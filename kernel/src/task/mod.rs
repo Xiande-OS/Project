@@ -1,21 +1,18 @@
-//! Per-process task and run loop.
+//! Tasks + cooperative scheduler (M5 part 2).
 //!
-//! Layout invariants we depend on:
-//!
-//!   ```text
-//!   TaskStorage buffer  [..kstack_usable..][TrapFrame]
-//!                       ^low                ^tf_ptr   ^top = sscratch on trap entry
-//!   ```
-//!
-//! The TrapFrame lives at the top of the per-task kernel stack so that
-//! after `__trap_entry` saves the frame, `sp` lands at `tf_ptr` with the
-//! usable kstack just below for the Rust handler's own frame.
+//! Layout: each Task owns a kstack buffer with the per-task TrapFrame
+//! at the top. The trap handler swaps `sscratch` with the current
+//! task's `kstack_top`, so all kernel work for that task happens on
+//! the kstack just below the TF.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicI32, Ordering};
 use spin::{Lazy, Mutex};
 
 use crate::arch::riscv64::trap::TrapFrame;
@@ -46,16 +43,27 @@ impl TaskStorage {
     }
 }
 
-pub struct Task {
-    storage: UnsafeCell<Box<TaskStorage>>,
-    pub memory_set: Mutex<MemorySet>,
-    pub fd_table: crate::fs::FdTable,
-    pub cwd: Mutex<alloc::string::String>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskState {
+    Ready,
+    Running,
+    /// Blocked waiting for any child to exit.
+    Waiting,
+    Zombie,
 }
 
-// SAFETY: M3 has a single task running on a single hart. The trap handler
-// writes the TrapFrame area between syscalls; Rust code only accesses it
-// in known-safe windows.
+pub struct Task {
+    pub pid: i32,
+    pub ppid: AtomicI32,
+    storage: UnsafeCell<Box<TaskStorage>>,
+    pub memory_set: Mutex<MemorySet>,
+    pub fd_table: Mutex<crate::fs::FdTable>,
+    pub cwd: Mutex<String>,
+    pub state: Mutex<TaskState>,
+    pub exit_code: AtomicI32,
+    pub children: Mutex<Vec<i32>>,
+}
+
 unsafe impl Send for Task {}
 unsafe impl Sync for Task {}
 
@@ -66,12 +74,6 @@ impl Task {
 
     pub fn kstack_top(&self) -> usize {
         unsafe { (*self.storage.get()).kstack_top() }
-    }
-
-    /// Get a mut reference to the trap frame. Caller must ensure no
-    /// concurrent access (trap.S does not run while this is held).
-    pub unsafe fn trap_frame_mut(&self) -> &mut TrapFrame {
-        &mut *self.tf_ptr()
     }
 
     pub fn copy_in_bytes(&self, va: usize, len: usize) -> Option<Vec<u8>> {
@@ -126,24 +128,125 @@ pub fn copy_out_via(ms: &MemorySet, va: usize, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
-static TASK: Lazy<Mutex<Option<Arc<Task>>>> = Lazy::new(|| Mutex::new(None));
+// ----- Task table + scheduler -----
+
+static NEXT_PID: AtomicI32 = AtomicI32::new(1);
+fn alloc_pid() -> i32 {
+    NEXT_PID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub struct TaskTable {
+    pub tasks: BTreeMap<i32, Arc<Task>>,
+}
+
+static TABLE: Lazy<Mutex<TaskTable>> = Lazy::new(|| {
+    Mutex::new(TaskTable {
+        tasks: BTreeMap::new(),
+    })
+});
+
+static CURRENT_PID: AtomicI32 = AtomicI32::new(0);
+
+pub fn current_pid() -> i32 {
+    CURRENT_PID.load(Ordering::Relaxed)
+}
 
 pub fn current_task() -> Arc<Task> {
-    TASK.lock().as_ref().expect("no current task").clone()
+    let pid = current_pid();
+    TABLE
+        .lock()
+        .tasks
+        .get(&pid)
+        .expect("no current task")
+        .clone()
 }
 
 pub fn install_task(task: Arc<Task>) {
-    *TASK.lock() = Some(task);
+    let pid = task.pid;
+    TABLE.lock().tasks.insert(pid, task);
+    CURRENT_PID.store(pid, Ordering::Relaxed);
 }
 
-/// Build a Task from an ELF image, install it as current, and return it.
+pub fn task_by_pid(pid: i32) -> Option<Arc<Task>> {
+    TABLE.lock().tasks.get(&pid).cloned()
+}
+
+/// Pick any task in Ready state (other than `exclude`) and mark it Running.
+pub fn pick_ready(exclude: i32) -> Option<Arc<Task>> {
+    let table = TABLE.lock();
+    for (&pid, task) in table.tasks.iter() {
+        if pid == exclude {
+            continue;
+        }
+        let mut state = task.state.lock();
+        if *state == TaskState::Ready {
+            *state = TaskState::Running;
+            return Some(task.clone());
+        }
+    }
+    None
+}
+
+/// Mark a task Ready (e.g. after wake-from-wait).
+pub fn make_ready(pid: i32) {
+    if let Some(t) = task_by_pid(pid) {
+        let mut s = t.state.lock();
+        if *s != TaskState::Zombie {
+            *s = TaskState::Ready;
+        }
+    }
+}
+
+pub fn reap(pid: i32) {
+    TABLE.lock().tasks.remove(&pid);
+}
+
+pub fn set_current_pid(pid: i32) {
+    CURRENT_PID.store(pid, Ordering::Relaxed);
+}
+
+pub fn any_runnable_except(pid: i32) -> bool {
+    let t = TABLE.lock();
+    t.tasks.values().any(|task| {
+        task.pid != pid
+            && matches!(
+                *task.state.lock(),
+                TaskState::Ready | TaskState::Running
+            )
+    })
+}
+
+pub fn any_waiting() -> bool {
+    let t = TABLE.lock();
+    t.tasks.values().any(|task| *task.state.lock() == TaskState::Waiting)
+}
+
+// ----- Initial task creation -----
+
 pub fn create_task_from_elf(
     elf_image: &[u8],
     argv: &[&str],
     envp: &[&str],
 ) -> Arc<Task> {
     let mut ms = MemorySet::new();
+    map_kernel_into(&mut ms);
+    let elf = crate::loader::load_elf(elf_image, &mut ms).expect("ELF load");
+    let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);
 
+    let mut tf = TrapFrame::default();
+    tf.sepc = elf.entry;
+    tf.x[1] = user_sp_top;
+    // SPIE | SUM | FS=Initial (1<<13) so user-mode FP doesn't trap on first
+    // touch. busybox' setjmp saves fs0..fs11.
+    let sstatus: usize = (1 << 5) | (1 << 18) | (1 << 13);
+    tf.sstatus = sstatus;
+
+    let task = make_task_with_ms(ms, tf, 0);
+    install_task(task.clone());
+    task
+}
+
+fn map_kernel_into(ms: &mut MemorySet) {
     extern "C" {
         fn __kernel_start();
     }
@@ -152,32 +255,28 @@ pub fn create_task_from_elf(
     ms.map_mmio(0x0c00_0000, 0x1000_0000); // PLIC
     ms.map_mmio(0x1000_0000, 0x1000_1000); // UART
     ms.map_mmio(0x1000_1000, 0x1000_9000); // virtio-mmio
+}
 
-    let elf = crate::loader::load_elf(elf_image, &mut ms).expect("ELF load");
-    let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);
-
-    let mut tf = TrapFrame::default();
-    tf.sepc = elf.entry;
-    tf.x[1] = user_sp_top;
-    // sstatus: SPP=0 (return to U-mode), SPIE=1, SUM=1 (kernel can poke user mem).
-    let sstatus: usize = (1 << 5) | (1 << 18);
-    tf.sstatus = sstatus;
-
+fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
+    let pid = alloc_pid();
     let task = Arc::new(Task {
+        pid,
+        ppid: AtomicI32::new(ppid),
         storage: UnsafeCell::new(TaskStorage::boxed()),
         memory_set: Mutex::new(ms),
-        fd_table: crate::fs::FdTable::new(),
-        cwd: Mutex::new(alloc::string::String::from("/")),
+        fd_table: Mutex::new(crate::fs::FdTable::new()),
+        cwd: Mutex::new(String::from("/")),
+        state: Mutex::new(TaskState::Running),
+        exit_code: AtomicI32::new(0),
+        children: Mutex::new(Vec::new()),
     });
-
-    // Copy TF into the storage.
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
     }
-
-    install_task(task.clone());
     task
 }
+
+// ----- Initial argv/envp/auxv stack -----
 
 fn setup_initial_stack(
     elf: &LoadedElf,
@@ -222,24 +321,24 @@ fn setup_initial_stack(
     sp &= !0xfusize;
 
     let auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec![
-        (3, elf.phdr_va),                              // AT_PHDR
-        (4, elf.phent),                                // AT_PHENT
-        (5, elf.phnum),                                // AT_PHNUM
-        (6, PAGE_SIZE),                                // AT_PAGESZ
-        (7, 0),                                        // AT_BASE
-        (8, 0),                                        // AT_FLAGS
-        (9, elf.entry),                                // AT_ENTRY
-        (11, 0),                                       // AT_UID
-        (12, 0),                                       // AT_EUID
-        (13, 0),                                       // AT_GID
-        (14, 0),                                       // AT_EGID
-        (16, 0),                                       // AT_HWCAP
-        (17, 100),                                     // AT_CLKTCK
-        (23, 0),                                       // AT_SECURE
-        (25, random_va),                               // AT_RANDOM
-        (15, platform_va),                             // AT_PLATFORM
-        (31, arg_addrs.first().copied().unwrap_or(0)), // AT_EXECFN
-        (0, 0),                                        // AT_NULL
+        (3, elf.phdr_va),
+        (4, elf.phent),
+        (5, elf.phnum),
+        (6, PAGE_SIZE),
+        (7, 0),
+        (8, 0),
+        (9, elf.entry),
+        (11, 0),
+        (12, 0),
+        (13, 0),
+        (14, 0),
+        (16, 0),
+        (17, 100),
+        (23, 0),
+        (25, random_va),
+        (15, platform_va),
+        (31, arg_addrs.first().copied().unwrap_or(0)),
+        (0, 0),
     ];
 
     let ptrs_bytes = 8
@@ -251,7 +350,6 @@ fn setup_initial_stack(
     let start_va = sp - ptrs_bytes;
 
     let mut cursor = start_va;
-
     write_usize(ms, cursor, argv.len());
     cursor += 8;
     for &a in &arg_addrs {
@@ -281,9 +379,67 @@ fn write_usize(ms: &mut MemorySet, va: usize, v: usize) {
     copy_out_via(ms, va, &bytes).expect("write usize");
 }
 
-/// Enter user-mode for the first time, and never return. Activates the
-/// task's satp, then tail-calls into the trap-return asm to restore the
-/// initial register set and `sret`.
+// ----- fork / execve -----
+
+pub fn fork_current() -> Arc<Task> {
+    let parent = current_task();
+    let mut new_ms = parent.memory_set.lock().fork();
+    // fork() only copies user areas; the kernel identity map and MMIO
+    // mappings need to be re-added so the trap handler keeps working
+    // after we switch satp to the child's table.
+    map_kernel_into(&mut new_ms);
+    let mut new_tf = unsafe { (*parent.tf_ptr()).clone() };
+    new_tf.x[9] = 0; // child sees 0 from clone
+    let task = make_task_with_ms(new_ms, new_tf, parent.pid);
+    *task.state.lock() = TaskState::Ready;
+    {
+        let new_fdt = parent.fd_table.lock().clone_for_fork();
+        *task.fd_table.lock() = new_fdt;
+        *task.cwd.lock() = parent.cwd.lock().clone();
+        parent.children.lock().push(task.pid);
+    }
+    TABLE.lock().tasks.insert(task.pid, task.clone());
+    task
+}
+
+/// Replace the current task's image with `elf_image`, argv, envp.
+pub fn execve_current(elf_image: &[u8], argv: &[&str], envp: &[&str]) -> Result<(), i32> {
+    let task = current_task();
+    let mut ms = MemorySet::new();
+    map_kernel_into(&mut ms);
+    let elf = crate::loader::load_elf(elf_image, &mut ms).map_err(|_| -22i32)?;
+    let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);
+
+    // Replace memory_set and activate its satp immediately.
+    let new_satp;
+    {
+        let mut slot = task.memory_set.lock();
+        *slot = ms;
+        new_satp = slot.satp();
+    }
+    unsafe {
+        core::arch::asm!(
+            "csrw satp, {satp}",
+            "sfence.vma",
+            satp = in(reg) new_satp,
+        );
+    }
+
+    // Replace trap frame with fresh entry state.
+    let mut tf = TrapFrame::default();
+    tf.sepc = elf.entry;
+    tf.x[1] = user_sp_top;
+    tf.sstatus = (1 << 5) | (1 << 18) | (1 << 13); // SPIE | SUM | FS=Initial
+    unsafe {
+        core::ptr::write(task.tf_ptr(), tf);
+    }
+
+    // close-on-exec
+    task.fd_table.lock().close_cloexec();
+    Ok(())
+}
+
+/// First-time entry to user mode for the initial task.
 pub fn run_user_loop(task: &Arc<Task>) -> ! {
     extern "C" {
         fn __trap_return(tf: *const TrapFrame) -> !;
@@ -293,9 +449,6 @@ pub fn run_user_loop(task: &Arc<Task>) -> ! {
     let tf_ptr = task.tf_ptr();
 
     unsafe {
-        // Set kernel sp for the very first trap: we want it equal to
-        // (tf_ptr + size_of::<TrapFrame>()), which __trap_return will
-        // load into sscratch on return-to-user.
         core::arch::asm!(
             "csrw satp, {satp}",
             "sfence.vma",
@@ -303,4 +456,33 @@ pub fn run_user_loop(task: &Arc<Task>) -> ! {
         );
         __trap_return(tf_ptr as *const _);
     }
+}
+
+/// Called by the trap handler. Decides which task to return through and
+/// switches satp + current_pid accordingly. Returns the TF to load.
+pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
+    let cur_pid = current_pid();
+    let cur_state = task_by_pid(cur_pid).map(|t| *t.state.lock());
+
+    if matches!(cur_state, Some(TaskState::Zombie) | Some(TaskState::Waiting)) {
+        if let Some(next) = pick_ready(cur_pid) {
+            let satp = next.memory_set.lock().satp();
+            CURRENT_PID.store(next.pid, Ordering::Relaxed);
+            unsafe {
+                core::arch::asm!(
+                    "csrw satp, {satp}",
+                    "sfence.vma",
+                    satp = in(reg) satp,
+                );
+            }
+            return next.tf_ptr();
+        }
+        if cur_state == Some(TaskState::Waiting) {
+            if let Some(t) = task_by_pid(cur_pid) {
+                *t.state.lock() = TaskState::Running;
+            }
+        }
+    }
+
+    current_tf
 }

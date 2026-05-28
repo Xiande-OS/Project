@@ -74,8 +74,10 @@ __trap_entry:
     mv      a0, sp
     call    rust_trap_handler
 
-    # sp is callee-saved per RISC-V ABI, so it still points at the
-    # TrapFrame. Continue into the shared exit path.
+    # rust_trap_handler returns the TrapFrame pointer in a0. It may be
+    # the same as the saved one (no context switch) or a different
+    # task's TF (after fork/exit/wait4). Use a0 as the new sp.
+    mv      sp, a0
     j       .Ltrap_exit
 
     .globl __trap_return

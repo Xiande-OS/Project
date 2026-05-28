@@ -140,6 +140,34 @@ impl MemorySet {
         self.page_table.translate(va)
     }
 
+    /// Deep-copy this address space (fork). Each user VmArea gets fresh
+    /// frames whose contents are copied from the parent. Kernel + MMIO
+    /// identity mappings need to be re-added by the caller.
+    pub fn fork(&self) -> Self {
+        let mut new_ms = MemorySet::new();
+        for area in &self.areas {
+            let mut new_frames = alloc::collections::BTreeMap::new();
+            let pte_flags = area.perm.to_pte();
+            for (&vpn, frame) in &area.frames {
+                let new_frame = super::frame::alloc().expect("OOM in fork");
+                let src = frame.ppn.as_byte_slice();
+                let dst = new_frame.ppn.as_byte_slice();
+                dst.copy_from_slice(src);
+                new_ms.page_table.map(vpn, new_frame.ppn, pte_flags);
+                new_frames.insert(vpn, new_frame);
+            }
+            new_ms.areas.push(VmArea {
+                vpn_start: area.vpn_start,
+                vpn_end: area.vpn_end,
+                perm: area.perm,
+                frames: new_frames,
+            });
+        }
+        new_ms.brk_base = self.brk_base;
+        new_ms.brk_cur = self.brk_cur;
+        new_ms
+    }
+
     /// Find the area that contains `vpn` (for fault handlers, brk).
     pub fn find_area_mut(&mut self, vpn: VirtPageNum) -> Option<&mut VmArea> {
         self.areas.iter_mut().find(|a| a.contains(vpn))

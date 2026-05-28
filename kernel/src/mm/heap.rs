@@ -7,7 +7,7 @@
 
 use buddy_system_allocator::LockedHeap;
 
-const KERNEL_HEAP_SIZE: usize = 8 * 1024 * 1024;
+const KERNEL_HEAP_SIZE: usize = 32 * 1024 * 1024;
 
 #[link_section = ".bss.heap"]
 static mut KERNEL_HEAP: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];

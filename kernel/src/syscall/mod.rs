@@ -42,8 +42,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
 
     if syscall_trace_enabled() {
         crate::println!(
-            "[sys] #{} sp={:#x} a0={:#x} a1={:#x} a2={:#x}",
-            id, tf.x[1], a0, a1, a2
+            "[sys pid={}] #{} sp={:#x} a0={:#x} a1={:#x} a2={:#x}",
+            crate::task::current_pid(), id, tf.x[1], a0, a1, a2
         );
     }
 
@@ -110,6 +110,9 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RENAMEAT2 => sys_renameat2(a0 as i32, a1, a2 as i32, a3, a4 as u32),
         nr::SYS_LINKAT => sys_linkat(a0 as i32, a1, a2 as i32, a3, a4 as i32),
         nr::SYS_SYMLINKAT => 0, // best-effort stub
+        nr::SYS_CLONE => sys_clone(a0, a1, a2, a3, a4),
+        nr::SYS_EXECVE => sys_execve(a0, a1, a2),
+        nr::SYS_WAIT4 => sys_wait4(a0 as i32, a1, a2 as i32),
         _ => {
             println!("[syscall] unimplemented #{} a0={:#x} a1={:#x}", id, a0, a1);
             ENOSYS
@@ -175,7 +178,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
     let Some(bytes) = task.copy_in_bytes(buf, len) else {
         return EFAULT;
     };
-    let Some(file) = task.fd_table.get(fd) else {
+    let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
     match file.write(&bytes) {
@@ -195,7 +198,7 @@ fn sys_writev(fd: i32, iov: usize, count: usize) -> isize {
         return 0;
     }
     let task = current_task();
-    let Some(file) = task.fd_table.get(fd) else {
+    let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
     let Some(iovs_bytes) = task.copy_in_bytes(iov, count * core::mem::size_of::<IoVec>()) else {
@@ -227,7 +230,7 @@ fn sys_writev(fd: i32, iov: usize, count: usize) -> isize {
 
 fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
     let task = current_task();
-    let Some(file) = task.fd_table.get(fd) else {
+    let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
     let mut tmp = alloc::vec![0u8; len];
@@ -246,7 +249,7 @@ fn sys_readv(fd: i32, iov: usize, count: usize) -> isize {
         return 0;
     }
     let task = current_task();
-    let Some(file) = task.fd_table.get(fd) else {
+    let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
     let Some(iovs_bytes) = task.copy_in_bytes(iov, count * core::mem::size_of::<IoVec>()) else {
@@ -287,7 +290,7 @@ fn sys_readv(fd: i32, iov: usize, count: usize) -> isize {
 
 fn sys_pread(fd: i32, buf: usize, len: usize, off: u64) -> isize {
     let task = current_task();
-    let Some(file) = task.fd_table.get(fd) else {
+    let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
     let mut tmp = alloc::vec![0u8; len];
@@ -304,7 +307,7 @@ fn sys_pread(fd: i32, buf: usize, len: usize, off: u64) -> isize {
 
 fn sys_pwrite(fd: i32, buf: usize, len: usize, off: u64) -> isize {
     let task = current_task();
-    let Some(file) = task.fd_table.get(fd) else {
+    let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
     let Some(bytes) = task.copy_in_bytes(buf, len) else {
@@ -318,7 +321,7 @@ fn sys_pwrite(fd: i32, buf: usize, len: usize, off: u64) -> isize {
 
 fn sys_lseek(fd: i32, offset: i64, whence: i32) -> isize {
     let task = current_task();
-    let Some(file) = task.fd_table.get(fd) else {
+    let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
     match file.seek(offset, whence) {
@@ -333,7 +336,7 @@ fn resolve_at(dfd: i32, path: &str) -> Option<Arc<dyn Inode>> {
         let cwd = task.cwd.lock().clone();
         fs::lookup_path(fs::root(), &cwd).ok()?
     } else {
-        task.fd_table.get(dfd)?.inode.clone()
+        task.fd_table.lock().get(dfd)?.inode.clone()
     };
     fs::lookup_path(start, path).ok()
 }
@@ -344,7 +347,7 @@ fn resolve_at_parent(dfd: i32, path: &str) -> Option<(Arc<dyn Inode>, String)> {
         let cwd = task.cwd.lock().clone();
         fs::lookup_path(fs::root(), &cwd).ok()?
     } else {
-        task.fd_table.get(dfd)?.inode.clone()
+        task.fd_table.lock().get(dfd)?.inode.clone()
     };
     fs::split_parent(start, path).ok()
 }
@@ -388,14 +391,14 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
     };
 
     let file = Arc::new(File::from_inode(inode, readable, writable, append));
-    match current_task().fd_table.alloc(file, cloexec) {
+    match current_task().fd_table.lock().alloc(file, cloexec) {
         Ok(fd) => fd as isize,
         Err(e) => err_to_isize(e),
     }
 }
 
 fn sys_close(fd: i32) -> isize {
-    match current_task().fd_table.close(fd) {
+    match current_task().fd_table.lock().close(fd) {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
     }
@@ -403,10 +406,12 @@ fn sys_close(fd: i32) -> isize {
 
 fn sys_dup(fd: i32) -> isize {
     let task = current_task();
-    let Some(f) = task.fd_table.get(fd) else {
-        return EBADF;
+    let f = match task.fd_table.lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
     };
-    match task.fd_table.alloc(f, false) {
+    let res = task.fd_table.lock().alloc(f, false);
+    match res {
         Ok(nfd) => nfd as isize,
         Err(e) => err_to_isize(e),
     }
@@ -414,7 +419,7 @@ fn sys_dup(fd: i32) -> isize {
 
 fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> isize {
     let cloexec = (flags & O_CLOEXEC) != 0;
-    match current_task().fd_table.dup3(oldfd, newfd, cloexec) {
+    match current_task().fd_table.lock().dup3(oldfd, newfd, cloexec) {
         Ok(fd) => fd as isize,
         Err(e) => err_to_isize(e),
     }
@@ -426,14 +431,14 @@ fn sys_pipe2(pipefd_ptr: usize, flags: i32) -> isize {
     let rf = Arc::new(File::from_inode(r, true, false, false));
     let wf = Arc::new(File::from_inode(w, false, true, false));
     let cloexec = (flags & O_CLOEXEC) != 0;
-    let r_fd = match task.fd_table.alloc(rf, cloexec) {
+    let r_fd = match task.fd_table.lock().alloc(rf, cloexec) {
         Ok(fd) => fd,
         Err(e) => return err_to_isize(e),
     };
-    let w_fd = match task.fd_table.alloc(wf, cloexec) {
+    let w_fd = match task.fd_table.lock().alloc(wf, cloexec) {
         Ok(fd) => fd,
         Err(e) => {
-            let _ = task.fd_table.close(r_fd);
+            let _ = task.fd_table.lock().close(r_fd);
             return err_to_isize(e);
         }
     };
@@ -494,7 +499,7 @@ struct Linux64Dirent {
 
 fn sys_getdents64(fd: i32, buf: usize, len: usize) -> isize {
     let task = current_task();
-    let Some(file) = task.fd_table.get(fd) else {
+    let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
     let entries = match file.inode.list() {
@@ -599,7 +604,7 @@ fn write_struct<T>(addr: usize, value: &T) -> isize {
 
 fn sys_fstat(fd: i32, buf: usize) -> isize {
     let task = current_task();
-    let Some(file) = task.fd_table.get(fd) else {
+    let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
     let st = fill_stat(&file.inode);
@@ -612,7 +617,7 @@ fn sys_newfstatat(dfd: i32, path: usize, buf: usize, _flags: i32) -> isize {
     };
     let inode = if path_str.is_empty() {
         // AT_EMPTY_PATH semantics: use dfd directly.
-        let Some(file) = current_task().fd_table.get(dfd) else {
+        let Some(file) = current_task().fd_table.lock().get(dfd) else {
             return EBADF;
         };
         file.inode.clone()
@@ -660,7 +665,7 @@ fn sys_statx(dfd: i32, path: usize, _flags: i32, _mask: u32, buf: usize) -> isiz
         return EFAULT;
     };
     let inode = if path_str.is_empty() {
-        let Some(file) = current_task().fd_table.get(dfd) else {
+        let Some(file) = current_task().fd_table.lock().get(dfd) else {
             return EBADF;
         };
         file.inode.clone()
@@ -745,11 +750,157 @@ fn normalize_path(p: &str) -> String {
 // ---------- Misc ----------
 
 fn sys_exit(status: i32) -> isize {
-    println!("[syscall] task exit({})", status);
-    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+    let task = current_task();
+    task.exit_code.store(status, core::sync::atomic::Ordering::Relaxed);
+    *task.state.lock() = crate::task::TaskState::Zombie;
+    println!("[exit] pid={} status={}", task.pid, status);
+
+    // Wake any parent in wait4.
+    let ppid = task.ppid.load(core::sync::atomic::Ordering::Relaxed);
+    if let Some(parent) = crate::task::task_by_pid(ppid) {
+        let mut s = parent.state.lock();
+        if *s == crate::task::TaskState::Waiting {
+            *s = crate::task::TaskState::Ready;
+        }
     }
+
+    // If no other runnable/waiting/zombie task exists, halt.
+    let pid = task.pid;
+    if !crate::task::any_runnable_except(pid) && !crate::task::any_waiting() {
+        sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+        loop {
+            unsafe { core::arch::asm!("wfi") };
+        }
+    }
+    0
+}
+
+pub fn sys_kill_current(status: i32) -> isize {
+    sys_exit(status)
+}
+
+fn sys_clone(flags: usize, child_sp: usize, _ptid: usize, _ctid: usize, _newtls: usize) -> isize {
+    let _ = flags;
+    let new_task = crate::task::fork_current();
+    if child_sp != 0 {
+        unsafe {
+            (*new_task.tf_ptr()).x[1] = child_sp;
+        }
+    }
+    new_task.pid as isize
+}
+
+fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
+    let Some(path) = copy_path(path_addr) else {
+        return EFAULT;
+    };
+    let argv = read_string_array(argv_addr).unwrap_or_default();
+    let envp = read_string_array(envp_addr).unwrap_or_default();
+
+    // Look up the binary in the VFS.
+    let inode = match fs::lookup_path(fs::root(), &path) {
+        Ok(i) => i,
+        Err(_) => return ENOENT,
+    };
+    if inode.kind() != FileType::Regular {
+        return -13; // EACCES
+    }
+    let size = inode.size() as usize;
+    let mut elf_image = alloc::vec![0u8; size];
+    if let Err(e) = inode.read_at(0, &mut elf_image) {
+        return err_to_isize(e);
+    }
+    // Ensure aligned (xmas-elf requires 8-byte alignment).
+    let elf_aligned: alloc::vec::Vec<u8> = aligned_clone(&elf_image);
+
+    let argv_refs: alloc::vec::Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let envp_refs: alloc::vec::Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+    match crate::task::execve_current(&elf_aligned, &argv_refs, &envp_refs) {
+        Ok(()) => 0,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+fn aligned_clone(src: &[u8]) -> alloc::vec::Vec<u8> {
+    // Vec data has 8-byte (or stricter) alignment by default — alloc gives
+    // pointer aligned to mem::align_of::<u8>() == 1, but in practice the
+    // allocator returns >=8 byte aligned blocks. Re-allocate via a u64
+    // buffer to be safe.
+    let nwords = (src.len() + 7) / 8;
+    let mut words = alloc::vec![0u64; nwords];
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), words.as_mut_ptr() as *mut u8, src.len());
+    }
+    // Re-interpret as Vec<u8>. Easier: just copy into a Vec<u8> created from words.
+    let mut bytes = alloc::vec::Vec::with_capacity(src.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, bytes.as_mut_ptr(), src.len());
+        bytes.set_len(src.len());
+    }
+    drop(words);
+    bytes
+}
+
+fn read_string_array(addr: usize) -> Option<alloc::vec::Vec<String>> {
+    if addr == 0 {
+        return Some(alloc::vec::Vec::new());
+    }
+    let task = current_task();
+    let mut out = alloc::vec::Vec::new();
+    let mut cursor = addr;
+    loop {
+        let bytes = task.copy_in_bytes(cursor, 8)?;
+        let ptr = u64::from_le_bytes(bytes.as_slice().try_into().ok()?);
+        if ptr == 0 {
+            break;
+        }
+        let s = copy_path(ptr as usize)?;
+        out.push(s);
+        cursor += 8;
+        if out.len() > 1024 {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+fn sys_wait4(pid: i32, status_addr: usize, _options: i32) -> isize {
+    let me = current_task();
+    let zombie = {
+        let children = me.children.lock();
+        children
+            .iter()
+            .filter_map(|&cpid| crate::task::task_by_pid(cpid))
+            .find(|c| {
+                // pid < 0  -> any child (we ignore pgid distinctions)
+                // pid == 0 -> any child in caller's pgid (treat as any)
+                // pid > 0  -> specific pid
+                (pid <= 0 || c.pid == pid)
+                    && *c.state.lock() == crate::task::TaskState::Zombie
+            })
+    };
+    if let Some(z) = zombie {
+        let code = z.exit_code.load(core::sync::atomic::Ordering::Relaxed);
+        if status_addr != 0 {
+            let val: i32 = (code & 0xff) << 8;
+            let _ = me.copy_out_bytes(status_addr, &val.to_le_bytes());
+        }
+        me.children.lock().retain(|&cpid| cpid != z.pid);
+        crate::task::reap(z.pid);
+        return z.pid as isize;
+    }
+
+    // No matching zombie. Mark Waiting and rewind sepc so the ecall is
+    // re-executed when we get rescheduled. The scheduler will switch
+    // to a child.
+    if me.children.lock().is_empty() {
+        return -10; // ECHILD
+    }
+    *me.state.lock() = crate::task::TaskState::Waiting;
+    unsafe {
+        (*me.tf_ptr()).sepc -= 4;
+    }
+    0
 }
 
 fn sys_brk(new_brk: usize) -> isize {
@@ -848,7 +999,7 @@ fn sys_mmap(_addr: usize, len: usize, _prot: i32, flags: i32, fd: i32, off: usiz
 
     // If file-backed, read file content into a buffer first.
     let init = if (flags & MAP_ANONYMOUS) == 0 && fd >= 0 {
-        let Some(file) = task.fd_table.get(fd) else {
+        let Some(file) = task.fd_table.lock().get(fd) else {
             return EBADF;
         };
         let mut buf = alloc::vec![0u8; aligned];

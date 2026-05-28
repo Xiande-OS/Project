@@ -27,6 +27,8 @@ static GIT_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("GIT_ELF_PATH")));
 static REAL_GIT_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("REAL_GIT_ELF_PATH")));
+static BUSYBOX_ALIGNED: &AlignedElf<[u8]> =
+    &AlignedElf(*include_bytes!(env!("BUSYBOX_ELF_PATH")));
 
 fn hello_elf() -> &'static [u8] {
     &HELLO_ALIGNED.0
@@ -40,6 +42,9 @@ fn git_elf() -> &'static [u8] {
 fn real_git_elf() -> &'static [u8] {
     &REAL_GIT_ALIGNED.0
 }
+fn busybox_elf() -> &'static [u8] {
+    &BUSYBOX_ALIGNED.0
+}
 
 #[no_mangle]
 pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
@@ -49,7 +54,18 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     mm::init();
     arch::riscv64::trap::init();
     fs::init();
-    println!("[ok] heap + frame allocator + trap vector + vfs");
+
+    // Drop runnable binaries into /bin so execve can resolve them.
+    let bb = fs::install_file("/bin", "busybox", busybox_elf()).unwrap();
+    for applet in [
+        "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir", "mv", "cp",
+        "true", "false", "env", "pwd", "wc", "grep", "head", "tail", "sort",
+        "uniq", "tr", "find", "touch", "test", "[", "[[", "stat",
+    ] {
+        fs::link_into("/bin", applet, bb.clone()).unwrap();
+    }
+    fs::install_file("/bin", "git", real_git_elf()).unwrap();
+    println!("[ok] heap + frame allocator + trap vector + vfs + /bin");
     if option_env!("SYSTRACE").is_some() {
         syscall::set_syscall_trace(true);
     }
@@ -64,6 +80,19 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         let mut a = alloc::vec!["git"];
         a.extend_from_slice(&split);
         ("git", git_elf(), a)
+    } else if cfg!(feature = "shell") {
+        let cmd = option_env!("SHELL_CMD").unwrap_or("echo hello from busybox");
+        let applet = option_env!("APPLET").unwrap_or("sh");
+        let mut a = alloc::vec![applet];
+        if applet == "sh" || applet == "ash" {
+            a.push("-c");
+            a.push(cmd);
+        } else {
+            for arg in cmd.split_whitespace() {
+                a.push(arg);
+            }
+        }
+        (applet, busybox_elf(), a)
     } else {
         let cmd = option_env!("GIT_CMD").unwrap_or("--version");
         let split: alloc::vec::Vec<&str> = cmd.split_whitespace().collect();

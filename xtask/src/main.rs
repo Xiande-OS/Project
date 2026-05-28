@@ -99,14 +99,17 @@ fn build_kernel(profile: Profile) -> Result<(), String> {
     let workspace = workspace_root();
     let kernel_dir = workspace.join("kernel");
     let mut cmd = Command::new(cargo());
-    // Run cargo from inside kernel/ so that kernel/.cargo/config.toml is
-    // picked up (its rustflags reference kernel/linker.ld relatively).
     cmd.current_dir(&kernel_dir)
         .arg("build")
         .arg("--target")
         .arg(KERNEL_TARGET);
     if let Some(flag) = profile.cargo_flag() {
         cmd.arg(flag);
+    }
+    if let Ok(features) = env::var("KERNEL_FEATURES") {
+        if !features.is_empty() {
+            cmd.arg("--features").arg(features);
+        }
     }
     let status = cmd
         .stdout(Stdio::inherit())

@@ -101,4 +101,11 @@ fn main() {
     std::fs::copy(&real_git_src, &real_git_dst).expect("copy real_git.elf");
     println!("cargo:rerun-if-changed=../user/real_git.elf");
     println!("cargo:rustc-env=REAL_GIT_ELF_PATH={}", real_git_dst.display());
+
+    // busybox 1.36.1, static musl riscv64.
+    let bb_src = workspace_root.join("user/busybox.elf");
+    let bb_dst = out_dir.join("busybox.elf");
+    std::fs::copy(&bb_src, &bb_dst).expect("copy busybox.elf");
+    println!("cargo:rerun-if-changed=../user/busybox.elf");
+    println!("cargo:rustc-env=BUSYBOX_ELF_PATH={}", bb_dst.display());
 }

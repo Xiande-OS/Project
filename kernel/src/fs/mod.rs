@@ -271,15 +271,18 @@ fn write_file(dir: &dyn Inode, name: &str, data: &[u8]) {
     let _ = f.write_at(0, data);
 }
 
-/// Place an inode in /bin (used to drop busybox in at boot).
-pub fn install_bin(name: &str, inode: Arc<dyn Inode>) -> Result<()> {
-    let root = root();
-    let bin = root.lookup("bin")?;
-    bin.create(name, FileType::Regular)
-        .ok();
-    // For now just place. If exists, ignore (we wrote a stub).
-    // Replace by direct insertion.
-    if let Some(td) = tmpfs::downcast_dir(&bin) {
+/// Drop a regular file into a directory inode and return its inode so
+/// the caller can hardlink it under additional names.
+pub fn install_file(parent: &str, name: &str, content: &[u8]) -> Result<Arc<dyn Inode>> {
+    let dir = lookup_path(root(), parent)?;
+    let f = dir.create(name, FileType::Regular)?;
+    f.write_at(0, content)?;
+    Ok(f)
+}
+
+pub fn link_into(parent: &str, name: &str, inode: Arc<dyn Inode>) -> Result<()> {
+    let dir = lookup_path(root(), parent)?;
+    if let Some(td) = tmpfs::downcast_dir(&dir) {
         td.place_inode(name, inode)?;
     }
     Ok(())
