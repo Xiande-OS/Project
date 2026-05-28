@@ -54,6 +54,7 @@ pub fn prepare_init() -> Option<(Arc<dyn Inode>, Vec<String>)> {
         println!("[xiande-os] install_file /init.sh failed: {}", e);
         return None;
     }
+    println!("---- /init.sh ----\n{}---- end ----", body);
 
     let bb = match fs::lookup_path(fs::root(), BUSYBOX_PATH) {
         Ok(i) => i,

@@ -1050,5 +1050,41 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         }
     }
 
+    // Round-robin nudge for the Ready/Running case. If the current
+    // task is still runnable but another Ready task exists, yield to
+    // them this trap. Without this, a userspace tight loop that does
+    // a syscall per iteration (e.g. libctest's pthread_cancel_points
+    // hammering tkill+sigreturn 36k times) monopolises the hart and
+    // the busybox `timeout` daemon never gets scheduled to fire its
+    // wall-clock SIGKILL. Cooperative-with-a-nudge: at every trap
+    // boundary, if anyone else is Ready, switch to the
+    // lowest-pid one.
+    if let Some(next) = pick_ready(cur_pid) {
+        let cur_satp = task_by_pid(cur_pid).map(|t| t.memory_set.lock().satp());
+        let next_satp = next.memory_set.lock().satp();
+        // Demote the current task back to Ready so it can run again later.
+        if let Some(cur) = task_by_pid(cur_pid) {
+            let mut s = cur.state.lock();
+            if *s == TaskState::Running {
+                *s = TaskState::Ready;
+            }
+        }
+        CURRENT_PID.store(next.pid, Ordering::Relaxed);
+        if cur_satp != Some(next_satp) {
+            unsafe {
+                core::arch::asm!(
+                    "csrw satp, {satp}",
+                    "sfence.vma",
+                    satp = in(reg) next_satp,
+                );
+            }
+        }
+        let next_tf = next.tf_ptr();
+        unsafe { crate::signal::check_signals(&next, &mut *next_tf); }
+        if !matches!(*next.state.lock(), TaskState::Zombie) {
+            return next_tf;
+        }
+    }
+
     current_tf
 }
