@@ -69,6 +69,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_STATX => sys_statx(a0 as i32, a1, a2 as i32, a3 as u32, a4),
         nr::SYS_GETCWD => sys_getcwd(a0, a1),
         nr::SYS_CHDIR => sys_chdir(a0),
+        nr::SYS_MOUNT => sys_mount(a0, a1, a2, a3, a4),
+        nr::SYS_UMOUNT2 => sys_umount2(a0, a1 as i32),
         nr::SYS_FACCESSAT | nr::SYS_FACCESSAT2 => sys_faccessat(a0 as i32, a1, a2 as i32),
         nr::SYS_FCHMOD => sys_fchmod(a0 as i32, a1 as u32),
         nr::SYS_FCHMODAT => sys_fchmodat(a0 as i32, a1, a2 as u32),
@@ -2148,7 +2150,8 @@ fn sys_chdir(path: usize) -> isize {
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
-    let inode = match fs::lookup_path(fs::root(), &path_str) {
+    let start = if path_str.starts_with('/') { fs::root() } else { cwd_inode() };
+    let inode = match fs::lookup_path(start, &path_str) {
         Ok(i) => i,
         Err(e) => return err_to_isize(e),
     };
@@ -2164,6 +2167,28 @@ fn sys_chdir(path: usize) -> isize {
     };
     *current_task().cwd.lock() = new_cwd;
     0
+}
+
+fn sys_mount(_source: usize, target: usize, _fstype: usize, _flags: usize, _data: usize) -> isize {
+    let Some(target_str) = copy_path(target) else {
+        return EFAULT;
+    };
+    let start = if target_str.starts_with('/') { fs::root() } else { cwd_inode() };
+    match fs::lookup_path(start, &target_str) {
+        Ok(_) => 0,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+fn sys_umount2(target: usize, _flags: i32) -> isize {
+    let Some(target_str) = copy_path(target) else {
+        return EFAULT;
+    };
+    let start = if target_str.starts_with('/') { fs::root() } else { cwd_inode() };
+    match fs::lookup_path(start, &target_str) {
+        Ok(_) => 0,
+        Err(e) => err_to_isize(e),
+    }
 }
 
 fn normalize_path(p: &str) -> String {

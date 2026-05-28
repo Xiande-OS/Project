@@ -16,7 +16,7 @@
 //! Out of scope on purpose: writes, journal replay, encryption,
 //! verity, inline_data, bigalloc, ea_inode.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -25,7 +25,8 @@ use alloc::vec::Vec;
 use core::any::Any;
 use spin::Mutex;
 
-use super::{FileType, Inode, Result, EINVAL, ENOENT};
+use super::tmpfs::{TmpfsDir, TmpfsFile};
+use super::{FileType, Inode, Result, EEXIST, EINVAL, ENOENT};
 use crate::drivers::virtio_blk::BlockDevice;
 
 const SECTOR_SIZE: usize = 512;
@@ -302,12 +303,15 @@ pub struct Ext4Dir {
     fs: Arc<Fs>,
     ino: u32,
     children: Mutex<Option<BTreeMap<String, Arc<dyn Inode>>>>,
+    overlay_added: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
+    overlay_deleted: Mutex<BTreeSet<String>>,
 }
 
 pub struct Ext4File {
     fs: Arc<Fs>,
     ino: u32,
     cached: Mutex<Option<Arc<[u8]>>>,
+    mutated: Mutex<Option<Vec<u8>>>,
 }
 
 impl Ext4Dir {
@@ -328,6 +332,8 @@ impl Ext4Dir {
                     fs: self.fs.clone(),
                     ino: child_ino,
                     children: Mutex::new(None),
+                    overlay_added: Mutex::new(BTreeMap::new()),
+                    overlay_deleted: Mutex::new(BTreeSet::new()),
                 }),
                 7 => {
                     // Symlink — present as a regular file holding the target.
@@ -335,12 +341,14 @@ impl Ext4Dir {
                         fs: self.fs.clone(),
                         ino: child_ino,
                         cached: Mutex::new(None),
+                        mutated: Mutex::new(None),
                     })
                 }
                 _ => Arc::new(Ext4File {
                     fs: self.fs.clone(),
                     ino: child_ino,
                     cached: Mutex::new(None),
+                    mutated: Mutex::new(None),
                 }),
             };
             map.insert(name, child);
@@ -355,6 +363,12 @@ impl Inode for Ext4Dir {
     fn kind(&self) -> FileType { FileType::Directory }
     fn size(&self) -> u64 { 0 }
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        if self.overlay_deleted.lock().contains(name) {
+            return Err(ENOENT);
+        }
+        if let Some(node) = self.overlay_added.lock().get(name).cloned() {
+            return Ok(node);
+        }
         self.build_children()?;
         let map = self.children.lock();
         map.as_ref()
@@ -363,16 +377,66 @@ impl Inode for Ext4Dir {
     }
     fn list(&self) -> Result<Vec<(String, FileType)>> {
         self.build_children()?;
+        let deleted = self.overlay_deleted.lock();
+        let added = self.overlay_added.lock();
         let map = self.children.lock();
-        Ok(map
+        let mut out: BTreeMap<String, FileType> = BTreeMap::new();
+        if let Some(m) = map.as_ref() {
+            for (k, v) in m.iter() {
+                if !deleted.contains(k) {
+                    out.insert(k.clone(), v.kind());
+                }
+            }
+        }
+        for (k, v) in added.iter() {
+            out.insert(k.clone(), v.kind());
+        }
+        Ok(out.into_iter().collect())
+    }
+    fn create(&self, name: &str, kind: FileType) -> Result<Arc<dyn Inode>> {
+        let mut deleted = self.overlay_deleted.lock();
+        let mut added = self.overlay_added.lock();
+        if !deleted.contains(name) {
+            if added.contains_key(name) {
+                return Err(EEXIST);
+            }
+            self.build_children()?;
+            if let Some(m) = self.children.lock().as_ref() {
+                if m.contains_key(name) {
+                    return Err(EEXIST);
+                }
+            }
+        }
+        let node: Arc<dyn Inode> = match kind {
+            FileType::Regular | FileType::Symlink => Arc::new(TmpfsFile::new()),
+            FileType::Directory => TmpfsDir::new_root() as Arc<dyn Inode>,
+            _ => return Err(EINVAL),
+        };
+        deleted.remove(name);
+        added.insert(name.to_string(), node.clone());
+        Ok(node)
+    }
+    fn unlink(&self, name: &str) -> Result<()> {
+        let mut added = self.overlay_added.lock();
+        if added.remove(name).is_some() {
+            return Ok(());
+        }
+        if self.overlay_deleted.lock().contains(name) {
+            return Err(ENOENT);
+        }
+        self.build_children()?;
+        let on_disk = self
+            .children
+            .lock()
             .as_ref()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.kind())).collect())
-            .unwrap_or_default())
+            .map(|m| m.contains_key(name))
+            .unwrap_or(false);
+        if !on_disk {
+            return Err(ENOENT);
+        }
+        self.overlay_deleted.lock().insert(name.to_string());
+        Ok(())
     }
-    fn create(&self, _name: &str, _kind: FileType) -> Result<Arc<dyn Inode>> {
-        Err(EINVAL)
-    }
-    fn unlink(&self, _name: &str) -> Result<()> { Err(EINVAL) }
     fn read_at(&self, _off: u64, _buf: &mut [u8]) -> Result<usize> { Err(EINVAL) }
     fn write_at(&self, _off: u64, _buf: &[u8]) -> Result<usize> { Err(EINVAL) }
 }
@@ -405,6 +469,9 @@ impl Inode for Ext4File {
         }
     }
     fn size(&self) -> u64 {
+        if let Some(v) = self.mutated.lock().as_ref() {
+            return v.len() as u64;
+        }
         self.fs.read_inode(self.ino).map(|i| i.size).unwrap_or(0)
     }
     fn lookup(&self, _name: &str) -> Result<Arc<dyn Inode>> { Err(EINVAL) }
@@ -414,8 +481,17 @@ impl Inode for Ext4File {
     }
     fn unlink(&self, _name: &str) -> Result<()> { Err(EINVAL) }
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize> {
-        let data = self.data()?;
         let start = off as usize;
+        if let Some(v) = self.mutated.lock().as_ref() {
+            if start >= v.len() {
+                return Ok(0);
+            }
+            let end = core::cmp::min(start + buf.len(), v.len());
+            let n = end - start;
+            buf[..n].copy_from_slice(&v[start..end]);
+            return Ok(n);
+        }
+        let data = self.data()?;
         if start >= data.len() {
             return Ok(0);
         }
@@ -424,7 +500,29 @@ impl Inode for Ext4File {
         buf[..n].copy_from_slice(&data[start..end]);
         Ok(n)
     }
-    fn write_at(&self, _off: u64, _buf: &[u8]) -> Result<usize> { Err(EINVAL) }
+    fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize> {
+        let mut slot = self.mutated.lock();
+        if slot.is_none() {
+            let data = self.data()?;
+            *slot = Some(data.to_vec());
+        }
+        let v = slot.as_mut().unwrap();
+        let start = off as usize;
+        if start + buf.len() > v.len() {
+            v.resize(start + buf.len(), 0);
+        }
+        v[start..start + buf.len()].copy_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn truncate(&self, len: u64) -> Result<()> {
+        let mut slot = self.mutated.lock();
+        if slot.is_none() {
+            let data = self.data()?;
+            *slot = Some(data.to_vec());
+        }
+        slot.as_mut().unwrap().resize(len as usize, 0);
+        Ok(())
+    }
 }
 
 /// Mount the first virtio-blk device as EXT4 and return the root dir
@@ -445,6 +543,8 @@ pub fn mount() -> core::result::Result<Arc<dyn Inode>, &'static str> {
         fs,
         ino: ROOT_INO,
         children: Mutex::new(None),
+        overlay_added: Mutex::new(BTreeMap::new()),
+        overlay_deleted: Mutex::new(BTreeSet::new()),
     });
     Ok(root)
 }
