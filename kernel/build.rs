@@ -78,4 +78,20 @@ fn main() {
     let musl_dst = out_dir.join("musl_hello.elf");
     std::fs::copy(&musl_src, &musl_dst).expect("copy musl_hello.elf");
     println!("cargo:rustc-env=MUSL_HELLO_ELF_PATH={}", musl_dst.display());
+
+    // git (final goal).
+    println!("cargo:rerun-if-changed=../user/git/src/main.rs");
+    println!("cargo:rerun-if-changed=../user/git/Cargo.toml");
+    build_user_pkg(
+        &cargo_bin,
+        &user_dir,
+        "git",
+        "riscv64gc-unknown-linux-musl",
+        &strip,
+    );
+    let git_src = user_dir
+        .join("target/riscv64gc-unknown-linux-musl/release/git");
+    let git_dst = out_dir.join("git.elf");
+    std::fs::copy(&git_src, &git_dst).expect("copy git.elf");
+    println!("cargo:rustc-env=GIT_ELF_PATH={}", git_dst.display());
 }

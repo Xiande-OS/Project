@@ -1,0 +1,13 @@
+[package]
+name = "git"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "git"
+path = "src/main.rs"
+
+[dependencies]
+sha1 = { version = "0.10", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }

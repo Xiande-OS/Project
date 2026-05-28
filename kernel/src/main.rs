@@ -22,12 +22,17 @@ static HELLO_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("HELLO_ELF_PATH")));
 static MUSL_HELLO_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("MUSL_HELLO_ELF_PATH")));
+static GIT_ALIGNED: &AlignedElf<[u8]> =
+    &AlignedElf(*include_bytes!(env!("GIT_ELF_PATH")));
 
 fn hello_elf() -> &'static [u8] {
     &HELLO_ALIGNED.0
 }
 fn musl_hello_elf() -> &'static [u8] {
     &MUSL_HELLO_ALIGNED.0
+}
+fn git_elf() -> &'static [u8] {
+    &GIT_ALIGNED.0
 }
 
 #[no_mangle]
@@ -39,15 +44,21 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     arch::riscv64::trap::init();
     println!("[ok] heap + frame allocator + trap vector");
 
-    // Pick which user binary to run.  Bare-metal `hello` is the M3 smoke
-    // test; switch to musl_hello for M4.
-    let (name, elf) = if cfg!(feature = "bare_hello") {
-        ("hello", hello_elf())
+    let (name, elf, argv) = if cfg!(feature = "bare_hello") {
+        ("hello", hello_elf(), alloc::vec!["hello"])
+    } else if cfg!(feature = "musl_hello") {
+        ("musl_hello", musl_hello_elf(), alloc::vec!["musl_hello"])
     } else {
-        ("musl_hello", musl_hello_elf())
+        // Pick command via env var; defaults to "self-test".
+        let cmd = option_env!("GIT_CMD").unwrap_or("self-test");
+        let split: alloc::vec::Vec<&str> = cmd.split_whitespace().collect();
+        let mut a = alloc::vec!["git"];
+        a.extend_from_slice(&split);
+        ("git", git_elf(), a)
     };
     println!("[user] loading {} ({} bytes)", name, elf.len());
-    let task = task::create_task_from_elf(elf, &[name], &["PATH=/bin", "HOME=/"]);
+    println!("[user] argv = {:?}", argv);
+    let task = task::create_task_from_elf(elf, &argv, &["PATH=/bin", "HOME=/", "TERM=dumb"]);
     println!("[user] task installed, entering user mode...");
     task::run_user_loop(&task);
 }

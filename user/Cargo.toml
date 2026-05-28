@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hello", "musl_hello"]
+members = ["hello", "musl_hello", "git"]
 exclude = []
 
 [profile.release]
