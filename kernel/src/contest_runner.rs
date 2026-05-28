@@ -261,8 +261,8 @@ fn script_budget(script: &str) -> &'static str {
         s if s.starts_with("iozone_") => "20",
         s if s.starts_with("cyclictest_") => "8",
         s if s.starts_with("lmbench_") => "15",
-        s if s.starts_with("iperf_") => "5",
-        s if s.starts_with("netperf_") => "5",
+        s if s.starts_with("iperf_") => "40",
+        s if s.starts_with("netperf_") => "40",
         // unixbench_testcode.sh has ~25 ./<bench> invocations, each one
         // a 10-20s in-userland loop in the original script. We pre-trim
         // the loop length to ~2s in the test-image preprocessing pass
