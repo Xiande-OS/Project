@@ -30,6 +30,8 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
+pub type SigActions = [KSigAction; (NSIG + 1) as usize];
+
 use crate::arch::riscv64::trap::TrapFrame;
 use crate::mm::memory_set::MemorySet;
 use crate::mm::VirtAddr;
@@ -152,8 +154,11 @@ pub struct SigAltStack {
 }
 
 /// Per-task signal state container. Stored on `Task`.
+///
+/// `actions` is wrapped in `Arc<Mutex<>>` so CLONE_SIGHAND threads share the
+/// disposition table while each thread keeps its own mask + pending bits.
 pub struct SignalState {
-    pub actions: Mutex<[KSigAction; (NSIG + 1) as usize]>,
+    pub actions: Arc<Mutex<SigActions>>,
     pub mask: AtomicU64,
     pub pending: AtomicU64,
     pub altstack: Mutex<Option<SigAltStack>>,
@@ -163,7 +168,7 @@ pub struct SignalState {
 impl SignalState {
     pub fn new() -> Self {
         Self {
-            actions: Mutex::new([KSigAction::default(); (NSIG + 1) as usize]),
+            actions: Arc::new(Mutex::new([KSigAction::default(); (NSIG + 1) as usize])),
             mask: AtomicU64::new(0),
             pending: AtomicU64::new(0),
             altstack: Mutex::new(None),
@@ -171,11 +176,25 @@ impl SignalState {
         }
     }
 
-    /// Inherited copy for fork(): same actions, same mask, pending cleared.
+    /// Inherited copy for fork(): same actions (fresh deep copy), same
+    /// mask, pending cleared.
     pub fn fork_inherit(&self) -> Self {
         let actions = *self.actions.lock();
         Self {
-            actions: Mutex::new(actions),
+            actions: Arc::new(Mutex::new(actions)),
+            mask: AtomicU64::new(self.mask.load(Ordering::Relaxed)),
+            pending: AtomicU64::new(0),
+            altstack: Mutex::new(*self.altstack.lock()),
+            saved_mask: Mutex::new(None),
+        }
+    }
+
+    /// Inherited copy for CLONE_THREAD/CLONE_SIGHAND: **same** Arc backing
+    /// the actions table (so a sigaction in one thread is visible to all).
+    /// Mask and pending are still per-thread.
+    pub fn share_actions_inherit(&self) -> Self {
+        Self {
+            actions: self.actions.clone(),
             mask: AtomicU64::new(self.mask.load(Ordering::Relaxed)),
             pending: AtomicU64::new(0),
             altstack: Mutex::new(*self.altstack.lock()),
@@ -263,9 +282,20 @@ pub fn raise_signal(target: &Arc<Task>, signo: u32) -> bool {
     }
     target.signals.pending.fetch_or(sigbit(signo), Ordering::SeqCst);
     // Wake from blocking syscalls.
-    let mut s = target.state.lock();
-    if *s == TaskState::Waiting {
-        *s = TaskState::Ready;
+    let was_waiting = {
+        let mut s = target.state.lock();
+        if *s == TaskState::Waiting {
+            *s = TaskState::Ready;
+            true
+        } else {
+            false
+        }
+    };
+    if was_waiting {
+        // If the task was parked in a futex queue, remove it and mark
+        // EINTR so the syscall resumes with -EINTR instead of "blocked
+        // again, no wake_result". Harmless if not in a futex queue.
+        crate::sync::futex::interrupt_wait(target.pid);
     }
     true
 }
