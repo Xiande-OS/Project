@@ -242,6 +242,7 @@ pub fn make_ready(pid: i32) {
 pub fn reap(pid: i32) {
     TABLE.lock().tasks.remove(&pid);
     crate::sync::futex::forget_task(pid);
+    forget_itimer(pid);
 }
 
 pub fn set_current_pid(pid: i32) {
@@ -851,10 +852,24 @@ pub fn execve_current_with_path(
     // close-on-exec
     task.fd_table.lock().close_cloexec();
 
-    // Record cmdline + exe_path for procfs.
+    // Record cmdline + exe_path for procfs. /proc/self/exe is read by
+    // glibc's _dl_get_origin which assert()s the linkval starts with
+    // '/'; resolve any relative path against the caller's cwd here so
+    // the recorded exe_path is absolute. Without this the entire
+    // glibc-dynamic test variant (lua-glibc, libctest-glibc, ...)
+    // aborts on _dl_get_origin.
     *task.cmdline.lock() = build_cmdline(argv);
     if !exe_path.is_empty() {
-        *task.exe_path.lock() = exe_path.into();
+        let s: String = exe_path.into();
+        let abs = if s.starts_with('/') {
+            s
+        } else {
+            let cwd = task.cwd.lock().clone();
+            let cwd = cwd.trim_end_matches('/');
+            let rel = s.strip_prefix("./").unwrap_or(&s);
+            alloc::format!("{}/{}", cwd, rel)
+        };
+        *task.exe_path.lock() = abs;
     }
     // POSIX: keep mask, reset every user-installed handler to SIG_DFL
     // (SIG_IGN survives), clear pending, clear altstack.
