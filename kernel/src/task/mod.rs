@@ -881,6 +881,26 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
 
     let cur_state = task_by_pid(cur_pid).map(|t| *t.state.lock());
 
+    // If the current task is Zombie and nothing else is Ready, we
+    // can't just return its trap frame — that would re-enter user
+    // code on a dead process. Spin sweeping the sleep / futex queues
+    // until SOMETHING becomes runnable (or, if there are no live
+    // tasks at all, shut down). Cheap because the host emulates
+    // mtime; the spin is the same work as a wfi loop without needing
+    // timer interrupts enabled.
+    if cur_state == Some(TaskState::Zombie) && !any_runnable_except(cur_pid) {
+        loop {
+            if !any_runnable_except(cur_pid) && !any_waiting() {
+                sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+                loop { unsafe { core::arch::asm!("wfi") }; }
+            }
+            wake_expired_sleepers(riscv::register::time::read64());
+            crate::sync::futex::poll_timeouts();
+            if any_runnable_except(cur_pid) { break; }
+            core::hint::spin_loop();
+        }
+    }
+
     if matches!(cur_state, Some(TaskState::Zombie) | Some(TaskState::Waiting)) {
         if let Some(next) = pick_ready(cur_pid) {
             let next_satp = next.memory_set.lock().satp();
