@@ -216,7 +216,11 @@ fn script_budget(script: &str) -> &'static str {
     match script {
         s if s.starts_with("basic_") => "20",
         s if s.starts_with("lua_") => "10",
-        s if s.starts_with("busybox_") => "20",
+        // busybox_cmd.txt has ~50 applet invocations including a real
+        // `sleep 5` and `sleep 1` (now that we linked the sleep applet
+        // into /bin), so the per-script wall-clock has to absorb at
+        // least 8s of real sleeping plus per-applet overhead.
+        s if s.starts_with("busybox_") => "45",
         s if s.starts_with("libctest_") => "30",
         s if s.starts_with("libcbench_") => "10",
         s if s.starts_with("iozone_") => "20",
