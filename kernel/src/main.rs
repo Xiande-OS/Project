@@ -110,6 +110,15 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         if let Some(d) = fs::tmpfs::downcast_dir(&dev_dir) {
             let shm = fs::tmpfs::TmpfsDir::new_root();
             d.place_inode("shm", shm as alloc::sync::Arc<dyn fs::Inode>).ok();
+            // busybox hwclock probes /dev/misc/rtc (and /dev/rtc) — provide a
+            // stub character device so open() succeeds. The default ioctl
+            // path returns 0, which is enough for hwclock to exit cleanly.
+            let misc = fs::tmpfs::TmpfsDir::new_root();
+            misc.create_special("rtc", fs::devfs::DevKind::Null).ok();
+            misc.create_special("rtc0", fs::devfs::DevKind::Null).ok();
+            d.place_inode("misc", misc as alloc::sync::Arc<dyn fs::Inode>).ok();
+            d.create_special("rtc", fs::devfs::DevKind::Null).ok();
+            d.create_special("rtc0", fs::devfs::DevKind::Null).ok();
         }
     }
     println!("[ok] heap + frame allocator + trap vector + vfs + /bin + /lib + /dev/shm");
