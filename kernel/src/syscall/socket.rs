@@ -324,6 +324,29 @@ pub fn sys_connect(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
             return 0;
         }
         SocketKind::Tcp => {
+            // Loopback fast-path: connect to 127.0.0.1 looks up the
+            // in-kernel listener registry and pairs us up without
+            // touching smoltcp. The agent that added net/loopback.rs
+            // forgot to wire this side — bind() already registers via
+            // register_listener() but connect() was still going out
+            // through smoltcp, which doesn't route 127.0.0.1 and so
+            // returned ECONNREFUSED.
+            if is_loopback(sa.addr) {
+                let task = current_task();
+                let lp_end = crate::net::loopback::try_connect(sa.port, 0);
+                match lp_end {
+                    Some(client_end) => {
+                        with_socket(fd, |s| {
+                            let mut st = s.state.lock();
+                            st.loopback = Some(client_end);
+                            st.peer = Some(SockAddrIn { addr: Ipv4Address::new(127, 0, 0, 1), port: sa.port });
+                        }).ok();
+                        let _ = task;
+                        return 0;
+                    }
+                    None => return ECONNREFUSED,
+                }
+            }
             // First call: start the connect. Subsequent calls (after
             // block_and_retry) just inspect state.
             if peer.is_none() {
