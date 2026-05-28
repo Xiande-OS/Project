@@ -525,6 +525,12 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
         return EFAULT;
     };
 
+    if syscall_trace_enabled() {
+        crate::println!(
+            "[openat pid={}] dfd={} flags={:#x} path={}",
+            crate::task::current_pid(), dfd, flags, path_str
+        );
+    }
     let cloexec = (flags & O_CLOEXEC) != 0;
     let create = (flags & O_CREAT) != 0;
     let excl = (flags & O_EXCL) != 0;
@@ -1895,10 +1901,23 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     // QEMU virt mtime ticks at 10 MHz: 1 tick = 100 ns.
     let total_ticks = (sec as u64).saturating_mul(10_000_000)
         + (nsec as u64) / 100;
-    let target = riscv::register::time::read64().saturating_add(total_ticks);
-    while riscv::register::time::read64() < target {
-        core::hint::spin_loop();
+    let now = riscv::register::time::read64();
+    let target = now.saturating_add(total_ticks);
+    if target <= now {
+        return 0;
     }
+    // Block instead of busy-spinning. Without this a polling sleeper
+    // (busybox `timeout` does nanosleep+kill in a tight loop) pinned
+    // the CPU and the actual wrapped command never got scheduled.
+    // We pre-write a0 = 0 before marking Waiting so that when the
+    // scheduler resumes us the trap return uses our value (the dispatch
+    // loop skips the post-syscall a0 write for Waiting tasks). sepc
+    // already points past ecall, so we do NOT rewind.
+    crate::task::sleep_until(task.pid, target);
+    unsafe {
+        (*task.tf_ptr()).x[9] = 0;
+    }
+    *task.state.lock() = crate::task::TaskState::Waiting;
     0
 }
 
@@ -2505,6 +2524,12 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
     };
     let argv = read_string_array(argv_addr).unwrap_or_default();
     let envp = read_string_array(envp_addr).unwrap_or_default();
+    if syscall_trace_enabled() {
+        crate::println!(
+            "[execve pid={}] {} argv={:?}",
+            crate::task::current_pid(), path, argv
+        );
+    }
 
     // Look up the binary in the VFS. Relative paths must resolve under
     // the caller's CWD, not the root — busybox sh invokes `./busybox`

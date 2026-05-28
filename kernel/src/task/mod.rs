@@ -271,6 +271,47 @@ pub fn all_tasks() -> Vec<Arc<Task>> {
     t.tasks.values().cloned().collect()
 }
 
+/// Tasks parked by sys_nanosleep / clock_nanosleep. The scheduler
+/// flips them back to Ready once their deadline (in mtime ticks) is
+/// reached. Before this, sys_nanosleep busy-spun until the deadline,
+/// pinning the CPU and starving any other Ready task — busybox
+/// `timeout` (a polling daemon doing `nanosleep + kill(self_parent,0)`)
+/// would hold the CPU forever and the actual wrapped command never got
+/// scheduled.
+static SLEEPING_UNTIL: spin::Mutex<alloc::collections::BTreeMap<i32, u64>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+pub fn sleep_until(pid: i32, deadline_ticks: u64) {
+    SLEEPING_UNTIL.lock().insert(pid, deadline_ticks);
+}
+
+pub fn forget_sleeper(pid: i32) {
+    SLEEPING_UNTIL.lock().remove(&pid);
+}
+
+/// Wake any nanosleep'd tasks whose deadline has been reached. Called
+/// from the scheduler hook on every trap exit; cheap when the map is
+/// empty.
+pub fn wake_expired_sleepers(now: u64) {
+    let expired: Vec<i32> = {
+        let m = SLEEPING_UNTIL.lock();
+        m.iter().filter_map(|(&pid, &d)| if now >= d { Some(pid) } else { None }).collect()
+    };
+    if expired.is_empty() {
+        return;
+    }
+    let mut m = SLEEPING_UNTIL.lock();
+    for pid in expired {
+        m.remove(&pid);
+        if let Some(t) = TABLE.lock().tasks.get(&pid).cloned() {
+            let mut s = t.state.lock();
+            if *s == TaskState::Waiting {
+                *s = TaskState::Ready;
+            }
+        }
+    }
+}
+
 /// CLONE_VFORK wakeup: the child has reached execve or exit. Any task whose
 /// `vfork_child` matches this pid is unblocked. Called from sys_execve (on
 /// success) and exit_one_thread.
@@ -811,6 +852,10 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
 
     // Sweep futex timeouts every trap exit; cheap on an empty queue.
     crate::sync::futex::poll_timeouts();
+
+    // Wake any nanosleep'd tasks whose deadline has elapsed. Without
+    // this a polling sleeper (busybox `timeout`) holds the CPU forever.
+    wake_expired_sleepers(riscv::register::time::read64());
 
     // Reap any detached threads (CLONE_THREAD) that died last round.
     // We can't reap the current pid even if dead — kstack still in use.
