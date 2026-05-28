@@ -11,6 +11,7 @@ mod drivers;
 mod fs;
 mod loader;
 mod mm;
+mod signal;
 mod sync;
 mod syscall;
 mod task;

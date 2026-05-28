@@ -110,6 +110,13 @@ impl MemorySet {
         }
     }
 
+    /// Install a user-readable+executable page at `va` containing `bytes`
+    /// (zero-padded to a page). Used for the signal-restorer trampoline.
+    pub fn map_user_rx_page(&mut self, va: VirtAddr, bytes: &[u8]) {
+        let area = VmArea::new(va, VirtAddr(va.0 + PAGE_SIZE), VmPerm::R | VmPerm::X | VmPerm::U);
+        self.push_user_area(area, Some(bytes));
+    }
+
     /// Push a user-mode area into this address space and (eagerly) back
     /// every page with a freshly allocated frame. If `init_data` is Some,
     /// the bytes are copied to the start of the area (zero padded).

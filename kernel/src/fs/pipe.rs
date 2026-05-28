@@ -9,6 +9,8 @@ use spin::Mutex;
 
 use super::{FileType, Inode, Result, EBADF, EINVAL};
 
+const EPIPE: i32 = -32;
+
 const PIPE_CAP: usize = 64 * 1024;
 
 struct PipeBuffer {
@@ -72,6 +74,13 @@ impl Inode for PipeEnd {
             return Err(EBADF);
         }
         let mut pipe = self.inner.lock();
+        // Read end closed: deliver SIGPIPE to the writer and return EPIPE.
+        if pipe.closed_read {
+            drop(pipe);
+            let task = crate::task::current_task();
+            let _ = crate::signal::raise_signal(&task, crate::signal::SIGPIPE);
+            return Err(EPIPE);
+        }
         let mut n = 0;
         while n < buf.len() && pipe.buf.len() < PIPE_CAP {
             pipe.buf.push_back(buf[n]);
@@ -81,6 +90,17 @@ impl Inode for PipeEnd {
             return Err(EINVAL); // full
         }
         Ok(n)
+    }
+}
+
+impl Drop for PipeEnd {
+    fn drop(&mut self) {
+        let mut pipe = self.inner.lock();
+        if self.is_writer {
+            pipe.closed_write = true;
+        } else {
+            pipe.closed_read = true;
+        }
     }
 }
 

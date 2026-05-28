@@ -15,6 +15,28 @@ pub use tmpfs::TmpfsDir;
 /// `console_read` returns it first before going back to SBI.
 static CONSOLE_PEEK: Mutex<Option<u8>> = Mutex::new(None);
 
+/// Translate raw tty control chars to signals (sent to the foreground pgrp).
+/// Returns `Some(b)` if the char should still be delivered as input, or
+/// `None` if it was a signal-trigger and should be swallowed.
+fn handle_tty_input(b: u8) -> Option<u8> {
+    use crate::signal::{SIGINT, SIGQUIT, SIGTSTP};
+    match b {
+        0x03 => {
+            crate::syscall::deliver_tty_signal(SIGINT);
+            None
+        }
+        0x1c => {
+            crate::syscall::deliver_tty_signal(SIGQUIT);
+            None
+        }
+        0x1a => {
+            crate::syscall::deliver_tty_signal(SIGTSTP);
+            None
+        }
+        _ => Some(b),
+    }
+}
+
 fn get_console_byte_blocking() -> u8 {
     loop {
         let c = sbi_rt::legacy::console_getchar();
@@ -23,7 +45,11 @@ fn get_console_byte_blocking() -> u8 {
             continue;
         }
         let b = c as u8;
-        return if b == b'\r' { b'\n' } else { b };
+        let b = if b == b'\r' { b'\n' } else { b };
+        if let Some(b) = handle_tty_input(b) {
+            return b;
+        }
+        // Was a signal-trigger -- loop and read the next byte (or block).
     }
 }
 
@@ -33,7 +59,8 @@ fn get_console_byte_nonblock() -> Option<u8> {
         None
     } else {
         let b = c as u8;
-        Some(if b == b'\r' { b'\n' } else { b })
+        let b = if b == b'\r' { b'\n' } else { b };
+        handle_tty_input(b)
     }
 }
 

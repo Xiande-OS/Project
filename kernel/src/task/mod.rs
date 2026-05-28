@@ -64,6 +64,7 @@ pub struct Task {
     pub state: Mutex<TaskState>,
     pub exit_code: AtomicI32,
     pub children: Mutex<Vec<i32>>,
+    pub signals: crate::signal::SignalState,
 }
 
 unsafe impl Send for Task {}
@@ -223,6 +224,13 @@ pub fn any_waiting() -> bool {
     t.tasks.values().any(|task| *task.state.lock() == TaskState::Waiting)
 }
 
+/// Snapshot of every task in the table. Cloning Arcs keeps it cheap
+/// and avoids holding the table lock while callers iterate.
+pub fn all_tasks() -> Vec<Arc<Task>> {
+    let t = TABLE.lock();
+    t.tasks.values().cloned().collect()
+}
+
 // ----- Initial task creation -----
 
 pub fn create_task_from_elf(
@@ -234,6 +242,7 @@ pub fn create_task_from_elf(
     map_kernel_into(&mut ms);
     let elf = crate::loader::load_elf(elf_image, &mut ms).expect("ELF load");
     let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);
+    crate::signal::install_restorer_page(&mut ms);
 
     let mut tf = TrapFrame::default();
     tf.sepc = elf.entry;
@@ -288,6 +297,7 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
         state: Mutex::new(TaskState::Running),
         exit_code: AtomicI32::new(0),
         children: Mutex::new(Vec::new()),
+        signals: crate::signal::SignalState::new(),
     });
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
@@ -416,6 +426,15 @@ pub fn fork_current() -> Arc<Task> {
         *task.fd_table.lock() = new_fdt;
         *task.cwd.lock() = parent.cwd.lock().clone();
         parent.children.lock().push(task.pid);
+        // Inherit signal dispositions and mask, but child starts with no
+        // pending signals.
+        let inherited = parent.signals.fork_inherit();
+        *task.signals.actions.lock() = *inherited.actions.lock();
+        task.signals.mask.store(
+            inherited.mask.load(core::sync::atomic::Ordering::Relaxed),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        *task.signals.altstack.lock() = *inherited.altstack.lock();
     }
     TABLE.lock().tasks.insert(task.pid, task.clone());
     task
@@ -428,6 +447,7 @@ pub fn execve_current(elf_image: &[u8], argv: &[&str], envp: &[&str]) -> Result<
     map_kernel_into(&mut ms);
     let elf = crate::loader::load_elf(elf_image, &mut ms).map_err(|_| -22i32)?;
     let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);
+    crate::signal::install_restorer_page(&mut ms);
 
     // Replace memory_set and activate its satp immediately.
     let new_satp;
@@ -455,6 +475,10 @@ pub fn execve_current(elf_image: &[u8], argv: &[&str], envp: &[&str]) -> Result<
 
     // close-on-exec
     task.fd_table.lock().close_cloexec();
+
+    // POSIX: keep mask, reset every user-installed handler to SIG_DFL
+    // (SIG_IGN survives), clear pending, clear altstack.
+    task.signals.reset_for_exec();
     Ok(())
 }
 
@@ -481,6 +505,25 @@ pub fn run_user_loop(task: &Arc<Task>) -> ! {
 /// switches satp + current_pid accordingly. Returns the TF to load.
 pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     let cur_pid = current_pid();
+
+    // Run signal delivery for the current task before considering a switch.
+    // Doing this before scheduling means terminating-by-signal flows through
+    // the same Zombie path as sys_exit. We must call this only if the cur
+    // task is still active (not already Zombie/Waiting).
+    if let Some(cur) = task_by_pid(cur_pid) {
+        let st = *cur.state.lock();
+        if matches!(st, TaskState::Ready | TaskState::Running) {
+            // SAFETY: current_tf is the kernel-side TF for the current task.
+            // No other CPU runs concurrently on this kernel.
+            let became_zombie = unsafe {
+                crate::signal::check_signals(&cur, &mut *current_tf)
+            };
+            if became_zombie {
+                // Fall through to scheduler -- it'll pick another task.
+            }
+        }
+    }
+
     let cur_state = task_by_pid(cur_pid).map(|t| *t.state.lock());
 
     if matches!(cur_state, Some(TaskState::Zombie) | Some(TaskState::Waiting)) {
@@ -494,11 +537,25 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
                     satp = in(reg) satp,
                 );
             }
-            return next.tf_ptr();
+            // Also deliver signals to the new current task.
+            let next_tf = next.tf_ptr();
+            unsafe {
+                crate::signal::check_signals(&next, &mut *next_tf);
+            }
+            return next_tf;
         }
         if cur_state == Some(TaskState::Waiting) {
             if let Some(t) = task_by_pid(cur_pid) {
                 *t.state.lock() = TaskState::Running;
+            }
+        }
+        if cur_state == Some(TaskState::Zombie) {
+            // No other runnable task -- shutdown.
+            if !any_runnable_except(cur_pid) && !any_waiting() {
+                sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+                loop {
+                    unsafe { core::arch::asm!("wfi") };
+                }
             }
         }
     }
