@@ -186,38 +186,16 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
             // each line still has enough samples to print a non-zero
             // result. We do this in the driver (not in the source on
             // disk) so the upstream image stays untouched.
-            if script.starts_with("unixbench_") {
-                // The benches are invoked as either:
-                //   ./<bench> 10            (cheap timed loops)
-                //   ./<bench> 10 exec       (syscall sub-mode)
-                //   ./fstime ... -t 20 ...  (fstime variants)
-                //   ./looper 20 ./multi.sh N (shell stress)
-                // Rewrite the explicit "10"/"20" timers down to 2/3 so
-                // the whole script can finish inside the 90s budget.
-                // We constrain each replacement with a leading space so
-                // we don't accidentally rewrite numbers inside e.g.
-                // "-b 256" or "-m 500".
-                s.push_str(&alloc::format!(
-                    "./busybox sed \
--e 's/ 10 / 2 /g' \
--e 's/ 10$/ 2/g' \
--e 's/-t 20 /-t 3 /g' \
--e 's/looper 20 /looper 3 /g' \
-./{s} > ./{s}.short\n",
-                    s = script
-                ));
-                s.push_str(&alloc::format!(
-                    "./busybox timeout -s KILL {b} ./busybox sh ./{s}.short\n",
-                    b = budget,
-                    s = script
-                ));
-            } else {
-                s.push_str(&alloc::format!(
-                    "./busybox timeout -s KILL {b} ./busybox sh ./{s}\n",
-                    b = budget,
-                    s = script
-                ));
-            }
+            // Just run the script with its budget. Any per-bench arg
+            // rewriting (unixbench upstream uses 10/20s timers that
+            // far exceed our 90s budget) is done at sdcard-build time,
+            // not via in-kernel sed: the redirect-into-overlay path is
+            // fragile and the test image is rebuilt for each run anyway.
+            s.push_str(&alloc::format!(
+                "./busybox timeout -s KILL {b} ./busybox sh ./{s}\n",
+                b = budget,
+                s = script
+            ));
             s.push_str(&alloc::format!(
                 "./busybox echo '#### OS COMP TEST GROUP END {g}-{v} ####'\n",
                 g = group,

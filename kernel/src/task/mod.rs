@@ -979,7 +979,11 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
 
     // Wake any nanosleep'd tasks whose deadline has elapsed. Without
     // this a polling sleeper (busybox `timeout`) holds the CPU forever.
-    wake_expired_sleepers(riscv::register::time::read64());
+    {
+        let now = riscv::register::time::read64();
+        wake_expired_sleepers(now);
+        wake_expired_itimers(now);
+    }
 
     // Reap any detached threads (CLONE_THREAD) that died last round.
     // We can't reap the current pid even if dead — kstack still in use.
@@ -1025,7 +1029,11 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         //     which case panic with a state dump so the failure is
         //     visible instead of a silent hang.
         loop {
-            wake_expired_sleepers(riscv::register::time::read64());
+            {
+        let now = riscv::register::time::read64();
+        wake_expired_sleepers(now);
+        wake_expired_itimers(now);
+    }
             crate::sync::futex::poll_timeouts();
             if any_runnable_except(cur_pid) { break; }
             if let Some(t) = task_by_pid(cur_pid) {
@@ -1104,7 +1112,11 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             }
             // Zombie path: spin until something Ready appears.
             loop {
-                wake_expired_sleepers(riscv::register::time::read64());
+                {
+        let now = riscv::register::time::read64();
+        wake_expired_sleepers(now);
+        wake_expired_itimers(now);
+    }
                 crate::sync::futex::poll_timeouts();
                 if crate::net::poll_with_progress() {
                     wake_socket_waiters();
