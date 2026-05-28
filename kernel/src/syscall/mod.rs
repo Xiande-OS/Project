@@ -80,9 +80,10 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_FSYNC => 0,
         nr::SYS_UTIMENSAT => sys_utimensat(a0 as i32, a1, a2, a3 as i32),
         nr::SYS_NANOSLEEP => sys_nanosleep(a0, a1),
-        nr::SYS_EXIT | nr::SYS_EXIT_GROUP => sys_exit(a0 as i32),
+        nr::SYS_EXIT => sys_exit(a0 as i32),
+        nr::SYS_EXIT_GROUP => sys_exit_group(a0 as i32),
         nr::SYS_BRK => sys_brk(a0),
-        nr::SYS_SET_TID_ADDRESS => 1,
+        nr::SYS_SET_TID_ADDRESS => sys_set_tid_address(a0),
         nr::SYS_SET_ROBUST_LIST => 0,
         nr::SYS_RT_SIGACTION => sys_rt_sigaction(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(a0 as i32, a1, a2, a3),
@@ -94,7 +95,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         }
         nr::SYS_IOCTL => sys_ioctl(a0 as i32, a1 as u32, a2),
         nr::SYS_GETUID | nr::SYS_GETEUID | nr::SYS_GETGID | nr::SYS_GETEGID => 0,
-        nr::SYS_GETPID | nr::SYS_GETTID => current_task().pid as isize,
+        nr::SYS_GETPID => current_task().tgid.load(core::sync::atomic::Ordering::Relaxed) as isize,
+        nr::SYS_GETTID => current_task().pid as isize,
         nr::SYS_GETPPID => {
             current_task().ppid.load(core::sync::atomic::Ordering::Relaxed) as isize
         }
@@ -142,7 +144,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_TGKILL => sys_tgkill(a0 as i32, a1 as i32, a2 as i32),
         nr::SYS_TKILL => sys_tkill(a0 as i32, a1 as i32),
         nr::SYS_KILL => sys_kill(a0 as i32, a1 as i32),
-        nr::SYS_FUTEX => 0,
+        nr::SYS_FUTEX => sys_futex(a0, a1 as i32, a2 as u32, a3, a4, a5 as u32),
         nr::SYS_PPOLL => sys_ppoll(a0, a1, a2),
         nr::SYS_SIGALTSTACK => sys_sigaltstack(a0, a1),
         nr::SYS_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(a0, a1, a2),
@@ -2248,25 +2250,94 @@ fn sys_setsid() -> isize {
     me.pid as isize
 }
 
+/// Per-POSIX, exit_thread (sys_exit) terminates only the calling thread.
+/// The process (tgid) survives until the *last* thread exits, at which
+/// point we send SIGCHLD to the parent.
 fn sys_exit(status: i32) -> isize {
-    let task = current_task();
+    exit_one_thread(&current_task(), status, /* group_exit = */ false);
+    0
+}
+
+/// exit_group: terminate every thread in this tgid with `status`. Used
+/// by `_exit`, `abort`, signal-default-terminate paths.
+fn sys_exit_group(status: i32) -> isize {
+    let me = current_task();
+    let my_tgid = me.tgid.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Snapshot the list of sibling threads (other tasks with same tgid).
+    let mut siblings: alloc::vec::Vec<alloc::sync::Arc<crate::task::Task>> =
+        crate::task::all_tasks()
+            .into_iter()
+            .filter(|t| {
+                t.tgid.load(core::sync::atomic::Ordering::Relaxed) == my_tgid
+                    && t.pid != me.pid
+            })
+            .collect();
+    // Mark each sibling Zombie + drop them from any futex queue.
+    for s in siblings.drain(..) {
+        s.exit_code
+            .store((status & 0xff) << 8, core::sync::atomic::Ordering::Relaxed);
+        crate::sync::futex::forget_task(s.pid);
+        clear_child_tid(&s);
+        *s.state.lock() = crate::task::TaskState::Zombie;
+        println!("[exit_group] pid={} status={}", s.pid, status);
+    }
+    // Now exit ourselves (group-exit: this is the leader's exit so the
+    // parent gets SIGCHLD).
+    exit_one_thread(&me, status, /* group_exit = */ true);
+    0
+}
+
+/// Common exit path for one thread. If this is the last thread in the
+/// tgid (or `group_exit`), notify the parent via SIGCHLD + wake.
+fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, group_exit: bool) {
     // Pre-encode the wait4 status as Linux expects: normal exit puts the
     // low byte of `status` in bits 8..15. wait4 returns it verbatim.
     task.exit_code
         .store((status & 0xff) << 8, core::sync::atomic::Ordering::Relaxed);
+
+    // CLONE_CHILD_CLEARTID handling: store 0 to ctid, wake one futex.
+    clear_child_tid(task);
+
+    // Drop ourselves from any futex queue.
+    crate::sync::futex::forget_task(task.pid);
+
     *task.state.lock() = crate::task::TaskState::Zombie;
     println!("[exit] pid={} status={}", task.pid, status);
 
-    // Wake any parent in wait4 and send SIGCHLD.
-    let ppid = task.ppid.load(core::sync::atomic::Ordering::Relaxed);
-    if let Some(parent) = crate::task::task_by_pid(ppid) {
-        {
-            let mut s = parent.state.lock();
-            if *s == crate::task::TaskState::Waiting {
-                *s = crate::task::TaskState::Ready;
+    // Is this the last thread alive in this tgid?
+    let my_tgid = task.tgid.load(core::sync::atomic::Ordering::Relaxed);
+    let any_alive = crate::task::all_tasks().into_iter().any(|t| {
+        t.tgid.load(core::sync::atomic::Ordering::Relaxed) == my_tgid
+            && t.pid != task.pid
+            && *t.state.lock() != crate::task::TaskState::Zombie
+    });
+
+    // For non-leader threads (tgid != pid), there is no parent that
+    // will wait4 for us — POSIX says SIGCHLD is sent only when the
+    // *process* (last thread) exits. We're detached, so self-reap.
+    let is_thread = task.tgid.load(core::sync::atomic::Ordering::Relaxed) != task.pid;
+    let leader_exit = group_exit || !any_alive;
+    if leader_exit {
+        let ppid = task.ppid.load(core::sync::atomic::Ordering::Relaxed);
+        if let Some(parent) = crate::task::task_by_pid(ppid) {
+            {
+                let mut s = parent.state.lock();
+                if *s == crate::task::TaskState::Waiting {
+                    *s = crate::task::TaskState::Ready;
+                }
             }
+            let _ = crate::signal::raise_signal(&parent, crate::signal::SIGCHLD);
         }
-        let _ = crate::signal::raise_signal(&parent, crate::signal::SIGCHLD);
+    }
+
+    if is_thread {
+        // Non-leader thread: no one will ever wait4 for this pid. Self-reap
+        // *after* scheduler picks the next task. We can't reap now (the
+        // scheduler still needs to read our state == Zombie to skip us);
+        // instead, mark a "needs_reap" flag and reap on the next schedule.
+        // Simpler: defer to a lazy sweep via a side channel.
+        mark_for_self_reap(task.pid);
     }
 
     // If no other runnable/waiting/zombie task exists, halt.
@@ -2277,22 +2348,93 @@ fn sys_exit(status: i32) -> isize {
             unsafe { core::arch::asm!("wfi") };
         }
     }
-    0
+}
+
+/// PIDs of detached threads that should be reaped (deleted from the
+/// task table + kstack freed) on the next scheduling boundary. We can't
+/// reap inline because the scheduler still needs to observe our Zombie
+/// state to switch off us.
+static SELF_REAP_LIST: spin::Mutex<alloc::vec::Vec<i32>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+fn mark_for_self_reap(pid: i32) {
+    SELF_REAP_LIST.lock().push(pid);
+}
+
+/// Called by the scheduler each trap exit. Reap pids queued for self-reap
+/// (CLONE_THREAD detached threads whose memory is no longer needed). We
+/// skip the *current* pid; it gets reaped next round.
+pub fn drain_self_reap_list(except: i32) {
+    let pids: alloc::vec::Vec<i32> = {
+        let mut l = SELF_REAP_LIST.lock();
+        let kept: alloc::vec::Vec<i32> = l.iter().copied().filter(|&p| p == except).collect();
+        let to_take: alloc::vec::Vec<i32> = l.iter().copied().filter(|&p| p != except).collect();
+        *l = kept;
+        to_take
+    };
+    for pid in pids {
+        crate::task::reap(pid);
+    }
+}
+
+/// If a CLONE_CHILD_CLEARTID address was registered for `task`, store 0
+/// to it and futex_wake(addr, 1). This is what unblocks pthread_join().
+fn clear_child_tid(task: &alloc::sync::Arc<crate::task::Task>) {
+    let addr = *task.clear_child_tid.lock();
+    if addr == 0 {
+        return;
+    }
+    *task.clear_child_tid.lock() = 0;
+    let _ = task.copy_out_bytes(addr, &0i32.to_le_bytes());
+    // Wake one waiter on this futex. Use the global futex machinery, but
+    // we must perform the wake AS the exiting task (so the futex key is
+    // computed via this task's MS — necessary in the no-CLONE_VM case).
+    // crate::sync::futex::do_futex with a borrowed task isn't there yet;
+    // do it directly by translating + waking.
+    futex_wake_via_task(task, addr, 1);
+}
+
+fn futex_wake_via_task(task: &alloc::sync::Arc<crate::task::Task>, uaddr: usize, n: i32) {
+    // Resolve PA via this task's MS (so the key matches what FUTEX_WAIT
+    // used). We can't reach private helpers in sync::futex from outside
+    // easily, so use the global op via a temporary current_task swap?
+    // Simpler: temporarily set CURRENT_PID to this task. But we're called
+    // from sys_exit_group iterating siblings — we ARE the current task
+    // executing.
+    //
+    // Instead just call do_futex with the appropriate args, but use this
+    // task's MS to compute the PA — implement a small public helper.
+    crate::sync::futex::wake_for_task(task, uaddr, n);
 }
 
 pub fn sys_kill_current(status: i32) -> isize {
     sys_exit(status)
 }
 
-fn sys_clone(flags: usize, child_sp: usize, _ptid: usize, _ctid: usize, _newtls: usize) -> isize {
-    let _ = flags;
-    let new_task = crate::task::fork_current();
-    if child_sp != 0 {
-        unsafe {
-            (*new_task.tf_ptr()).x[1] = child_sp;
-        }
-    }
+/// RISC-V (and most "generic") clone calling convention:
+///   a0 = clone_flags | (exit_signal & 0xff)
+///   a1 = child_sp
+///   a2 = parent_tid_ptr
+///   a3 = tls
+///   a4 = child_tid_ptr
+///
+/// Note the swap of a3/a4 vs the standard musl prototype — RISC-V uses
+/// the same order as ARM/x86_64. Musl's pthread_create passes:
+///   flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD
+///         |CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID
+///   a1=child_sp, a2=&tid (==ptid), a3=tls, a4=&tid (==ctid)
+fn sys_clone(flags: usize, child_sp: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
+    let new_task = crate::task::clone_current(flags, child_sp, ptid, ctid, tls);
     new_task.pid as isize
+}
+
+fn sys_set_tid_address(addr: usize) -> isize {
+    let task = current_task();
+    *task.clear_child_tid.lock() = addr;
+    task.pid as isize
+}
+
+fn sys_futex(uaddr: usize, op: i32, val: u32, val2: usize, uaddr2: usize, val3: u32) -> isize {
+    crate::sync::futex::do_futex(uaddr, op, val, val2, uaddr2, val3)
 }
 
 fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {

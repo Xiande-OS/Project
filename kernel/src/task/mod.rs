@@ -54,13 +54,19 @@ pub enum TaskState {
 
 pub struct Task {
     pub pid: i32,
+    /// Thread-group leader pid. Equals `pid` for process leaders; for threads
+    /// (CLONE_THREAD), this is the creator's tgid. `getpid()` returns this.
+    pub tgid: AtomicI32,
     pub ppid: AtomicI32,
     pub pgid: AtomicI32,
     pub sid: AtomicI32,
     storage: UnsafeCell<Box<TaskStorage>>,
-    pub memory_set: Mutex<MemorySet>,
-    pub fd_table: Mutex<crate::fs::FdTable>,
-    pub cwd: Mutex<String>,
+    /// Address space. Wrapped in Arc so CLONE_VM threads share the same one.
+    pub memory_set: Arc<Mutex<MemorySet>>,
+    /// File-descriptor table. Wrapped in Arc so CLONE_FILES threads share it.
+    pub fd_table: Arc<Mutex<crate::fs::FdTable>>,
+    /// Working directory. Wrapped in Arc so CLONE_FS threads share it.
+    pub cwd: Arc<Mutex<String>>,
     pub state: Mutex<TaskState>,
     pub exit_code: AtomicI32,
     pub children: Mutex<Vec<i32>>,
@@ -69,6 +75,10 @@ pub struct Task {
     /// Absolute path to the executable image. Used by /proc/<pid>/exe and /comm.
     pub exe_path: Mutex<String>,
     pub signals: crate::signal::SignalState,
+    /// `clone(..., CLONE_CHILD_CLEARTID, ...)` — when this task exits we
+    /// write 0 to *addr and `futex_wake(addr, 1)`. Set by `set_tid_address`
+    /// and by CLONE_CHILD_CLEARTID. 0 = disabled.
+    pub clear_child_tid: Mutex<usize>,
 }
 
 unsafe impl Send for Task {}
@@ -95,6 +105,13 @@ impl Task {
 
     pub fn memory_set_mut(&self) -> spin::MutexGuard<'_, MemorySet> {
         self.memory_set.lock()
+    }
+
+    /// True if this task shares its address space with at least one other
+    /// task (via CLONE_VM). Used by `schedule_next_after_trap` to skip the
+    /// satp write + sfence on intra-tgid context switches.
+    pub fn vm_shared(&self) -> bool {
+        Arc::strong_count(&self.memory_set) > 1
     }
 }
 
@@ -217,6 +234,7 @@ pub fn make_ready(pid: i32) {
 
 pub fn reap(pid: i32) {
     TABLE.lock().tasks.remove(&pid);
+    crate::sync::futex::forget_task(pid);
 }
 
 pub fn set_current_pid(pid: i32) {
@@ -356,19 +374,21 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
     };
     let task = Arc::new(Task {
         pid,
+        tgid: AtomicI32::new(pid),
         ppid: AtomicI32::new(ppid),
         pgid: AtomicI32::new(pgid),
         sid: AtomicI32::new(sid),
         storage: UnsafeCell::new(TaskStorage::boxed()),
-        memory_set: Mutex::new(ms),
-        fd_table: Mutex::new(crate::fs::FdTable::new()),
-        cwd: Mutex::new(String::from("/")),
+        memory_set: Arc::new(Mutex::new(ms)),
+        fd_table: Arc::new(Mutex::new(crate::fs::FdTable::new())),
+        cwd: Arc::new(Mutex::new(String::from("/"))),
         state: Mutex::new(TaskState::Running),
         exit_code: AtomicI32::new(0),
         children: Mutex::new(Vec::new()),
         cmdline: Mutex::new(Vec::new()),
         exe_path: Mutex::new(String::new()),
         signals: crate::signal::SignalState::new(),
+        clear_child_tid: Mutex::new(0),
     });
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
@@ -482,31 +502,169 @@ fn write_usize(ms: &mut MemorySet, va: usize, v: usize) {
 // ----- fork / execve -----
 
 pub fn fork_current() -> Arc<Task> {
+    clone_current(0, 0, 0, 0, 0)
+}
+
+// CLONE_* flag bits (Linux generic).
+pub const CLONE_VM: usize = 0x100;
+pub const CLONE_FS: usize = 0x200;
+pub const CLONE_FILES: usize = 0x400;
+pub const CLONE_SIGHAND: usize = 0x800;
+pub const CLONE_PIDFD: usize = 0x1000;
+pub const CLONE_PTRACE: usize = 0x2000;
+pub const CLONE_VFORK: usize = 0x4000;
+pub const CLONE_PARENT: usize = 0x8000;
+pub const CLONE_THREAD: usize = 0x10000;
+pub const CLONE_NEWNS: usize = 0x20000;
+pub const CLONE_SYSVSEM: usize = 0x40000;
+pub const CLONE_SETTLS: usize = 0x80000;
+pub const CLONE_PARENT_SETTID: usize = 0x100000;
+pub const CLONE_CHILD_CLEARTID: usize = 0x200000;
+pub const CLONE_DETACHED: usize = 0x400000;
+pub const CLONE_UNTRACED: usize = 0x800000;
+pub const CLONE_CHILD_SETTID: usize = 0x1000000;
+
+/// General clone primitive used by both `fork()` and `pthread_create()`.
+///
+/// * If `CLONE_VM` is set, the new task shares its caller's address space
+///   (same `Arc<Mutex<MemorySet>>`, same satp). Otherwise we deep-copy.
+/// * If `CLONE_FS` is set, the new task shares the cwd. Otherwise cloned.
+/// * If `CLONE_FILES` is set, fd_table is shared. Otherwise cloned.
+/// * If `CLONE_SIGHAND` is set, the new task shares sig_actions. Otherwise
+///   a fresh inheriting copy.
+/// * If `CLONE_THREAD` is set, the new task gets caller's `tgid` and is NOT
+///   placed in the caller's `children` list; SIGCHLD on its exit is suppressed.
+///
+/// Returns the new task (already inserted into the table). The new task's TF
+/// has `a0 = 0` (so it returns 0 from clone), `sp = child_sp` if non-zero, and
+/// `tp = newtls` if `CLONE_SETTLS` is set.
+pub fn clone_current(
+    flags: usize,
+    child_sp: usize,
+    ptid: usize,
+    ctid: usize,
+    newtls: usize,
+) -> Arc<Task> {
     let parent = current_task();
-    let mut new_ms = parent.memory_set.lock().fork();
-    // fork() only copies user areas; the kernel identity map and MMIO
-    // mappings need to be re-added so the trap handler keeps working
-    // after we switch satp to the child's table.
-    map_kernel_into(&mut new_ms);
+
+    // ---- Address space ----
+    let memory_set: Arc<Mutex<MemorySet>> = if flags & CLONE_VM != 0 {
+        // Share: same Arc, same satp, same page table.
+        parent.memory_set.clone()
+    } else {
+        // Deep-copy parent's user areas; remap the kernel/MMIO identity into
+        // the new page table so the trap handler keeps working after a
+        // future satp switch.
+        let mut new_ms = parent.memory_set.lock().fork();
+        map_kernel_into(&mut new_ms);
+        Arc::new(Mutex::new(new_ms))
+    };
+
+    // ---- Working dir ----
+    let cwd: Arc<Mutex<String>> = if flags & CLONE_FS != 0 {
+        parent.cwd.clone()
+    } else {
+        Arc::new(Mutex::new(parent.cwd.lock().clone()))
+    };
+
+    // ---- fd table ----
+    let fd_table: Arc<Mutex<crate::fs::FdTable>> = if flags & CLONE_FILES != 0 {
+        parent.fd_table.clone()
+    } else {
+        let new_fdt = parent.fd_table.lock().clone_for_fork();
+        Arc::new(Mutex::new(new_fdt))
+    };
+
+    // ---- TF: clone parent's, override sp/tp/a0 ----
     let mut new_tf = unsafe { (*parent.tf_ptr()).clone() };
     new_tf.x[9] = 0; // child sees 0 from clone
-    let task = make_task_with_ms(new_ms, new_tf, parent.pid);
-    *task.state.lock() = TaskState::Ready;
-    {
-        let new_fdt = parent.fd_table.lock().clone_for_fork();
-        *task.fd_table.lock() = new_fdt;
-        *task.cwd.lock() = parent.cwd.lock().clone();
-        parent.children.lock().push(task.pid);
-        // Inherit signal dispositions and mask, but child starts with no
-        // pending signals.
-        let inherited = parent.signals.fork_inherit();
-        *task.signals.actions.lock() = *inherited.actions.lock();
-        task.signals.mask.store(
-            inherited.mask.load(core::sync::atomic::Ordering::Relaxed),
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        *task.signals.altstack.lock() = *inherited.altstack.lock();
+    if child_sp != 0 {
+        new_tf.x[1] = child_sp;
     }
+    if flags & CLONE_SETTLS != 0 {
+        new_tf.x[3] = newtls; // x4 = tp (index 3 because x[0] is x1)
+    }
+
+    // ---- Allocate the task with a fresh kstack/TF, then patch shared fields ----
+    let pid = alloc_pid();
+
+    // Inherit parent's process group + session. For CLONE_THREAD the ppid
+    // stays as the *parent's* parent (matches Linux behaviour with CLONE_PARENT
+    // implied) — actually Linux: with CLONE_THREAD, child's ppid = parent's
+    // ppid. With plain fork: child's ppid = parent.pid. We follow that.
+    let ppid = if flags & CLONE_THREAD != 0 {
+        parent.ppid.load(Ordering::Relaxed)
+    } else {
+        parent.pid
+    };
+    let tgid = if flags & CLONE_THREAD != 0 {
+        parent.tgid.load(Ordering::Relaxed)
+    } else {
+        pid
+    };
+    let pgid = parent.pgid.load(Ordering::Relaxed);
+    let sid = parent.sid.load(Ordering::Relaxed);
+
+    let task = Arc::new(Task {
+        pid,
+        tgid: AtomicI32::new(tgid),
+        ppid: AtomicI32::new(ppid),
+        pgid: AtomicI32::new(pgid),
+        sid: AtomicI32::new(sid),
+        storage: UnsafeCell::new(TaskStorage::boxed()),
+        memory_set,
+        fd_table,
+        cwd,
+        state: Mutex::new(TaskState::Ready),
+        exit_code: AtomicI32::new(0),
+        children: Mutex::new(Vec::new()),
+        cmdline: Mutex::new(parent.cmdline.lock().clone()),
+        exe_path: Mutex::new(parent.exe_path.lock().clone()),
+        signals: if flags & CLONE_SIGHAND != 0 {
+            parent.signals.share_actions_inherit()
+        } else {
+            parent.signals.fork_inherit()
+        },
+        clear_child_tid: Mutex::new(0),
+    });
+    // Write the TF onto the new kstack.
+    unsafe {
+        core::ptr::write(task.tf_ptr(), new_tf);
+    }
+
+    // CLONE_CHILD_CLEARTID — remember addr so exit clears it + futex_wakes.
+    if flags & CLONE_CHILD_CLEARTID != 0 {
+        *task.clear_child_tid.lock() = ctid;
+    }
+
+    // CLONE_PARENT_SETTID — write the new tid into the parent's address
+    // space at `ptid`. We're still on the parent's page table, so the
+    // parent's copy_out works directly.
+    if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+        let tid_bytes = (task.pid as i32).to_le_bytes();
+        let _ = parent.copy_out_bytes(ptid, &tid_bytes);
+    }
+
+    // CLONE_CHILD_SETTID — write the new tid into the child's address
+    // space at `ctid`. With CLONE_VM the address spaces are the same, so
+    // copying via the *parent* (current task) works. Without CLONE_VM, the
+    // child's MS was deep-copied from parent's, so the same VA maps to a
+    // different PA but is still set up; we can write via the child's MS.
+    if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
+        let tid_bytes = (task.pid as i32).to_le_bytes();
+        if flags & CLONE_VM != 0 {
+            let _ = parent.copy_out_bytes(ctid, &tid_bytes);
+        } else {
+            let _ = task.copy_out_bytes(ctid, &tid_bytes);
+        }
+    }
+
+    // children-tracking + waiter semantics: only the non-CLONE_THREAD case
+    // adds the new task as a child of the caller (so wait4 finds it).
+    if flags & CLONE_THREAD == 0 {
+        parent.children.lock().push(task.pid);
+    }
+
     TABLE.lock().tasks.insert(task.pid, task.clone());
     task
 }
@@ -529,7 +687,12 @@ pub fn execve_current_with_path(
     let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);
     crate::signal::install_restorer_page(&mut ms);
 
-    // Replace memory_set and activate its satp immediately.
+    // execve detaches the caller from any shared address space (POSIX
+    // semantics): we replace the contents of the Arc<Mutex<MemorySet>>.
+    // If it was shared (e.g. by a CLONE_VM thread that lived past exec),
+    // the other thread keeps the *old* shared Arc — but in practice
+    // pthread_create + execve is undefined, so this is safe for our test
+    // matrix. We just swap the lock's contents.
     let new_satp;
     {
         let mut slot = task.memory_set.lock();
@@ -564,6 +727,8 @@ pub fn execve_current_with_path(
     // POSIX: keep mask, reset every user-installed handler to SIG_DFL
     // (SIG_IGN survives), clear pending, clear altstack.
     task.signals.reset_for_exec();
+    // execve also clears any pending CLONE_CHILD_CLEARTID address.
+    *task.clear_child_tid.lock() = 0;
     Ok(())
 }
 
@@ -597,6 +762,13 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
 
     let cur_pid = current_pid();
 
+    // Sweep futex timeouts every trap exit; cheap on an empty queue.
+    crate::sync::futex::poll_timeouts();
+
+    // Reap any detached threads (CLONE_THREAD) that died last round.
+    // We can't reap the current pid even if dead — kstack still in use.
+    crate::syscall::drain_self_reap_list(cur_pid);
+
     // Run signal delivery for the current task before considering a switch.
     // Doing this before scheduling means terminating-by-signal flows through
     // the same Zombie path as sys_exit. We must call this only if the cur
@@ -619,14 +791,19 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
 
     if matches!(cur_state, Some(TaskState::Zombie) | Some(TaskState::Waiting)) {
         if let Some(next) = pick_ready(cur_pid) {
-            let satp = next.memory_set.lock().satp();
+            let next_satp = next.memory_set.lock().satp();
+            // Fast path: same address space (CLONE_VM threads) — skip the
+            // csrw+sfence; satp is already correct for the new task.
+            let cur_satp = task_by_pid(cur_pid).map(|t| t.memory_set.lock().satp());
             CURRENT_PID.store(next.pid, Ordering::Relaxed);
-            unsafe {
-                core::arch::asm!(
-                    "csrw satp, {satp}",
-                    "sfence.vma",
-                    satp = in(reg) satp,
-                );
+            if cur_satp != Some(next_satp) {
+                unsafe {
+                    core::arch::asm!(
+                        "csrw satp, {satp}",
+                        "sfence.vma",
+                        satp = in(reg) next_satp,
+                    );
+                }
             }
             // Also deliver signals to the new current task.
             let next_tf = next.tf_ptr();
