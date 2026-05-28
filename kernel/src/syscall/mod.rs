@@ -2337,6 +2337,10 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
     *task.state.lock() = crate::task::TaskState::Zombie;
     println!("[exit] pid={} status={}", task.pid, status);
 
+    // CLONE_VFORK: if our parent was vfork-waiting for us, unblock them.
+    // (Both execve and exit are valid termination points for the wait.)
+    crate::task::wake_vfork_parent_of(task.pid);
+
     // Is this the last thread alive in this tgid?
     let my_tgid = task.tgid.load(core::sync::atomic::Ordering::Relaxed);
     let any_alive = crate::task::all_tasks().into_iter().any(|t| {

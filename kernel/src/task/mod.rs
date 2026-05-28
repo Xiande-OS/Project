@@ -79,6 +79,13 @@ pub struct Task {
     /// write 0 to *addr and `futex_wake(addr, 1)`. Set by `set_tid_address`
     /// and by CLONE_CHILD_CLEARTID. 0 = disabled.
     pub clear_child_tid: Mutex<usize>,
+    /// `clone(CLONE_VFORK)` parent suspension. POSIX vfork blocks the parent
+    /// until the child either calls execve (gets its own address space) or
+    /// exits. Without this, parent + child race on the shared stack and
+    /// parent reads back garbage values for variables it held there (e.g.
+    /// busybox `timeout`'s saved child pid).
+    /// Holds Some(child_pid) while waiting; cleared when child exec's/exits.
+    pub vfork_child: Mutex<Option<i32>>,
 }
 
 unsafe impl Send for Task {}
@@ -264,6 +271,23 @@ pub fn all_tasks() -> Vec<Arc<Task>> {
     t.tasks.values().cloned().collect()
 }
 
+/// CLONE_VFORK wakeup: the child has reached execve or exit. Any task whose
+/// `vfork_child` matches this pid is unblocked. Called from sys_execve (on
+/// success) and exit_one_thread.
+pub fn wake_vfork_parent_of(child_pid: i32) {
+    for t in all_tasks() {
+        let mut slot = t.vfork_child.lock();
+        if *slot == Some(child_pid) {
+            *slot = None;
+            drop(slot);
+            let mut s = t.state.lock();
+            if *s == TaskState::Waiting {
+                *s = TaskState::Ready;
+            }
+        }
+    }
+}
+
 /// Mark this task as blocked on socket activity rather than wait4/futex.
 /// `wake_socket_waiters` only wakes tasks in this set, so a wait4 caller
 /// doesn't get spuriously bounced back to Ready every trap.
@@ -389,6 +413,7 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
         exe_path: Mutex::new(String::new()),
         signals: crate::signal::SignalState::new(),
         clear_child_tid: Mutex::new(0),
+        vfork_child: Mutex::new(None),
     });
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
@@ -626,6 +651,7 @@ pub fn clone_current(
             parent.signals.fork_inherit()
         },
         clear_child_tid: Mutex::new(0),
+        vfork_child: Mutex::new(None),
     });
     // Write the TF onto the new kstack.
     unsafe {
@@ -666,6 +692,21 @@ pub fn clone_current(
     }
 
     TABLE.lock().tasks.insert(task.pid, task.clone());
+
+    // CLONE_VFORK: block the parent until child execs or exits. With
+    // CLONE_VM (always the case for real vfork()), parent + child share
+    // stack — running them concurrently corrupts whatever the parent had
+    // on its stack across the vfork call. We pre-write the parent's a0
+    // here because the syscall dispatch loop skips the tf write when the
+    // task is Waiting (otherwise it would clobber retried-syscall args).
+    if flags & CLONE_VFORK != 0 {
+        *parent.vfork_child.lock() = Some(task.pid);
+        unsafe {
+            (*parent.tf_ptr()).x[9] = task.pid as usize;
+        }
+        *parent.state.lock() = TaskState::Waiting;
+    }
+
     task
 }
 
@@ -729,6 +770,12 @@ pub fn execve_current_with_path(
     task.signals.reset_for_exec();
     // execve also clears any pending CLONE_CHILD_CLEARTID address.
     *task.clear_child_tid.lock() = 0;
+
+    // CLONE_VFORK parent has been waiting for us to call execve. Now that
+    // we have our own address space, the parent's stack is no longer at
+    // risk of being trashed by us — let it resume.
+    wake_vfork_parent_of(task.pid);
+
     Ok(())
 }
 
