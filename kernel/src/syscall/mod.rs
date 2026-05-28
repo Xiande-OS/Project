@@ -3181,6 +3181,9 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
     // returned address is page-aligned, satisfying the 16-byte
     // alignment that musl's mallocng asserts on every allocation.
     let start = ms.mmap_anon(aligned, perm, init.as_deref());
+    if start.0 == usize::MAX {
+        return -12; // ENOMEM (mmap_anon hit frame exhaustion)
+    }
     start.0 as isize
 }
 

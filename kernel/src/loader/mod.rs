@@ -82,7 +82,7 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
         VirtAddr(sp_top),
         VmPerm::R | VmPerm::W | VmPerm::U,
     );
-    ms.push_user_area(stack, None);
+    ms.push_user_area(stack, None).map_err(|_| "OOM: user stack")?;
 
     let brk_base = (max_end_va + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     ms.brk_base = VirtAddr(brk_base);
@@ -178,7 +178,7 @@ fn load_segment(
         .copy_from_slice(&image[file_off..file_off + file_avail]);
 
     let area = VmArea::new(va_start, va_end, perm);
-    ms.push_user_area(area, Some(&buf));
+    ms.push_user_area(area, Some(&buf)).map_err(|_| "OOM: ELF segment")?;
 
     if va + mem_sz > *max_end_va {
         *max_end_va = va + mem_sz;

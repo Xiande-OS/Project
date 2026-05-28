@@ -142,19 +142,26 @@ impl MemorySet {
     /// (zero-padded to a page). Used for the signal-restorer trampoline.
     pub fn map_user_rx_page(&mut self, va: VirtAddr, bytes: &[u8]) {
         let area = VmArea::new(va, VirtAddr(va.0 + PAGE_SIZE), VmPerm::R | VmPerm::X | VmPerm::U);
-        self.push_user_area(area, Some(bytes));
+        // One page at exec time; if this OOMs the restorer just won't be
+        // mapped (signals would fault) but the kernel survives.
+        let _ = self.push_user_area(area, Some(bytes));
     }
 
     /// Push a user-mode area into this address space and (eagerly) back
     /// every page with a freshly allocated frame. If `init_data` is Some,
     /// the bytes are copied to the start of the area (zero padded).
-    pub fn push_user_area(&mut self, mut area: VmArea, init_data: Option<&[u8]>) {
+    /// Returns Err(()) on frame exhaustion. Frames mapped so far in this
+    /// area are freed when `area` drops, so a partial failure leaves no
+    /// leak. Callers in the execve / brk / mmap paths must turn Err into
+    /// ENOMEM rather than panicking — a fork-storm benchmark must not
+    /// take down the kernel.
+    pub fn push_user_area(&mut self, mut area: VmArea, init_data: Option<&[u8]>) -> Result<(), ()> {
         let pte_flags = area.perm.to_pte();
         // Walk page by page.
         let mut copied = 0usize;
         for vpn_raw in area.vpn_start.0..area.vpn_end.0 {
             let vpn = VirtPageNum(vpn_raw);
-            let frame = alloc_frame().expect("OOM: user area");
+            let Some(frame) = alloc_frame() else { return Err(()); };
             let ppn = frame.ppn;
             // Copy initial bytes (if any) into the frame.
             if let Some(data) = init_data {
@@ -169,6 +176,7 @@ impl MemorySet {
             area.frames.insert(vpn, frame);
         }
         self.areas.push(area);
+        Ok(())
     }
 
     pub fn translate(&self, va: VirtAddr) -> Option<super::address::PhysAddr> {
@@ -381,7 +389,14 @@ impl MemorySet {
                 if area.frames.contains_key(&vpn) {
                     continue;
                 }
-                let frame = alloc_frame().expect("OOM: brk grow");
+                let Some(frame) = alloc_frame() else {
+                    // OOM: stop growing. Commit the brk we managed to
+                    // back so far; userland sees a short brk and its
+                    // allocator returns NULL instead of the kernel dying.
+                    area.vpn_end = vpn;
+                    self.brk_cur = VirtAddr(vpn.0 << crate::mm::address::PAGE_SIZE_BITS);
+                    return self.brk_cur;
+                };
                 self.page_table.map(vpn, frame.ppn, pte_flags);
                 area.frames.insert(vpn, frame);
             }
@@ -389,7 +404,10 @@ impl MemorySet {
         } else {
             // Create a new heap area.
             let area = VmArea::new(self.brk_base, new_brk, heap_perm);
-            self.push_user_area(area, None);
+            if self.push_user_area(area, None).is_err() {
+                // OOM — leave brk where it was.
+                return self.brk_cur;
+            }
         }
         self.brk_cur = new_brk;
         self.brk_cur
@@ -408,7 +426,12 @@ impl MemorySet {
         let start = self.mmap_top.0;
         let end = start + aligned;
         let area = VmArea::new(VirtAddr(start), VirtAddr(end), perm);
-        self.push_user_area(area, init);
+        if self.push_user_area(area, init).is_err() {
+            // OOM — return the conventional MAP_FAILED sentinel. The
+            // mmap syscall translates this to -ENOMEM. Don't advance
+            // mmap_top so the address space stays consistent.
+            return VirtAddr(usize::MAX);
+        }
         self.mmap_top = VirtAddr(end);
         VirtAddr(start)
     }
