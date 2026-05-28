@@ -983,41 +983,63 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     }
 
     if matches!(cur_state, Some(TaskState::Zombie) | Some(TaskState::Waiting)) {
-        if let Some(next) = pick_ready(cur_pid) {
-            let next_satp = next.memory_set.lock().satp();
-            // Fast path: same address space (CLONE_VM threads) — skip the
-            // csrw+sfence; satp is already correct for the new task.
-            let cur_satp = task_by_pid(cur_pid).map(|t| t.memory_set.lock().satp());
-            CURRENT_PID.store(next.pid, Ordering::Relaxed);
-            if cur_satp != Some(next_satp) {
-                unsafe {
-                    core::arch::asm!(
-                        "csrw satp, {satp}",
-                        "sfence.vma",
-                        satp = in(reg) next_satp,
-                    );
+        // Outer loop: if we picked a task that died in its own signal
+        // delivery (SIGKILL queued while it was Waiting), pick another.
+        // If no Ready task remains AND cur is Zombie, we cannot return
+        // cur_tf — that would re-enter dead user code. Wait instead.
+        let cur_satp = task_by_pid(cur_pid).map(|t| t.memory_set.lock().satp());
+        loop {
+            // Try to pick a Ready task, skipping any that get killed by
+            // their own signals on arrival.
+            let mut found: Option<*mut TrapFrame> = None;
+            while let Some(next) = pick_ready(cur_pid) {
+                CURRENT_PID.store(next.pid, Ordering::Relaxed);
+                let next_satp = next.memory_set.lock().satp();
+                if cur_satp != Some(next_satp) {
+                    unsafe {
+                        core::arch::asm!(
+                            "csrw satp, {satp}",
+                            "sfence.vma",
+                            satp = in(reg) next_satp,
+                        );
+                    }
+                }
+                let next_tf = next.tf_ptr();
+                unsafe { crate::signal::check_signals(&next, &mut *next_tf); }
+                if !matches!(*next.state.lock(), TaskState::Zombie) {
+                    found = Some(next_tf);
+                    break;
                 }
             }
-            // Also deliver signals to the new current task.
-            let next_tf = next.tf_ptr();
-            unsafe {
-                crate::signal::check_signals(&next, &mut *next_tf);
+            if let Some(tf) = found {
+                return tf;
             }
-            return next_tf;
-        }
-        if cur_state == Some(TaskState::Waiting) {
-            if let Some(t) = task_by_pid(cur_pid) {
-                *t.state.lock() = TaskState::Running;
-            }
-        }
-        if cur_state == Some(TaskState::Zombie) {
-            // No other runnable task -- shutdown.
-            if !any_runnable_except(cur_pid) && !any_waiting() {
-                sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-                loop {
-                    unsafe { core::arch::asm!("wfi") };
+            // No live Ready task. If cur is Zombie we must NOT return
+            // its tf. Wait for either a sleeper to mature, an I/O event
+            // to wake a socket waiter, or a futex deadline. If literally
+            // nobody can ever wake us, shut down (Zombie) or panic
+            // (Waiting).
+            if cur_state == Some(TaskState::Waiting) {
+                if let Some(t) = task_by_pid(cur_pid) {
+                    *t.state.lock() = TaskState::Running;
                 }
+                return current_tf;
             }
+            // Zombie path: spin until something Ready appears.
+            loop {
+                wake_expired_sleepers(riscv::register::time::read64());
+                crate::sync::futex::poll_timeouts();
+                if crate::net::poll_with_progress() {
+                    wake_socket_waiters();
+                }
+                if any_runnable_except(cur_pid) { break; }
+                if !any_waiting() {
+                    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+                    loop { unsafe { core::arch::asm!("wfi") }; }
+                }
+                core::hint::spin_loop();
+            }
+            // Loop back and try pick_ready again.
         }
     }
 
