@@ -12,12 +12,43 @@ use super::{devfs, FileType, Inode, Result, EEXIST, EINVAL, ENOENT};
 
 pub struct TmpfsFile {
     data: Mutex<Vec<u8>>,
+    pub meta: Mutex<Meta>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Meta {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub atime_sec: i64,
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
+}
+
+impl Default for Meta {
+    fn default() -> Self {
+        Self {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+        }
+    }
 }
 
 impl TmpfsFile {
     pub fn new() -> Self {
         Self {
             data: Mutex::new(Vec::new()),
+            meta: Mutex::new(Meta::default()),
         }
     }
 }
@@ -59,12 +90,14 @@ impl Inode for TmpfsFile {
 
 pub struct TmpfsDir {
     entries: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
+    pub meta: Mutex<Meta>,
 }
 
 impl TmpfsDir {
     pub fn new_root() -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(BTreeMap::new()),
+            meta: Mutex::new(Meta { mode: 0o755, ..Meta::default() }),
         })
     }
 
@@ -126,6 +159,7 @@ impl Inode for TmpfsDir {
             FileType::Regular => Arc::new(TmpfsFile::new()),
             FileType::Directory => Arc::new(TmpfsDir {
                 entries: Mutex::new(BTreeMap::new()),
+                meta: Mutex::new(Meta { mode: 0o755, ..Meta::default() }),
             }),
             _ => return Err(EINVAL),
         };

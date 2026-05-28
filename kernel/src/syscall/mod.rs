@@ -69,11 +69,16 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_GETCWD => sys_getcwd(a0, a1),
         nr::SYS_CHDIR => sys_chdir(a0),
         nr::SYS_FACCESSAT | nr::SYS_FACCESSAT2 => sys_faccessat(a0 as i32, a1, a2 as i32),
-        nr::SYS_FCHMOD | nr::SYS_FCHMODAT | nr::SYS_FCHOWN | nr::SYS_FCHOWNAT => 0,
+        nr::SYS_FCHMOD => sys_fchmod(a0 as i32, a1 as u32),
+        nr::SYS_FCHMODAT => sys_fchmodat(a0 as i32, a1, a2 as u32),
+        nr::SYS_FCHOWN => sys_fchown(a0 as i32, a1 as u32, a2 as u32),
+        nr::SYS_FCHOWNAT => sys_fchownat(a0 as i32, a1, a2 as u32, a3 as u32),
         nr::SYS_UMASK => 0o022,
         nr::SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2 as i32),
+        nr::SYS_FLOCK => sys_flock(a0 as i32, a1 as i32),
         nr::SYS_FSYNC => 0,
-        nr::SYS_UTIMENSAT => 0,
+        nr::SYS_UTIMENSAT => sys_utimensat(a0 as i32, a1, a2, a3 as i32),
+        nr::SYS_NANOSLEEP => sys_nanosleep(a0, a1),
         nr::SYS_EXIT | nr::SYS_EXIT_GROUP => sys_exit(a0 as i32),
         nr::SYS_BRK => sys_brk(a0),
         nr::SYS_SET_TID_ADDRESS => 1,
@@ -94,8 +99,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_UNAME => sys_uname(a0),
         nr::SYS_GETRANDOM => sys_getrandom(a0, a1, a2),
         nr::SYS_MMAP => sys_mmap(a0, a1, a2 as i32, a3 as i32, a4 as i32, a5),
-        nr::SYS_MUNMAP => 0,
-        nr::SYS_MPROTECT => 0,
+        nr::SYS_MUNMAP => sys_munmap(a0, a1),
+        nr::SYS_MPROTECT => sys_mprotect(a0, a1, a2 as i32),
         nr::SYS_MADVISE => 0,
         nr::SYS_PRLIMIT64 => 0,
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
@@ -637,6 +642,63 @@ fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
     }
 }
 
+// ---------- flock (advisory, per-inode) ----------
+
+use spin::Mutex as SpinMutex;
+
+#[derive(Default)]
+struct LockState {
+    /// 0 = unlocked, >0 = shared count, -1 = exclusive
+    count: i32,
+}
+
+static FLOCK_TABLE: SpinMutex<alloc::collections::BTreeMap<usize, LockState>> =
+    SpinMutex::new(alloc::collections::BTreeMap::new());
+
+fn sys_flock(fd: i32, op: i32) -> isize {
+    const LOCK_SH: i32 = 1;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const LOCK_UN: i32 = 8;
+
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
+    let key = Arc::as_ptr(&file.inode) as *const () as usize;
+    let mode = op & !LOCK_NB;
+    let mut table = FLOCK_TABLE.lock();
+    let entry = table.entry(key).or_default();
+
+    match mode {
+        LOCK_SH => {
+            if entry.count < 0 {
+                // exclusive held; would block
+                return -11; // EWOULDBLOCK
+            }
+            entry.count += 1;
+            0
+        }
+        LOCK_EX => {
+            if entry.count != 0 {
+                return -11; // EWOULDBLOCK
+            }
+            entry.count = -1;
+            0
+        }
+        LOCK_UN => {
+            if entry.count > 0 {
+                entry.count -= 1;
+            } else if entry.count < 0 {
+                entry.count = 0;
+            }
+            if entry.count == 0 {
+                table.remove(&key);
+            }
+            0
+        }
+        _ => EINVAL,
+    }
+}
+
 fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
     const F_DUPFD: i32 = 0;
     const F_GETFD: i32 = 1;
@@ -704,6 +766,160 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
         F_SETFL => 0,
         _ => 0,
     }
+}
+
+// ---------- mmap / munmap / mprotect ----------
+
+fn sys_munmap(addr: usize, len: usize) -> isize {
+    if len == 0 {
+        return EINVAL;
+    }
+    let task = current_task();
+    task.memory_set_mut().unmap_range(crate::mm::VirtAddr(addr), len);
+    0
+}
+
+fn sys_mprotect(addr: usize, len: usize, prot: i32) -> isize {
+    if len == 0 {
+        return EINVAL;
+    }
+    let mut perm = crate::mm::memory_set::VmPerm::U;
+    if prot & 0x1 != 0 { perm |= crate::mm::memory_set::VmPerm::R; }
+    if prot & 0x2 != 0 { perm |= crate::mm::memory_set::VmPerm::W; }
+    if prot & 0x4 != 0 { perm |= crate::mm::memory_set::VmPerm::X; }
+    let task = current_task();
+    task.memory_set_mut().protect_range(crate::mm::VirtAddr(addr), len, perm);
+    0
+}
+
+// ---------- chmod / chown / utimensat ----------
+
+fn meta_of_inode(inode: &Arc<dyn Inode>) -> Option<&Arc<dyn Inode>> {
+    Some(inode)
+}
+
+fn apply_mode(inode: &Arc<dyn Inode>, mode: u32) {
+    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+        f.meta.lock().mode = mode & 0o7777;
+    } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
+        d.meta.lock().mode = mode & 0o7777;
+    }
+}
+
+fn apply_owner(inode: &Arc<dyn Inode>, uid: u32, gid: u32) {
+    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+        let mut m = f.meta.lock();
+        if uid != u32::MAX { m.uid = uid; }
+        if gid != u32::MAX { m.gid = gid; }
+    } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
+        let mut m = d.meta.lock();
+        if uid != u32::MAX { m.uid = uid; }
+        if gid != u32::MAX { m.gid = gid; }
+    }
+}
+
+fn apply_times(inode: &Arc<dyn Inode>, atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) {
+    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+        let mut m = f.meta.lock();
+        if let Some((s, ns)) = atime { m.atime_sec = s; m.atime_nsec = ns; }
+        if let Some((s, ns)) = mtime { m.mtime_sec = s; m.mtime_nsec = ns; }
+    } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
+        let mut m = d.meta.lock();
+        if let Some((s, ns)) = atime { m.atime_sec = s; m.atime_nsec = ns; }
+        if let Some((s, ns)) = mtime { m.mtime_sec = s; m.mtime_nsec = ns; }
+    }
+}
+
+fn sys_fchmod(fd: i32, mode: u32) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
+    apply_mode(&file.inode, mode);
+    0
+}
+
+fn sys_fchmodat(dfd: i32, path: usize, mode: u32) -> isize {
+    let Some(p) = copy_path(path) else { return EFAULT };
+    let Some(i) = resolve_at(dfd, &p) else { return ENOENT };
+    apply_mode(&i, mode);
+    0
+}
+
+fn sys_fchown(fd: i32, uid: u32, gid: u32) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
+    apply_owner(&file.inode, uid, gid);
+    0
+}
+
+fn sys_fchownat(dfd: i32, path: usize, uid: u32, gid: u32) -> isize {
+    let Some(p) = copy_path(path) else { return EFAULT };
+    let Some(i) = resolve_at(dfd, &p) else { return ENOENT };
+    apply_owner(&i, uid, gid);
+    0
+}
+
+const UTIME_NOW: i64 = (1i64 << 30) - 1;
+const UTIME_OMIT: i64 = (1i64 << 30) - 2;
+
+fn sys_utimensat(dfd: i32, path: usize, times: usize, _flags: i32) -> isize {
+    let inode = if path == 0 {
+        // AT_EMPTY_PATH or operating on dfd directly.
+        let task = current_task();
+        let Some(file) = task.fd_table.lock().get(dfd) else { return EBADF; };
+        file.inode.clone()
+    } else {
+        let Some(p) = copy_path(path) else { return EFAULT };
+        let Some(i) = resolve_at(dfd, &p) else { return ENOENT };
+        i
+    };
+
+    let now_mtime = riscv::register::time::read64();
+    let now_sec = (now_mtime / 10_000_000) as i64;
+    let now_ns = ((now_mtime % 10_000_000) * 100) as i64;
+
+    let (atime, mtime) = if times == 0 {
+        // NULL → both = now.
+        (Some((now_sec, now_ns)), Some((now_sec, now_ns)))
+    } else {
+        let task = current_task();
+        let Some(buf) = task.copy_in_bytes(times, 32) else { return EFAULT };
+        let parse = |o: usize| -> (i64, i64) {
+            let s = i64::from_le_bytes(buf[o..o + 8].try_into().unwrap_or([0; 8]));
+            let ns = i64::from_le_bytes(buf[o + 8..o + 16].try_into().unwrap_or([0; 8]));
+            (s, ns)
+        };
+        let (as_, ans) = parse(0);
+        let (ms_, mns) = parse(16);
+        let atime = if ans == UTIME_OMIT { None } else if ans == UTIME_NOW { Some((now_sec, now_ns)) } else { Some((as_, ans)) };
+        let mtime = if mns == UTIME_OMIT { None } else if mns == UTIME_NOW { Some((now_sec, now_ns)) } else { Some((ms_, mns)) };
+        (atime, mtime)
+    };
+
+    apply_times(&inode, atime, mtime);
+    0
+}
+
+// ---------- nanosleep (busy-wait on SBI timer) ----------
+
+fn sys_nanosleep(req: usize, _rem: usize) -> isize {
+    if req == 0 {
+        return EFAULT;
+    }
+    let task = current_task();
+    let Some(b) = task.copy_in_bytes(req, 16) else { return EFAULT };
+    let sec = i64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
+    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        return EINVAL;
+    }
+    // QEMU virt mtime ticks at 10 MHz: 1 tick = 100 ns.
+    let total_ticks = (sec as u64).saturating_mul(10_000_000)
+        + (nsec as u64) / 100;
+    let target = riscv::register::time::read64().saturating_add(total_ticks);
+    while riscv::register::time::read64() < target {
+        core::hint::spin_loop();
+    }
+    0
 }
 
 fn sys_faccessat(dfd: i32, path: usize, _mode: i32) -> isize {
@@ -818,12 +1034,36 @@ struct LinuxStat {
 
 fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
     let mut s = LinuxStat::default();
-    s.st_mode = match inode.kind() {
-        FileType::Regular => 0o100644,
-        FileType::Directory => 0o040755,
-        FileType::CharDevice => 0o020666,
-        FileType::Pipe => 0o010600,
+    let type_bits = match inode.kind() {
+        FileType::Regular => 0o100000,
+        FileType::Directory => 0o040000,
+        FileType::CharDevice => 0o020000,
+        FileType::Pipe => 0o010000,
     };
+    let (mode_bits, uid, gid, atime, mtime, ctime) = if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+        let m = *f.meta.lock();
+        (m.mode, m.uid, m.gid, (m.atime_sec, m.atime_nsec), (m.mtime_sec, m.mtime_nsec), (m.ctime_sec, m.ctime_nsec))
+    } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
+        let m = *d.meta.lock();
+        (m.mode, m.uid, m.gid, (m.atime_sec, m.atime_nsec), (m.mtime_sec, m.mtime_nsec), (m.ctime_sec, m.ctime_nsec))
+    } else {
+        let mode_default = match inode.kind() {
+            FileType::Regular => 0o644,
+            FileType::Directory => 0o755,
+            FileType::CharDevice => 0o666,
+            FileType::Pipe => 0o600,
+        };
+        (mode_default, 0, 0, (0, 0), (0, 0), (0, 0))
+    };
+    s.st_mode = (type_bits | (mode_bits & 0o7777)) as u32;
+    s.st_uid = uid;
+    s.st_gid = gid;
+    s.st_atime = atime.0;
+    s.st_atime_nsec = atime.1 as u64;
+    s.st_mtime = mtime.0;
+    s.st_mtime_nsec = mtime.1 as u64;
+    s.st_ctime = ctime.0;
+    s.st_ctime_nsec = ctime.1 as u64;
     s.st_nlink = 1;
     s.st_size = inode.size() as i64;
     s.st_blksize = 4096;
