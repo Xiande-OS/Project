@@ -8,6 +8,8 @@
 # Build artifacts produced by `make all`.
 /kernel-rv
 /kernel-la
+# Local SYSTRACE=1 build used for ad-hoc debugging
+/kernel-rv-trace
 
 # `make prepare` materialises these from cargo/ on contest boxes
 # where hidden dirs got stripped on clone. Don't commit them — the
