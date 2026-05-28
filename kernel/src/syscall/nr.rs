@@ -50,6 +50,7 @@ pub const SYS_NANOSLEEP: usize = 101;
 pub const SYS_GETITIMER: usize = 102;
 pub const SYS_SETITIMER: usize = 103;
 pub const SYS_CLOCK_GETTIME: usize = 113;
+pub const SYS_CLOCK_GETRES: usize = 114;
 pub const SYS_CLOCK_NANOSLEEP: usize = 115;
 pub const SYS_SETPGID: usize = 154;
 pub const SYS_GETPGID: usize = 155;

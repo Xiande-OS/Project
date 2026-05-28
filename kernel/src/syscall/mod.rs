@@ -139,6 +139,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SCHED_GETPARAM | nr::SYS_SCHED_GETSCHEDULER => 0,
         nr::SYS_SCHED_SETSCHEDULER => 0,
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
+        nr::SYS_CLOCK_GETRES => sys_clock_getres(a0, a1),
         nr::SYS_GETTIMEOFDAY => sys_gettimeofday(a0),
         nr::SYS_SCHED_YIELD => 0,
         nr::SYS_TGKILL => sys_tgkill(a0 as i32, a1 as i32, a2 as i32),
@@ -2444,8 +2445,11 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
     let argv = read_string_array(argv_addr).unwrap_or_default();
     let envp = read_string_array(envp_addr).unwrap_or_default();
 
-    // Look up the binary in the VFS.
-    let inode = match fs::lookup_path(fs::root(), &path) {
+    // Look up the binary in the VFS. Relative paths must resolve under
+    // the caller's CWD, not the root — busybox sh invokes `./busybox`
+    // and `./<test>` after `cd /mnt/musl`.
+    let start = if path.starts_with('/') { fs::root() } else { cwd_inode() };
+    let inode = match fs::lookup_path(start, &path) {
         Ok(i) => i,
         Err(_) => return ENOENT,
     };
@@ -2457,6 +2461,52 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
     if let Err(e) = inode.read_at(0, &mut elf_image) {
         return err_to_isize(e);
     }
+
+    // Shebang: if the file starts with `#!`, peel the interpreter line
+    // and re-dispatch as `interp [arg] path original_args...`. POSIX
+    // allows exactly one optional arg after the interpreter path.
+    if elf_image.len() >= 2 && &elf_image[..2] == b"#!" {
+        let nl = elf_image.iter().position(|&b| b == b'\n').unwrap_or(elf_image.len());
+        let line = core::str::from_utf8(&elf_image[2..nl]).unwrap_or("").trim();
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let interp = String::from(parts.next().unwrap_or(""));
+        let interp_arg = parts.next().map(|s| String::from(s.trim()));
+        if interp.is_empty() {
+            return -8; // ENOEXEC
+        }
+        let mut new_argv: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+        new_argv.push(interp.clone());
+        if let Some(a) = interp_arg { if !a.is_empty() { new_argv.push(a); } }
+        // Replace argv[0] of the original call with the script path so
+        // the interpreter sees the right script name.
+        new_argv.push(path.clone());
+        for a in argv.iter().skip(1) {
+            new_argv.push(a.clone());
+        }
+
+        let interp_inode = match fs::lookup_path(
+            if interp.starts_with('/') { fs::root() } else { cwd_inode() },
+            &interp,
+        ) {
+            Ok(i) => i,
+            Err(_) => return ENOENT,
+        };
+        let interp_size = interp_inode.size() as usize;
+        let mut interp_image = alloc::vec![0u8; interp_size];
+        if let Err(e) = interp_inode.read_at(0, &mut interp_image) {
+            return err_to_isize(e);
+        }
+        let interp_aligned: alloc::vec::Vec<u8> = aligned_clone(&interp_image);
+        let argv_refs: alloc::vec::Vec<&str> = new_argv.iter().map(|s| s.as_str()).collect();
+        let envp_refs: alloc::vec::Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+        return match crate::task::execve_current_with_path(
+            &interp_aligned, &argv_refs, &envp_refs, &interp,
+        ) {
+            Ok(()) => 0,
+            Err(e) => err_to_isize(e),
+        };
+    }
+
     // Ensure aligned (xmas-elf requires 8-byte alignment).
     let elf_aligned: alloc::vec::Vec<u8> = aligned_clone(&elf_image);
 
@@ -2633,6 +2683,15 @@ fn sys_clock_gettime(_clk: usize, ts: usize) -> isize {
         sec: (mtime / 10_000_000) as i64,
         nsec: ((mtime % 10_000_000) * 100) as i64,
     };
+    write_struct(ts, &ts_val)
+}
+
+fn sys_clock_getres(_clk: usize, ts: usize) -> isize {
+    if ts == 0 {
+        return 0;
+    }
+    // 100ns timer resolution (mtime ticks at 10MHz on QEMU virt).
+    let ts_val = Timespec { sec: 0, nsec: 100 };
     write_struct(ts, &ts_val)
 }
 

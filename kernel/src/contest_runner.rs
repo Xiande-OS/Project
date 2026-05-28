@@ -36,6 +36,13 @@ pub fn prepare_init() -> Option<(Arc<dyn Inode>, Vec<String>)> {
         }
     };
 
+    // The contest binaries have PT_INTERP pointing at absolute paths
+    // under /lib (the riscv64 glibc loader, the musl loader). Make the
+    // disk's copies available under /lib so dynamic exec succeeds.
+    if mounted {
+        bind_loaders();
+    }
+
     let variants: Vec<(String, Vec<String>)> = if mounted {
         enumerate_variants("/mnt")
     } else {
@@ -93,6 +100,33 @@ fn enumerate_variants(mount: &str) -> Vec<(String, Vec<String>)> {
     }
 
     out
+}
+
+/// Make the dynamic loaders from the testsuite disk accessible at the
+/// absolute paths PT_INTERP encodes. Tries each known mapping and just
+/// reports failures — missing files mean that variant isn't on the disk.
+fn bind_loaders() {
+    let mappings: &[(&str, &str)] = &[
+        // glibc loader — required by both musl/basic/* and glibc/basic/*.
+        ("/mnt/glibc/lib/ld-linux-riscv64-lp64d.so.1", "ld-linux-riscv64-lp64d.so.1"),
+        // musl loader (the libc.so on this contest disk IS the loader).
+        ("/mnt/musl/libc.so", "ld-musl-riscv64-sf.so.1"),
+        ("/mnt/musl/libc.so", "ld-musl-riscv64.so.1"),
+    ];
+    for (src, dst) in mappings {
+        match fs::lookup_path(fs::root(), src) {
+            Ok(inode) => {
+                if let Err(e) = fs::link_into("/lib", dst, inode) {
+                    println!("[xiande-os] link {} -> /lib/{} failed: {}", src, dst, e);
+                } else {
+                    println!("[xiande-os] /lib/{} -> {}", dst, src);
+                }
+            }
+            Err(_) => {
+                // Source missing — that's fine, this variant isn't shipped.
+            }
+        }
+    }
 }
 
 fn list_testcodes(dir: &str) -> Vec<String> {
