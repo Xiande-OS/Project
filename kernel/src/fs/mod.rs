@@ -312,6 +312,17 @@ impl FdTable {
         }
     }
 
+    /// Close every fd, dropping the File Arcs. Called on process exit so
+    /// pipe write-ends are released and downstream readers observe EOF.
+    /// Without this, a zombie's fd_table keeps the pipe writer alive until
+    /// reap(), so `cmd | grep ...` hangs forever (the grep never sees EOF).
+    pub fn close_all(&self) {
+        let mut t = self.table.lock();
+        for slot in t.iter_mut() {
+            *slot = None;
+        }
+    }
+
     pub fn alloc(&self, file: Arc<File>, cloexec: bool) -> Result<i32> {
         let mut t = self.table.lock();
         let mut c = self.cloexec.lock();

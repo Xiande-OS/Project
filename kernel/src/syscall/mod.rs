@@ -2688,6 +2688,15 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
     *task.state.lock() = crate::task::TaskState::Zombie;
     println!("[exit] pid={} status={}", task.pid, status);
 
+    // Close all fds now (not at reap) so pipe write-ends are released
+    // immediately. A zombie holding a pipe writer keeps downstream
+    // readers (`cmd | grep ...`) blocked forever waiting for EOF. Only
+    // clear when we're the sole holder of the fd table — a live
+    // CLONE_FILES sibling shares the same Arc.
+    if alloc::sync::Arc::strong_count(&task.fd_table) == 1 {
+        task.fd_table.lock().close_all();
+    }
+
     // CLONE_VFORK: if our parent was vfork-waiting for us, unblock them.
     // (Both execve and exit are valid termination points for the wait.)
     crate::task::wake_vfork_parent_of(task.pid);
