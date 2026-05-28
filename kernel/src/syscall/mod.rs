@@ -2762,12 +2762,23 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
             new_argv.push(a.clone());
         }
 
+        // Look up the interpreter. Some scripts use shebangs that
+        // point at non-standard paths (`#!/busybox sh`); if the literal
+        // path misses, fall back to /bin/<basename> so distro-style
+        // names still work without rewriting the testcase.
         let interp_inode = match fs::lookup_path(
             if interp.starts_with('/') { fs::root() } else { cwd_inode() },
             &interp,
         ) {
             Ok(i) => i,
-            Err(_) => return ENOENT,
+            Err(_) => {
+                let basename = interp.rsplit('/').next().unwrap_or(&interp);
+                let fallback = alloc::format!("/bin/{}", basename);
+                match fs::lookup_path(fs::root(), &fallback) {
+                    Ok(i) => i,
+                    Err(_) => return ENOENT,
+                }
+            }
         };
         let interp_size = interp_inode.size() as usize;
         let mut interp_image = alloc::vec![0u8; interp_size];

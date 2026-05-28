@@ -71,6 +71,9 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
 
     // Drop runnable binaries into /bin so execve can resolve them.
     let bb = fs::install_file("/bin", "busybox", busybox_elf()).unwrap();
+    // Some testcode scripts use `#!/busybox sh` shebangs (lua's test.sh
+    // in particular). Plant a /busybox node so the shebang resolves.
+    fs::link_into("/", "busybox", bb.clone()).unwrap();
     for applet in [
         "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir", "mv", "cp",
         "true", "false", "env", "pwd", "wc", "grep", "head", "tail", "sort",
