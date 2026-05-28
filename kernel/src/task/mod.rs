@@ -242,7 +242,6 @@ pub fn make_ready(pid: i32) {
 pub fn reap(pid: i32) {
     TABLE.lock().tasks.remove(&pid);
     crate::sync::futex::forget_task(pid);
-    forget_itimer(pid);
 }
 
 pub fn set_current_pid(pid: i32) {
@@ -359,73 +358,6 @@ pub fn wake_expired_sleepers(now: u64) {
             if *s == TaskState::Waiting {
                 *s = TaskState::Ready;
             }
-        }
-    }
-}
-
-/// ITIMER_REAL deadlines: per-pid (next_deadline_ticks, interval_ticks).
-/// `interval_ticks == 0` means single-shot (don't rearm).
-///
-/// Without this, every unixbench micro-benchmark (dhry2reg, whetstone,
-/// syscall, pipe, ...) sets `setitimer(ITIMER_REAL, ...)` for its
-/// duration then spins waiting for SIGALRM. With no setitimer + no
-/// SIGALRM, they loop forever and our wall-clock budget cuts them off
-/// before they print the COUNT|N| line the wrapper script greps for.
-static IT_REAL_DEADLINES: spin::Mutex<alloc::collections::BTreeMap<i32, (u64, u64)>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
-
-/// Install / replace this pid's ITIMER_REAL. `next == 0` disarms it.
-pub fn itimer_real_set(pid: i32, next_deadline_ticks: u64, interval_ticks: u64) {
-    let mut m = IT_REAL_DEADLINES.lock();
-    if next_deadline_ticks == 0 {
-        m.remove(&pid);
-    } else {
-        m.insert(pid, (next_deadline_ticks, interval_ticks));
-    }
-}
-
-/// Query current ITIMER_REAL (next_deadline_ticks, interval_ticks).
-pub fn itimer_real_get(pid: i32) -> Option<(u64, u64)> {
-    IT_REAL_DEADLINES.lock().get(&pid).copied()
-}
-
-/// Drop any timer state owned by `pid`. Called from reap.
-pub fn forget_itimer(pid: i32) {
-    IT_REAL_DEADLINES.lock().remove(&pid);
-}
-
-/// Raise SIGALRM on any task whose ITIMER_REAL deadline has elapsed.
-/// If the timer has a non-zero interval, rearm it; otherwise drop it.
-/// Called from `schedule_next_after_trap` next to `wake_expired_sleepers`.
-pub fn wake_expired_itimers(now: u64) {
-    // Quick check + collect to avoid holding the lock across raise_signal.
-    let fired: Vec<(i32, u64, u64)> = {
-        let m = IT_REAL_DEADLINES.lock();
-        m.iter()
-            .filter_map(|(&pid, &(next, interval))| {
-                if now >= next { Some((pid, next, interval)) } else { None }
-            })
-            .collect()
-    };
-    if fired.is_empty() {
-        return;
-    }
-    {
-        let mut m = IT_REAL_DEADLINES.lock();
-        for (pid, _next, interval) in &fired {
-            if *interval > 0 {
-                // Rearm at now+interval (POSIX-ish: "now" rather than
-                // last_deadline+interval avoids running missed-deadline
-                // bursts back-to-back).
-                m.insert(*pid, (now + *interval, *interval));
-            } else {
-                m.remove(pid);
-            }
-        }
-    }
-    for (pid, _next, _interval) in fired {
-        if let Some(t) = task_by_pid(pid) {
-            let _ = crate::signal::raise_signal(&t, crate::signal::SIGALRM);
         }
     }
 }
@@ -977,11 +909,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
 
     // Wake any nanosleep'd tasks whose deadline has elapsed. Without
     // this a polling sleeper (busybox `timeout`) holds the CPU forever.
-    let now_ticks = riscv::register::time::read64();
-    wake_expired_sleepers(now_ticks);
-    // Fire ITIMER_REAL deadlines (raise SIGALRM on the owner so the
-    // unixbench micro-benches don't spin forever waiting for SIGALRM).
-    wake_expired_itimers(now_ticks);
+    wake_expired_sleepers(riscv::register::time::read64());
 
     // Reap any detached threads (CLONE_THREAD) that died last round.
     // We can't reap the current pid even if dead — kstack still in use.
@@ -1027,9 +955,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         //     which case panic with a state dump so the failure is
         //     visible instead of a silent hang.
         loop {
-            let now = riscv::register::time::read64();
-            wake_expired_sleepers(now);
-            wake_expired_itimers(now);
+            wake_expired_sleepers(riscv::register::time::read64());
             crate::sync::futex::poll_timeouts();
             if any_runnable_except(cur_pid) { break; }
             if let Some(t) = task_by_pid(cur_pid) {
@@ -1108,9 +1034,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             }
             // Zombie path: spin until something Ready appears.
             loop {
-                let now = riscv::register::time::read64();
-                wake_expired_sleepers(now);
-                wake_expired_itimers(now);
+                wake_expired_sleepers(riscv::register::time::read64());
                 crate::sync::futex::poll_timeouts();
                 if crate::net::poll_with_progress() {
                     wake_socket_waiters();
@@ -1135,17 +1059,20 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     // wall-clock SIGKILL. Cooperative-with-a-nudge: at every trap
     // boundary, if anyone else is Ready, switch to the
     // lowest-pid one.
-    if let Some(next) = pick_ready(cur_pid) {
-        let cur_satp = task_by_pid(cur_pid).map(|t| t.memory_set.lock().satp());
+    //
+    // Important: pick_ready may return a task that becomes Zombie the
+    // moment check_signals delivers SIGKILL to it. In that case we
+    // must NOT have already switched satp/CURRENT_PID, because we'd
+    // fall through to `current_tf` and re-enter the *current* task's
+    // user code against a different task's page tables — instant
+    // segfault for the wrapping sh when its child got cascade-killed.
+    // Loop until we find a non-Zombie pick (or run out), then commit.
+    let cur_satp = task_by_pid(cur_pid).map(|t| t.memory_set.lock().satp());
+    while let Some(next) = pick_ready(cur_pid) {
         let next_satp = next.memory_set.lock().satp();
-        // Demote the current task back to Ready so it can run again later.
-        if let Some(cur) = task_by_pid(cur_pid) {
-            let mut s = cur.state.lock();
-            if *s == TaskState::Running {
-                *s = TaskState::Ready;
-            }
-        }
-        CURRENT_PID.store(next.pid, Ordering::Relaxed);
+        // Speculatively switch satp so check_signals' copy_out for a
+        // user signal frame writes to the right page table. If next
+        // becomes Zombie below, restore cur_satp before falling back.
         if cur_satp != Some(next_satp) {
             unsafe {
                 core::arch::asm!(
@@ -1157,9 +1084,30 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         }
         let next_tf = next.tf_ptr();
         unsafe { crate::signal::check_signals(&next, &mut *next_tf); }
-        if !matches!(*next.state.lock(), TaskState::Zombie) {
-            return next_tf;
+        if matches!(*next.state.lock(), TaskState::Zombie) {
+            // Restore the previous satp and try the next candidate.
+            if let Some(s) = cur_satp {
+                if Some(next_satp) != cur_satp {
+                    unsafe {
+                        core::arch::asm!(
+                            "csrw satp, {satp}",
+                            "sfence.vma",
+                            satp = in(reg) s,
+                        );
+                    }
+                }
+            }
+            continue;
         }
+        // Commit the switch: demote current to Ready, publish CURRENT_PID.
+        if let Some(cur) = task_by_pid(cur_pid) {
+            let mut s = cur.state.lock();
+            if *s == TaskState::Running {
+                *s = TaskState::Ready;
+            }
+        }
+        CURRENT_PID.store(next.pid, Ordering::Relaxed);
+        return next_tf;
     }
 
     current_tf
