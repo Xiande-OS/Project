@@ -2493,23 +2493,29 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
         return err_to_isize(e);
     }
 
-    // Shebang: if the file starts with `#!`, peel the interpreter line
-    // and re-dispatch as `interp [arg] path original_args...`. POSIX
-    // allows exactly one optional arg after the interpreter path.
-    if elf_image.len() >= 2 && &elf_image[..2] == b"#!" {
-        let nl = elf_image.iter().position(|&b| b == b'\n').unwrap_or(elf_image.len());
-        let line = core::str::from_utf8(&elf_image[2..nl]).unwrap_or("").trim();
-        let mut parts = line.splitn(2, char::is_whitespace);
-        let interp = String::from(parts.next().unwrap_or(""));
-        let interp_arg = parts.next().map(|s| String::from(s.trim()));
-        if interp.is_empty() {
-            return -8; // ENOEXEC
-        }
+    // Shebang or shebang-less script: if the file isn't an ELF, treat
+    // it as a shell script. With `#!interp [arg]` we honour the
+    // interpreter line; otherwise fall back to /bin/busybox sh.
+    let is_elf = elf_image.len() >= 4 && &elf_image[..4] == b"\x7fELF";
+    if !is_elf {
+        let (interp, interp_arg) = if elf_image.len() >= 2 && &elf_image[..2] == b"#!" {
+            let nl = elf_image.iter().position(|&b| b == b'\n').unwrap_or(elf_image.len());
+            let line = core::str::from_utf8(&elf_image[2..nl]).unwrap_or("").trim();
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let interp = String::from(parts.next().unwrap_or(""));
+            let interp_arg = parts.next().map(|s| String::from(s.trim()));
+            if interp.is_empty() {
+                (String::from("/bin/busybox"), Some(String::from("sh")))
+            } else {
+                (interp, interp_arg)
+            }
+        } else {
+            // No shebang either — default to busybox sh.
+            (String::from("/bin/busybox"), Some(String::from("sh")))
+        };
         let mut new_argv: alloc::vec::Vec<String> = alloc::vec::Vec::new();
         new_argv.push(interp.clone());
         if let Some(a) = interp_arg { if !a.is_empty() { new_argv.push(a); } }
-        // Replace argv[0] of the original call with the script path so
-        // the interpreter sees the right script name.
         new_argv.push(path.clone());
         for a in argv.iter().skip(1) {
             new_argv.push(a.clone());
