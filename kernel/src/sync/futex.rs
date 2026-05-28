@@ -351,6 +351,20 @@ fn drop_and_wake(pid: i32) {
     }
 }
 
+/// True if any waiter in any queue has a finite deadline still in
+/// the future. Used by the scheduler's deadlock check.
+pub fn has_pending_deadline(now: u64) -> bool {
+    let tab = FUTEXES.lock();
+    for q in tab.values() {
+        for w in q {
+            if w.deadline_ticks != 0 && w.deadline_ticks > now {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Poll-driven timeout sweep. Called from the scheduler between trap exits.
 /// Walks every queue; for each Waiter whose deadline has passed, removes it
 /// from the queue and marks Ready with WaitResult::Timedout.

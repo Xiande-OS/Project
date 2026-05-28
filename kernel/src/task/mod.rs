@@ -289,6 +289,49 @@ pub fn forget_sleeper(pid: i32) {
     SLEEPING_UNTIL.lock().remove(&pid);
 }
 
+/// Returns true if any task is parked on a sleep / futex deadline
+/// that hasn't expired yet. Used by the scheduler's deadlock check —
+/// a stalled kernel where nobody is ever going to wake should panic
+/// rather than spin forever pretending to make progress.
+pub fn any_pending_deadline(now: u64) -> bool {
+    if SLEEPING_UNTIL.lock().values().any(|&d| d > now) {
+        return true;
+    }
+    crate::sync::futex::has_pending_deadline(now)
+}
+
+#[cold]
+fn panic_dead_locked(cur_pid: i32, reason: &str) -> ! {
+    crate::println!("\n=== KERNEL DEADLOCK DETECTED ===");
+    crate::println!("reason: {}", reason);
+    crate::println!("current pid: {}", cur_pid);
+    let now = riscv::register::time::read64();
+    crate::println!("mtime: {}", now);
+    crate::println!("task table:");
+    let snapshot: Vec<(i32, TaskState, i32, i32)> = {
+        let t = TABLE.lock();
+        t.tasks.values().map(|task| (
+            task.pid,
+            *task.state.lock(),
+            task.tgid.load(Ordering::Relaxed),
+            task.ppid.load(Ordering::Relaxed),
+        )).collect()
+    };
+    for (pid, st, tgid, ppid) in snapshot {
+        crate::println!("  pid={} tgid={} ppid={} state={:?}", pid, tgid, ppid, st);
+    }
+    let sleepers: Vec<(i32, u64)> = SLEEPING_UNTIL.lock().iter().map(|(&p,&d)|(p,d)).collect();
+    if !sleepers.is_empty() {
+        crate::println!("sleepers (pid -> deadline_ticks):");
+        for (p, d) in sleepers {
+            let dt = if d > now { d - now } else { 0 };
+            crate::println!("  pid={} deadline={} ({} ticks away = {}ms)",
+                p, d, dt, dt / 10_000);
+        }
+    }
+    panic!("kernel deadlock — no path to forward progress");
+}
+
 /// Wake any nanosleep'd tasks whose deadline has been reached. Called
 /// from the scheduler hook on every trap exit; cheap when the map is
 /// empty.
@@ -843,10 +886,14 @@ pub fn run_user_loop(task: &Arc<Task>) -> ! {
 /// switches satp + current_pid accordingly. Returns the TF to load.
 pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     // Push/pull whatever the network stack has been doing while user-mode
-    // ran. Cheap no-op if the stack isn't up.
-    crate::net::poll();
-    // Wake any tasks that were blocked on sockets and now have progress.
-    wake_socket_waiters();
+    // ran. Only wake socket-blocked tasks if poll actually made progress;
+    // otherwise the same task (e.g. iperf3 -s on accept) re-Ready'd itself
+    // every trap and starved every other scheduler candidate, including
+    // the busybox-`timeout` daemon that was meant to kill it after N
+    // seconds.
+    if crate::net::poll_with_progress() {
+        wake_socket_waiters();
+    }
 
     let cur_pid = current_pid();
 
@@ -892,26 +939,44 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     if matches!(cur_state, Some(TaskState::Zombie) | Some(TaskState::Waiting))
         && !any_runnable_except(cur_pid)
     {
+        // No wall-clock deadline here — that's the busybox-`timeout`
+        // wrapper's job and the kernel can't know what counts as "too
+        // long" for an arbitrary userspace workload. Spin until either
+        //   - someone becomes Ready,
+        //   - this task itself becomes Ready (its own deadline matures),
+        //   - or there is provably nobody who could ever wake us, in
+        //     which case panic with a state dump so the failure is
+        //     visible instead of a silent hang.
         loop {
-            if !any_runnable_except(cur_pid) && !any_waiting() {
+            wake_expired_sleepers(riscv::register::time::read64());
+            crate::sync::futex::poll_timeouts();
+            if any_runnable_except(cur_pid) { break; }
+            if let Some(t) = task_by_pid(cur_pid) {
+                if *t.state.lock() == TaskState::Ready { break; }
+            }
+            // No-progress check: are there any other live tasks at
+            // all, and do any of them have a deadline that could
+            // eventually wake us? If neither, this is a real deadlock.
+            let now = riscv::register::time::read64();
+            let alive_others = any_runnable_except(cur_pid) || any_waiting();
+            if !alive_others {
                 if cur_state == Some(TaskState::Zombie) {
                     sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
                     loop { unsafe { core::arch::asm!("wfi") }; }
                 }
-                // Waiting with nothing to wake us — deadlock, but
-                // still hand back our own tf so the trap returns.
-                break;
+                panic_dead_locked(cur_pid, "no other live tasks");
             }
-            wake_expired_sleepers(riscv::register::time::read64());
-            crate::sync::futex::poll_timeouts();
-            if any_runnable_except(cur_pid) { break; }
-            // If our own deadline fired while we were waiting, we are
-            // now Ready ourselves — break out and let the normal path
-            // schedule us back in.
-            if let Some(t) = task_by_pid(cur_pid) {
-                if *t.state.lock() == TaskState::Ready {
-                    break;
-                }
+            if !any_pending_deadline(now) {
+                // Everyone is parked on something with no timeout —
+                // futex without deadline, socket wait, pipe wait, etc.
+                // Those CAN still be woken (by I/O events, by another
+                // task's write), so keep spinning. Network poll runs
+                // at the top of schedule_next_after_trap on the next
+                // round; getting back there requires a syscall, but
+                // we're not in user code. Drive net::poll here too.
+                crate::net::poll();
+                wake_socket_waiters();
+                if any_runnable_except(cur_pid) { break; }
             }
             core::hint::spin_loop();
         }

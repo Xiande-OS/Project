@@ -209,14 +209,23 @@ fn order_scripts(scripts: &[String]) -> Vec<String> {
 }
 
 fn script_budget(script: &str) -> &'static str {
+    // Aggressive fast-fail budgets. The whole testsuite must clear in
+    // a couple of minutes even if every network/benchmark group is
+    // wedged; banking the easy markers is more valuable than waiting
+    // for hangs.
     match script {
-        s if s.starts_with("cyclictest_") => "15",
-        s if s.starts_with("iozone_") => "30",
-        s if s.starts_with("lmbench_") => "30",
-        s if s.starts_with("iperf_") => "20",
-        s if s.starts_with("netperf_") => "20",
-        s if s.starts_with("unixbench_") => "30",
-        s if s.starts_with("ltp_") => "60",
-        _ => "30",
+        s if s.starts_with("basic_") => "20",
+        s if s.starts_with("lua_") => "10",
+        s if s.starts_with("busybox_") => "20",
+        s if s.starts_with("libctest_") => "30",
+        s if s.starts_with("libcbench_") => "10",
+        s if s.starts_with("iozone_") => "20",
+        s if s.starts_with("cyclictest_") => "8",
+        s if s.starts_with("lmbench_") => "15",
+        s if s.starts_with("iperf_") => "5",
+        s if s.starts_with("netperf_") => "5",
+        s if s.starts_with("unixbench_") => "15",
+        s if s.starts_with("ltp_") => "20",
+        _ => "10",
     }
 }

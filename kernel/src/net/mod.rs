@@ -177,11 +177,21 @@ pub fn with_stack<R>(f: impl FnOnce(&mut NetStack) -> R) -> Option<R> {
 /// Drive the smoltcp poll loop. Safe to call from any syscall entry/exit.
 /// No-op if the network stack isn't initialised.
 pub fn poll() {
-    let Some(s) = STACK.get() else { return };
+    let _ = poll_with_progress();
+}
+
+/// Same as `poll`, but returns true iff smoltcp processed at least one
+/// packet or readied a socket. The scheduler uses this to decide
+/// whether to wake socket-blocked tasks: waking unconditionally caused
+/// a socket-blocked task (e.g. iperf3 server on `accept`) to thrash the
+/// CPU, never letting any other task — including the `timeout` daemon
+/// that's supposed to kill it — get scheduled.
+pub fn poll_with_progress() -> bool {
+    let Some(s) = STACK.get() else { return false };
     let mut g = s.lock();
     let t = now();
     let g = &mut *g;
-    g.iface.poll(t, &mut g.phy, &mut g.sockets);
+    g.iface.poll(t, &mut g.phy, &mut g.sockets)
 }
 
 /// Allocate a fresh ephemeral source port (49152..=65535 wrap).
