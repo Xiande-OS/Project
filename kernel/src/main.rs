@@ -7,6 +7,7 @@ extern crate alloc;
 mod arch;
 #[macro_use]
 mod console;
+mod fs;
 mod loader;
 mod mm;
 mod sync;
@@ -47,7 +48,11 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
 
     mm::init();
     arch::riscv64::trap::init();
-    println!("[ok] heap + frame allocator + trap vector");
+    fs::init();
+    println!("[ok] heap + frame allocator + trap vector + vfs");
+    if option_env!("SYSTRACE").is_some() {
+        syscall::set_syscall_trace(true);
+    }
 
     let (name, elf, argv) = if cfg!(feature = "bare_hello") {
         ("hello", hello_elf(), alloc::vec!["hello"])

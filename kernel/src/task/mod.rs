@@ -49,6 +49,8 @@ impl TaskStorage {
 pub struct Task {
     storage: UnsafeCell<Box<TaskStorage>>,
     pub memory_set: Mutex<MemorySet>,
+    pub fd_table: crate::fs::FdTable,
+    pub cwd: Mutex<alloc::string::String>,
 }
 
 // SAFETY: M3 has a single task running on a single hart. The trap handler
@@ -164,6 +166,8 @@ pub fn create_task_from_elf(
     let task = Arc::new(Task {
         storage: UnsafeCell::new(TaskStorage::boxed()),
         memory_set: Mutex::new(ms),
+        fd_table: crate::fs::FdTable::new(),
+        cwd: Mutex::new(alloc::string::String::from("/")),
     });
 
     // Copy TF into the storage.
