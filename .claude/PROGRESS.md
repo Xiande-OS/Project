@@ -1,11 +1,11 @@
 # 进度（PROGRESS）
 
 > 这个文件描述项目当前所处的阶段、已完成的工作、正在进行的工作、阻塞项与下一步动作。每完成一个 milestone 或做出重大决策后更新。
-> 最近更新：2026-05-28（第三轮校准后）
+> 最近更新：2026-05-28（M0 完成）
 
 ## 当前阶段
-**M_design (rev. 3)**：架构论证已完成。仓库只有 `README.md` 与 `.claude/`。
-**当前实施目标 = 仅 M0**（项目骨架 + SBI 控制台 "hello"）。其他 milestone 留架构接口，不写实现。
+**M0 完成 ✅**：Cargo workspace、`riscv64gc-unknown-none-elf` 交叉编译、`cargo xtask qemu` 自动化、kernel 在 QEMU virt 上通过 OpenSBI 启动并打印 `xiande-os booting on hart 0`，DTB 物理地址正确显示（0xbfe00000），随后 SBI `system_reset` 干净关机。
+**下一阶段 = 等用户决定**：按 GOALS.md 顺序应该接 M1（trap / 内存 / 调度器骨架，单 hart），但按协作约定 M0 跑通后停下来汇报，由用户决定下一步优先级。
 
 ## 方向校准历史（2026-05-28 一天三轮）
 1. 上午：立项，9 个 milestone，SMP-ready + 动态链接 + 网络（wget 终验收）
@@ -20,25 +20,45 @@
 - [x] Milestone 划分 + 实施分期表（见 [GOALS.md](GOALS.md)、[DESIGN.md](DESIGN.md) 末尾"实施分期"段）
 - [x] 协作准则与同步文件结构（本目录）确立
 - [x] 协作记忆更新：补"少问多报"
+- [x] **Milestone 0**：Cargo workspace + 交叉编译 + xtask 自动化 + boot.S + SBI 控制台
+  - workspace `Cargo.toml`（resolver=2，members = `kernel`, `xtask`）
+  - `rust-toolchain.toml` 钉 `nightly-2026-05-27` + `riscv64gc-unknown-none-elf` 目标
+  - `kernel/`: `Cargo.toml` (sbi-rt 0.0.3, riscv 0.11)、`linker.ld` (`.text @ 0x80200000`)、`src/arch/riscv64/boot.S` 单 hart 入口（清 BSS、设栈、跳 kmain）、`src/main.rs` + `src/console.rs`（SBI legacy `console_putchar` 打印 + 干净 shutdown）
+  - `xtask/`: `cargo xtask {build,qemu}`，支持 `--release` / `--debug` / `--smp N` / `--gdb`
+  - workspace `.cargo/config.toml`: `xtask` alias + 仅作用于 `riscv64gc-unknown-none-elf` target 的链接 rustflags（host 构建不受影响）
+  - kernel ELF 实测正确：`.text` 起 `0x80200000`，64K boot stack 在 `.bss`
+  - **QEMU virt 实测输出**：`xiande-os booting on hart 0` / `dtb @ 0xbfe00000` / `M0: SBI console up. Halting.`，随后 SBI `system_reset(Shutdown, NoReason)` 干净退出
 
 ## 进行中
-- [ ] **Milestone 0**：Cargo workspace 骨架 + cross-compile target + QEMU 启动脚本 + SBI 控制台 "hello"
+- 无。等用户决定是否开 M1。
 
 ## 阻塞 / 待用户决策
-- 无。可以直接开 M0。
+- **下一步 milestone 优先级**：默认按 GOALS.md 顺序进 M1（trap / 内存 / 调度器骨架），但 HANDOFF.md 写明"M0 跑通后必须停下汇报"，所以等用户拍板。
+- 工具链注意：M0 没用到 `-Z build-std`，全靠 rustup 安装的 `riscv64gc-unknown-none-elf` 预编译 std component。M1 引内存分配/锁时如果需要 alloc 也可能继续不用 build-std；引入更深的 panic-abort customization 才考虑打开。
 
-## 下一步动作（按顺序，仅 M0 范围）
-1. 建立 Cargo workspace 根 `Cargo.toml`（resolver=2，workspace members = `kernel`, `xtask`）
-2. 写 `rust-toolchain.toml` 钉 nightly + 加 `riscv64gc-unknown-none-elf` target
-3. 建 `kernel/` crate：
-   - `kernel/Cargo.toml`（`[package]` + `[dependencies]` 加 `sbi-rt`、`riscv`）
-   - `kernel/.cargo/config.toml`：`target = "riscv64gc-unknown-none-elf"`、`rustflags = ["-C", "link-arg=-Tkernel/linker.ld"]`、`[unstable] build-std = ["core", "alloc", "compiler_builtins"]`
-   - `kernel/linker.ld`：`.text @ 0x80200000`、`.rodata`、`.data`、`.bss.stack`、`__kernel_end` 等符号
-   - `kernel/src/arch/riscv64/boot.S`：`_start` 单 hart 入口，设临时栈，跳到 `kmain(a0=hartid, a1=dtb)`
-   - `kernel/src/main.rs`：`#![no_std] #![no_main]`、`#[panic_handler]`、`extern "C" fn kmain` 用 `sbi_rt::console_write_byte` 打 "xiande-os booting on hart {hartid}"
-4. 建 `xtask/` crate：`xtask qemu` 子命令 — 调用 `cargo build -p kernel --release` → 用 `rust-objcopy` 抽 raw binary → `qemu-system-riscv64 -machine virt -nographic -bios default -kernel <binary>`
-5. 跑 `cargo xtask qemu`，确认终端能看到 `xiande-os booting on hart 0`
-6. M0 验收通过后，更新本文件，停下来汇报，等用户给下一步指示
+## 怎么跑（M0 当前状态）
+```sh
+# 一次到位
+cargo xtask qemu
+
+# 只编不跑
+cargo xtask build
+
+# 调试模式 / 多 hart 实验（M0 内核会把非 0 hart park 掉）
+cargo xtask qemu --debug --smp 1
+cargo xtask qemu --gdb            # 暂停等 gdb，:1234
+```
+
+## 下一步动作（建议，待用户确认）
+M1 — trap / 内存 / 调度器骨架（单 hart）：
+1. `kernel/src/arch/riscv64/trap.S` + `trap.rs`：`stvec` Direct 模式、`sscratch` 切栈、TrapFrame 保存全部 31 GPR
+2. `kernel/src/mm/`：buddy 物理页分配器（先 `buddy_system_allocator` crate）、`PhysAddr`/`VirtAddr` newtype、`PageTable` 抽象（trait `PagingMode`，Sv39 起步）
+3. 高半区跳转（M0 暂时 identity，M1 切到 `0xffff_ffff_8000_0000`）
+4. SBI timer 设 10ms tick，最小调度器：idle + 两个内核线程交替打印
+5. 除零/非法指令异常打 panic 信息
+6. **验收**：两线程交替打印 + 异常 panic 路径正确
+
+也可以按用户优先级跳到别的方向（例如先把用户态 ELF 加载 M3 做了），由用户拍板。
 
 ## 不做（M0 期间）
 - 不实现 trap / 中断 / 内存管理 / 调度 / 用户态 / 文件系统 / 网络
@@ -48,6 +68,7 @@
 ## 历史里程碑
 - 2026-05-28（上午）：项目立项 + 架构论证完成
 - 2026-05-28（下午）：方向两次校准，定为"全栈架构 + 仅 M0 实施"
+- 2026-05-28（晚上）：**M0 完成**——首次 `xiande-os booting on hart 0` 出现在 QEMU virt 控制台
 
 ## 给接手 agent 的提示
 - 项目目标和总体设计：先读 [GOALS.md](GOALS.md) 和 [DESIGN.md](DESIGN.md)

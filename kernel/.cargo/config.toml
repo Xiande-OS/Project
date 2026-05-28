@@ -1,0 +1,5 @@
+# Lets `cargo build` (without --target) inside kernel/ Just Work.
+# `cargo xtask` from the workspace root passes --target explicitly
+# and picks up the linker flags from ../.cargo/config.toml.
+[build]
+target = "riscv64gc-unknown-none-elf"

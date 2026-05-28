@@ -1,0 +1,13 @@
+[package]
+name = "kernel"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sbi-rt = { version = "0.0.3", features = ["legacy"] }
+riscv = "0.11"
+
+[features]
+default = []

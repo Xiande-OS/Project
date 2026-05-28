@@ -37,9 +37,10 @@
 - 用 sbi-rt / riscv / virtio-drivers / smoltcp / fatfs / fdt / xmas-elf / cpio_reader / buddy_system_allocator 等成熟 crate，不重造轮子
 - 工具链：内核 `riscv64gc-unknown-none-elf`；用户态 C 程序用 `riscv64-linux-musl-gcc`
 
-## 当前断点（2026-05-28）
-什么都还没建。下一步 = **Milestone 0**：建 Cargo workspace + 交叉编译 + QEMU 启动脚本 + SBI 控制台打印第一行字符串。
-具体步骤在 [PROGRESS.md](PROGRESS.md) 的"下一步动作"段。
+## 当前断点（2026-05-28 晚）
+**M0 已完成**——`cargo xtask qemu` 能在 QEMU virt 上看到 `xiande-os booting on hart 0`。
+按协作约定停在这里等用户决定下一步：默认走 M1（trap / 内存 / 调度器骨架，单 hart），也可按用户优先级跳。
+详见 [PROGRESS.md](PROGRESS.md) "下一步动作（建议，待用户确认）"段。
 
 ## 如果你遇到争议或需要决策
 - **M0 范围内的小决策**（实现细节、文件组织、crate 版本）：自己拿主意，PROGRESS 里说一声即可
