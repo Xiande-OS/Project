@@ -584,10 +584,30 @@ pub fn sys_setsockopt(_fd: i32, _level: i32, _optname: i32, _optval: usize, _opt
     0
 }
 
-pub fn sys_getsockopt(_fd: i32, _level: i32, _optname: i32, optval: usize, optlen_ptr: usize) -> isize {
+pub fn sys_getsockopt(_fd: i32, level: i32, optname: i32, optval: usize, optlen_ptr: usize) -> isize {
+    // Linux setsockopt(2) names (subset). iperf3 / netperf inspect a
+    // handful of these and refuse to proceed if any return 0.
+    const SOL_SOCKET: i32 = 1;
+    const SOL_TCP: i32 = 6;
+    const SO_SNDBUF: i32 = 7;
+    const SO_RCVBUF: i32 = 8;
+    const SO_ERROR: i32 = 4;
+    const SO_TYPE: i32 = 3;
+    const TCP_MAXSEG: i32 = 2;
+
     let task = current_task();
+    let val: i32 = match (level, optname) {
+        // 64 KiB matches our loopback pipe BUF_CAP and smoltcp default.
+        (SOL_SOCKET, SO_SNDBUF) | (SOL_SOCKET, SO_RCVBUF) => 65536,
+        // iperf3 multiplies SO_RCVBUF / 2 against -w; a non-zero value
+        // is what it actually needs.
+        (SOL_SOCKET, SO_ERROR) => 0,
+        (SOL_SOCKET, SO_TYPE) => 1, // SOCK_STREAM
+        (SOL_TCP, TCP_MAXSEG) => 1460,
+        _ => 0,
+    };
     if optval != 0 {
-        let _ = task.copy_out_bytes(optval, &0i32.to_le_bytes());
+        let _ = task.copy_out_bytes(optval, &val.to_le_bytes());
     }
     if optlen_ptr != 0 {
         let _ = task.copy_out_bytes(optlen_ptr, &4u32.to_le_bytes());

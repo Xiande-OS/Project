@@ -395,13 +395,30 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
     // until either data arrives or the peer closes.
     if n == 0 {
         if let Some(sock) = file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>() {
-            if sock.kind == crate::fs::socket::SocketKind::Tcp {
+            // Loopback socket: block if peer's outgoing buffer is empty AND
+            // peer hasn't shut down. Without this iperf3's control-socket
+            // read interprets the empty buffer as EOF and exits.
+            let lp = sock.state.lock().loopback.clone();
+            if let Some(lp) = lp {
+                if !lp.peer_eof() && !lp.can_recv() {
+                    let nonblock = sock.state.lock().nonblock;
+                    if nonblock {
+                        return -11;
+                    }
+                    crate::task::mark_socket_waiter(task.pid);
+                    *task.state.lock() = crate::task::TaskState::Waiting;
+                    unsafe {
+                        let tf = task.tf_ptr();
+                        (*tf).sepc -= 4;
+                    }
+                    return -11;
+                }
+            } else if sock.kind == crate::fs::socket::SocketKind::Tcp {
                 let nonblock = sock.state.lock().nonblock;
                 if crate::net::tcp_may_recv(sock.handle) {
                     if nonblock {
                         return -11; // EAGAIN
                     }
-                    // Rewind sepc and park; we'll be re-run after a packet.
                     crate::task::mark_socket_waiter(task.pid);
                     *task.state.lock() = crate::task::TaskState::Waiting;
                     unsafe {
