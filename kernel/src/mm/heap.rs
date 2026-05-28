@@ -11,7 +11,7 @@ use buddy_system_allocator::LockedHeap;
 // per bench. The contest harness also forks many short-lived ELFs whose
 // images we slurp into Vec<u8> in sys_execve. 32 MB was hitting alloc
 // failures mid-libcbench. 128 MB still fits inside QEMU virt's -m 1G.
-const KERNEL_HEAP_SIZE: usize = 512 * 1024 * 1024;
+const KERNEL_HEAP_SIZE: usize = 256 * 1024 * 1024;
 
 #[link_section = ".bss.heap"]
 static mut KERNEL_HEAP: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];

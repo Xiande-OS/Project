@@ -101,16 +101,19 @@ impl PageTable {
         SATP_MODE_SV39 | self.root_ppn().0
     }
 
-    fn find_or_create(&mut self, vpn: VirtPageNum) -> &mut Pte {
+    fn find_or_create(&mut self, vpn: VirtPageNum) -> Option<&mut Pte> {
         let indices = vpn.indices();
         let mut ppn = self.root.ppn;
         for (lvl, &idx) in indices.iter().enumerate() {
             let pte = unsafe { &mut *(ppn.base().0 as *mut Pte).add(idx) };
             if lvl == 2 {
-                return pte;
+                return Some(pte);
             }
             if !pte.is_valid() {
-                let frame = alloc_frame().expect("OOM: page-table node");
+                // None on frame exhaustion — map() turns this into a
+                // silent no-op so the OOMing process faults & dies
+                // instead of panicking the kernel.
+                let frame = alloc_frame()?;
                 *pte = Pte::new(frame.ppn, PteFlags::V);
                 ppn = frame.ppn;
                 self.intermediate.push(frame);
@@ -118,7 +121,7 @@ impl PageTable {
                 ppn = pte.ppn();
             }
         }
-        unreachable!()
+        None
     }
 
     fn find(&self, vpn: VirtPageNum) -> Option<&Pte> {
@@ -142,12 +145,17 @@ impl PageTable {
     /// invalidation and for tracking that the previous PPN is no longer
     /// referenced).
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PteFlags) {
-        let pte = self.find_or_create(vpn);
-        *pte = Pte::new(ppn, flags | PteFlags::V);
+        // Best-effort: on PT-node OOM the mapping silently doesn't get
+        // installed. The caller (push_user_area) has already checked the
+        // data frame; a missing mapping just means the OOMing process
+        // will fault on access and be killed — the kernel stays up.
+        if let Some(pte) = self.find_or_create(vpn) {
+            *pte = Pte::new(ppn, flags | PteFlags::V);
+        }
     }
 
     pub fn unmap(&mut self, vpn: VirtPageNum) -> Option<Pte> {
-        let pte = self.find_or_create(vpn);
+        let pte = self.find_or_create(vpn)?;
         if pte.is_valid() {
             let old = *pte;
             *pte = Pte::empty();
