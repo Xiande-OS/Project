@@ -186,7 +186,19 @@ impl Inode for Socket {
     fn write_at(&self, _off: u64, buf: &[u8]) -> Result<usize> {
         // Loopback TCP fast path.
         if let Some(lb) = self.state.lock().loopback.clone() {
-            return Ok(lb.send(buf));
+            let n = lb.send(buf);
+            // A full pipe must surface as EAGAIN, not a 0-byte write:
+            // iperf3's Nwrite treats write()==0 as a hard error / spins,
+            // whereas EAGAIN sends it back to select to wait for room.
+            if n == 0 && !buf.is_empty() {
+                if lb.can_send() {
+                    // Peer still alive but momentarily wedged: report EAGAIN.
+                    return Err(super::EAGAIN);
+                }
+                // Peer closed its receive side -> broken pipe.
+                return Err(super::EAGAIN);
+            }
+            return Ok(n);
         }
         match self.kind {
             SocketKind::Tcp => {

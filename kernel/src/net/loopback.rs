@@ -104,6 +104,13 @@ impl LoopbackEnd {
         for slot in buf.iter_mut().take(n) {
             *slot = q.pop_front().unwrap();
         }
+        let drained = !q.is_empty() || n > 0;
+        drop(q);
+        // Draining our incoming queue frees space in the peer's outgoing
+        // queue; a peer blocked in send() on a full pipe must be woken.
+        if drained && n > 0 {
+            crate::task::wake_socket_waiters();
+        }
         n
     }
 

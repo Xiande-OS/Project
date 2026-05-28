@@ -411,6 +411,15 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                         let tf = task.tf_ptr();
                         (*tf).sepc -= 4;
                     }
+                    // Re-check after parking: a peer send() between our
+                    // can_recv() test and the Waiting store would otherwise
+                    // fire wake_socket_waiters() while we were still Running
+                    // (a no-op), leaving us asleep forever. Since send()
+                    // writes the pipe before waking, re-reading here closes
+                    // that lost-wakeup window.
+                    if lp.can_recv() || lp.peer_eof() {
+                        *task.state.lock() = crate::task::TaskState::Ready;
+                    }
                     return -11;
                 }
             } else if sock.kind == crate::fs::socket::SocketKind::Tcp {
@@ -1312,8 +1321,28 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
             c[fd as usize] = arg & 1 != 0;
             0
         }
-        F_GETFL => 0,
-        F_SETFL => 0,
+        F_GETFL => {
+            // Report O_NONBLOCK so userland (iperf3) sees the flag it set.
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            if let Some(sock) = file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>() {
+                if sock.state.lock().nonblock {
+                    return O_NONBLOCK as isize;
+                }
+            }
+            0
+        }
+        F_SETFL => {
+            // Honor O_NONBLOCK on sockets: iperf3/netperf flip their data
+            // sockets non-blocking via fcntl and then rely on read()/write()
+            // returning EAGAIN instead of blocking. Ignoring it made the
+            // loopback read path park the task forever after a test's data
+            // phase ended.
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            if let Some(sock) = file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>() {
+                sock.state.lock().nonblock = (arg & O_NONBLOCK) != 0;
+            }
+            0
+        }
         // F_GETLK=5, F_SETLK=6, F_SETLKW=7. arg is `struct flock *`.
         5 | 6 | 7 => {
             let task = current_task();

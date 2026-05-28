@@ -66,6 +66,20 @@ fn block_and_retry() {
     }
 }
 
+/// Like `block_and_retry`, but re-evaluates `ready()` after switching to
+/// Waiting. A peer that produces data between the caller's emptiness test
+/// and our Waiting store calls `wake_socket_waiters()` while we are still
+/// Running (a no-op), which would otherwise leave us parked forever. The
+/// peer always mutates the shared queue *before* waking, so re-checking
+/// here after the store closes that lost-wakeup window.
+fn block_and_retry_recheck(ready: impl Fn() -> bool) {
+    block_and_retry();
+    if ready() {
+        let me = current_task();
+        *me.state.lock() = crate::task::TaskState::Ready;
+    }
+}
+
 /// Wake ourselves (Waiting -> Ready) so on the next scheduler tick we get
 /// rerun. The current syscall completes normally first; the rewound sepc
 /// + Waiting state takes effect at trap exit.
@@ -227,6 +241,16 @@ pub fn sys_accept4(fd: i32, sa_ptr: usize, sa_len_ptr: usize, flags: i32) -> isi
                 Err(e) => e as isize,
             };
         }
+        // Loopback listener with an empty backlog: block (with the
+        // lost-wakeup recheck) until a connect() queues a server-end,
+        // rather than falling through to smoltcp's accept path.
+        let nonblock = with_socket(fd, |s| s.state.lock().nonblock).unwrap_or(false);
+        if nonblock {
+            return EAGAIN;
+        }
+        let l2 = listener.clone();
+        block_and_retry_recheck(move || !l2.pending.lock().is_empty());
+        return EAGAIN;
     }
     // Look up the listening socket's handle + port.
     let listen_info = match with_socket(fd, |s| {
@@ -439,7 +463,8 @@ pub fn sys_sendto(
                     return ECONNRESET;
                 }
                 if n == 0 {
-                    block_and_retry();
+                    let lb2 = lb.clone();
+                    block_and_retry_recheck(move || lb2.can_send());
                     return EAGAIN;
                 }
                 return n as isize;
@@ -562,7 +587,8 @@ pub fn sys_recvfrom(
                     if nonblock {
                         return EAGAIN;
                     }
-                    block_and_retry();
+                    let lb2 = lb.clone();
+                    block_and_retry_recheck(move || lb2.can_recv() || lb2.peer_eof());
                     return EAGAIN;
                 }
                 if task.copy_out_bytes(buf_ptr, &buf[..n]).is_none() {
@@ -622,6 +648,14 @@ pub fn sys_recvfrom(
             // Loopback fast path: pull from our UdpEnd's incoming queue.
             if let Some(ue) = udp_end {
                 let dg = ue.incoming.lock().pop_front();
+                if dg.is_none() {
+                    if nonblock {
+                        return EAGAIN;
+                    }
+                    let ue2 = ue.clone();
+                    block_and_retry_recheck(move || !ue2.incoming.lock().is_empty());
+                    return EAGAIN;
+                }
                 if let Some(dg) = dg {
                     let n = core::cmp::min(buf.len(), dg.data.len());
                     if task.copy_out_bytes(buf_ptr, &dg.data[..n]).is_none() {
@@ -643,10 +677,7 @@ pub fn sys_recvfrom(
                     }
                     return n as isize;
                 }
-                if nonblock {
-                    return EAGAIN;
-                }
-                block_and_retry();
+                // Unreachable: the empty case is handled above.
                 return EAGAIN;
             }
             match net::udp_recv(handle, &mut buf) {
