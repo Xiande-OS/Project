@@ -84,6 +84,7 @@ pub const SYS_SYSINFO: usize = 179;
 pub const SYS_SOCKET: usize = 198;
 pub const SYS_BIND: usize = 200;
 pub const SYS_LISTEN: usize = 201;
+pub const SYS_ACCEPT: usize = 202;
 pub const SYS_ACCEPT4: usize = 242;
 pub const SYS_CONNECT: usize = 203;
 pub const SYS_GETSOCKNAME: usize = 204;

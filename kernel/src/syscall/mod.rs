@@ -186,6 +186,9 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_BIND => { crate::net::poll(); socket::sys_bind(a0 as i32, a1, a2) }
         nr::SYS_LISTEN => { crate::net::poll(); socket::sys_listen(a0 as i32, a1 as i32) }
         nr::SYS_ACCEPT4 => { crate::net::poll(); socket::sys_accept4(a0 as i32, a1, a2, a3 as i32) }
+        // Plain accept (#202) is the same as accept4 with flags=0. glibc-built
+        // network tools (iperf3, netserver) still emit it on RISC-V.
+        nr::SYS_ACCEPT => { crate::net::poll(); socket::sys_accept4(a0 as i32, a1, a2, 0) }
         nr::SYS_CONNECT => { crate::net::poll(); socket::sys_connect(a0 as i32, a1, a2) }
         nr::SYS_GETSOCKNAME => socket::sys_getsockname(a0 as i32, a1, a2),
         nr::SYS_GETPEERNAME => socket::sys_getpeername(a0 as i32, a1, a2),
@@ -197,7 +200,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SENDMSG => { crate::net::poll(); socket::sys_sendmsg(a0 as i32, a1, a2 as i32) }
         nr::SYS_RECVMSG => { crate::net::poll(); socket::sys_recvmsg(a0 as i32, a1, a2 as i32) }
         _ => {
-            println!("[syscall] unimplemented #{} a0={:#x} a1={:#x}", id, a0, a1);
+            warn_unimplemented(id, a0, a1);
             ENOSYS
         }
     };
@@ -223,6 +226,29 @@ static SYSCALL_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 
 fn syscall_trace_enabled() -> bool {
     SYSCALL_TRACE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// First-time-only print for an unimplemented syscall number. A
+/// looping ENOSYS retrieval (some contest binaries spin on accept,
+/// epoll, etc. instead of giving up) used to OOM the host log file at
+/// MB/s. We still want to know what was missing, so log once.
+fn warn_unimplemented(id: usize, a0: usize, a1: usize) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // 256 syscalls × 1 bit each = 4 u64s. Covers most of the active range;
+    // anything ≥256 collapses into the last bucket (still rate-limited per
+    // bucket, just slightly more aggressively).
+    static SEEN: [AtomicU64; 8] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    ];
+    let bucket = (id / 64) & 7;
+    let bit = 1u64 << (id & 63);
+    let prev = SEEN[bucket].fetch_or(bit, Ordering::Relaxed);
+    if prev & bit == 0 {
+        crate::println!(
+            "[syscall] unimplemented #{} a0={:#x} a1={:#x}", id, a0, a1
+        );
+    }
 }
 
 pub fn set_syscall_trace(on: bool) {
