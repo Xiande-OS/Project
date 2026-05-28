@@ -158,6 +158,18 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_EXECVE => sys_execve(a0, a1, a2),
         nr::SYS_WAIT4 => sys_wait4(a0 as i32, a1, a2 as i32),
         nr::SYS_WAITID => sys_waitid(a0 as i32, a1 as i32, a2, a3 as i32),
+        nr::SYS_MQ_OPEN => sys_mq_open(a0, a1 as i32, a2 as u32, a3),
+        nr::SYS_MQ_UNLINK => sys_mq_unlink(a0),
+        nr::SYS_MQ_TIMEDSEND => sys_mq_timedsend(a0 as i32, a1, a2, a3 as u32, a4),
+        nr::SYS_MQ_TIMEDRECEIVE => sys_mq_timedreceive(a0 as i32, a1, a2, a3, a4),
+        nr::SYS_MQ_GETSETATTR => 0,
+        nr::SYS_PIDFD_OPEN => sys_pidfd_open(a0 as i32, a1 as u32),
+        nr::SYS_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(a0 as i32, a1 as i32, a2, a3 as u32),
+        nr::SYS_PIDFD_GETFD => EBADF,
+        nr::SYS_INOTIFY_INIT1 => sys_inotify_init1(a0 as i32),
+        nr::SYS_INOTIFY_ADD_WATCH => 1,
+        nr::SYS_INOTIFY_RM_WATCH => 0,
+        nr::SYS_SIGNALFD4 => sys_signalfd4(a0 as i32, a1, a2 as usize, a3 as i32),
         _ => {
             println!("[syscall] unimplemented #{} a0={:#x} a1={:#x}", id, a0, a1);
             ENOSYS
@@ -672,6 +684,166 @@ fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
             0
         }
         _ => 0,
+    }
+}
+
+// ---------- POSIX message queues ----------
+
+use alloc::collections::VecDeque as MqVecDeque;
+
+struct PosixMsg {
+    prio: u32,
+    data: alloc::vec::Vec<u8>,
+}
+
+struct PosixMq {
+    queue: SpinMutex<MqVecDeque<PosixMsg>>,
+    max_msgs: usize,
+    max_msg_size: usize,
+}
+
+impl crate::fs::Inode for PosixMq {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn kind(&self) -> crate::fs::FileType { crate::fs::FileType::Pipe }
+    fn size(&self) -> u64 { self.queue.lock().len() as u64 }
+}
+
+static MQ_TABLE: SpinMutex<alloc::collections::BTreeMap<alloc::string::String, Arc<PosixMq>>> =
+    SpinMutex::new(alloc::collections::BTreeMap::new());
+
+fn sys_mq_open(name: usize, oflag: i32, _mode: u32, attr: usize) -> isize {
+    const O_CREAT: i32 = 0o100;
+    const O_EXCL: i32 = 0o200;
+    let task = current_task();
+    let Some(name_s) = copy_path(name) else { return EFAULT };
+    let key = alloc::string::String::from(name_s.trim_start_matches('/'));
+
+    let mut table = MQ_TABLE.lock();
+    let mq = if let Some(existing) = table.get(&key) {
+        if (oflag & O_EXCL) != 0 && (oflag & O_CREAT) != 0 { return -17; }
+        existing.clone()
+    } else {
+        if (oflag & O_CREAT) == 0 { return ENOENT; }
+        let (max_msgs, max_size) = if attr != 0 {
+            let Some(b) = task.copy_in_bytes(attr, 32) else { return EFAULT };
+            let m = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8])) as usize;
+            let s = i64::from_le_bytes(b[16..24].try_into().unwrap_or([0; 8])) as usize;
+            (if m == 0 { 10 } else { m }, if s == 0 { 8192 } else { s })
+        } else { (10, 8192) };
+        let mq = Arc::new(PosixMq {
+            queue: SpinMutex::new(MqVecDeque::new()),
+            max_msgs, max_msg_size: max_size,
+        });
+        table.insert(key, mq.clone());
+        mq
+    };
+    drop(table);
+    let inode: Arc<dyn Inode> = mq;
+    let file = Arc::new(crate::fs::File::from_inode(inode, true, true, false));
+    let res = task.fd_table.lock().alloc(file, false);
+    match res {
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+fn sys_mq_unlink(name: usize) -> isize {
+    let Some(name_s) = copy_path(name) else { return EFAULT };
+    let key = alloc::string::String::from(name_s.trim_start_matches('/'));
+    let mut table = MQ_TABLE.lock();
+    if table.remove(&key).is_some() { 0 } else { ENOENT }
+}
+
+fn sys_mq_timedsend(fd: i32, msg: usize, len: usize, prio: u32, _abs: usize) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    let mq = match file.inode.as_any().downcast_ref::<PosixMq>() { Some(q) => q, None => return EBADF };
+    if len > mq.max_msg_size { return -90; }
+    let Some(data) = task.copy_in_bytes(msg, len) else { return EFAULT };
+    let mut q = mq.queue.lock();
+    if q.len() >= mq.max_msgs { return -11; }
+    q.push_back(PosixMsg { prio, data });
+    0
+}
+
+fn sys_mq_timedreceive(fd: i32, msg: usize, len: usize, prio_ptr: usize, _abs: usize) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    let mq = match file.inode.as_any().downcast_ref::<PosixMq>() { Some(q) => q, None => return EBADF };
+    let m = { let mut q = mq.queue.lock(); q.pop_front() };
+    let Some(m) = m else { return -11; };
+    let n = core::cmp::min(len, m.data.len());
+    if task.copy_out_bytes(msg, &m.data[..n]).is_none() { return EFAULT; }
+    if prio_ptr != 0 { let _ = task.copy_out_bytes(prio_ptr, &m.prio.to_le_bytes()); }
+    n as isize
+}
+
+// ---------- pidfd / inotify / signalfd ----------
+
+struct PidFd { pid: i32 }
+impl crate::fs::Inode for PidFd {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn kind(&self) -> crate::fs::FileType { crate::fs::FileType::Pipe }
+    fn size(&self) -> u64 { 0 }
+}
+
+fn sys_pidfd_open(pid: i32, _flags: u32) -> isize {
+    if crate::task::task_by_pid(pid).is_none() { return -3; }
+    let pfd: Arc<dyn Inode> = Arc::new(PidFd { pid });
+    let file = Arc::new(crate::fs::File::from_inode(pfd, true, false, false));
+    match current_task().fd_table.lock().alloc(file, true) {
+        Ok(fd) => fd as isize, Err(e) => err_to_isize(e),
+    }
+}
+
+fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _siginfo: usize, _flags: u32) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(pidfd) else { return EBADF };
+    let pfd = match file.inode.as_any().downcast_ref::<PidFd>() { Some(p) => p, None => return EBADF };
+    let Some(target) = crate::task::task_by_pid(pfd.pid) else { return -3; };
+    crate::signal::raise_signal(&target, sig as u32);
+    0
+}
+
+struct InotifyFd;
+impl crate::fs::Inode for InotifyFd {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn kind(&self) -> crate::fs::FileType { crate::fs::FileType::Pipe }
+    fn size(&self) -> u64 { 0 }
+    fn read_at(&self, _o: u64, _b: &mut [u8]) -> crate::fs::Result<usize> { Ok(0) }
+}
+
+fn sys_inotify_init1(flags: i32) -> isize {
+    const IN_CLOEXEC: i32 = 0o2000000;
+    let n: Arc<dyn Inode> = Arc::new(InotifyFd);
+    let file = Arc::new(crate::fs::File::from_inode(n, true, false, false));
+    match current_task().fd_table.lock().alloc(file, flags & IN_CLOEXEC != 0) {
+        Ok(fd) => fd as isize, Err(e) => err_to_isize(e),
+    }
+}
+
+struct SignalFd { _mask: u64 }
+impl crate::fs::Inode for SignalFd {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn kind(&self) -> crate::fs::FileType { crate::fs::FileType::Pipe }
+    fn size(&self) -> u64 { 0 }
+    fn read_at(&self, _o: u64, _b: &mut [u8]) -> crate::fs::Result<usize> { Ok(0) }
+}
+
+fn sys_signalfd4(fd: i32, mask_addr: usize, _sizemask: usize, flags: i32) -> isize {
+    const SFD_CLOEXEC: i32 = 0o2000000;
+    let task = current_task();
+    let mask = if mask_addr != 0 {
+        let b = task.copy_in_bytes(mask_addr, 8).unwrap_or(alloc::vec![0u8; 8]);
+        u64::from_le_bytes(b.as_slice().try_into().unwrap_or([0; 8]))
+    } else { 0 };
+    if fd >= 0 { return fd as isize; }
+    let s: Arc<dyn Inode> = Arc::new(SignalFd { _mask: mask });
+    let file = Arc::new(crate::fs::File::from_inode(s, true, false, false));
+    let res = task.fd_table.lock().alloc(file, flags & SFD_CLOEXEC != 0);
+    match res {
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
     }
 }
 
