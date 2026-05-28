@@ -1,5 +1,5 @@
 /target
+/user/target
 **/*.rs.bk
-Cargo.lock.user
-*.swp
+**/*.swp
 .DS_Store
