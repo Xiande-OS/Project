@@ -1671,7 +1671,7 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
 
     let argv_refs: alloc::vec::Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
     let envp_refs: alloc::vec::Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
-    match crate::task::execve_current(&elf_aligned, &argv_refs, &envp_refs) {
+    match crate::task::execve_current_with_path(&elf_aligned, &argv_refs, &envp_refs, &path) {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
     }
@@ -1946,10 +1946,35 @@ fn sys_readlinkat(_dfd: i32, path: usize, buf: usize, len: usize) -> isize {
         Some(s) => s,
         None => return EINVAL,
     };
-    let resolved: &str = match path_str {
-        "/proc/self/exe" => "/bin/git",
-        _ => return ENOENT,
+    let resolved: alloc::string::String = if path_str == "/proc/self/exe" {
+        task.exe_path.lock().clone()
+    } else if path_str == "/proc/self/cwd" {
+        task.cwd.lock().clone()
+    } else if let Some(rest) = path_str.strip_prefix("/proc/") {
+        // Either /proc/<pid>/exe or /proc/<pid>/cwd.
+        if let Some((pid_str, leaf)) = rest.split_once('/') {
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                if let Some(t) = crate::task::task_by_pid(pid) {
+                    match leaf {
+                        "exe" => t.exe_path.lock().clone(),
+                        "cwd" => t.cwd.lock().clone(),
+                        _ => return ENOENT,
+                    }
+                } else {
+                    return ENOENT;
+                }
+            } else {
+                return ENOENT;
+            }
+        } else {
+            return ENOENT;
+        }
+    } else {
+        return ENOENT;
     };
+    if resolved.is_empty() {
+        return ENOENT;
+    }
     let n = core::cmp::min(len, resolved.len());
     if task.copy_out_bytes(buf, &resolved.as_bytes()[..n]).is_none() {
         return EFAULT;

@@ -7,7 +7,7 @@ pub mod memory_set;
 pub mod page_table;
 
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, PAGE_SIZE};
-pub use frame::{alloc as alloc_frame, FrameTracker};
+pub use frame::{alloc as alloc_frame, frame_stats, FrameTracker};
 pub use page_table::{PageTable, Pte, PteFlags};
 
 /// Physical memory end. QEMU virt's default RAM ends at 0x80000000 + 1 GiB.

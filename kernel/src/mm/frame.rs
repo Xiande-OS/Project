@@ -5,6 +5,7 @@
 //! exactly what `MemorySet` wants when a process exits.
 
 use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use buddy_system_allocator::LockedFrameAllocator;
 use spin::Lazy;
@@ -13,6 +14,11 @@ use super::address::{PhysAddr, PhysPageNum, PAGE_SIZE};
 
 static FRAME_ALLOC: Lazy<LockedFrameAllocator<32>> = Lazy::new(LockedFrameAllocator::new);
 
+/// Total pages put into the frame pool at boot (constant after `init`).
+static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// Pages currently handed out (in-use). Decremented on dealloc.
+static ALLOCATED_PAGES: AtomicUsize = AtomicUsize::new(0);
+
 /// Register the [start, end) physical range as the kernel's free frame pool.
 /// Pass `[__kernel_end .. MEMORY_END)` from boot.
 pub fn init(pa_start: PhysAddr, pa_end: PhysAddr) {
@@ -20,17 +26,31 @@ pub fn init(pa_start: PhysAddr, pa_end: PhysAddr) {
     let end = pa_end.0 / PAGE_SIZE;
     assert!(end > start, "frame range empty");
     FRAME_ALLOC.lock().add_frame(start, end);
+    TOTAL_PAGES.store(end - start, Ordering::Relaxed);
 }
 
 pub fn alloc() -> Option<FrameTracker> {
-    FRAME_ALLOC
+    let res = FRAME_ALLOC
         .lock()
         .alloc(1)
-        .map(|ppn_usize| FrameTracker::new_zeroed(PhysPageNum(ppn_usize)))
+        .map(|ppn_usize| FrameTracker::new_zeroed(PhysPageNum(ppn_usize)));
+    if res.is_some() {
+        ALLOCATED_PAGES.fetch_add(1, Ordering::Relaxed);
+    }
+    res
 }
 
 pub fn dealloc(ppn: PhysPageNum) {
     FRAME_ALLOC.lock().dealloc(ppn.0, 1);
+    ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// (total_pages, free_pages) snapshot of the frame allocator. Used by procfs
+/// to fill in /proc/meminfo.
+pub fn frame_stats() -> (usize, usize) {
+    let total = TOTAL_PAGES.load(Ordering::Relaxed);
+    let used = ALLOCATED_PAGES.load(Ordering::Relaxed);
+    (total, total.saturating_sub(used))
 }
 
 /// Owns one physical frame; frees on drop.
