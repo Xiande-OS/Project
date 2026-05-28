@@ -8,6 +8,7 @@ use spin::{Mutex, Once};
 pub mod devfs;
 pub mod pipe;
 pub mod tmpfs;
+pub use tmpfs::TmpfsDir;
 
 pub type Result<T> = core::result::Result<T, i32>;
 

@@ -108,4 +108,18 @@ fn main() {
     std::fs::copy(&bb_src, &bb_dst).expect("copy busybox.elf");
     println!("cargo:rerun-if-changed=../user/busybox.elf");
     println!("cargo:rustc-env=BUSYBOX_ELF_PATH={}", bb_dst.display());
+
+    // dynamic-hello (C, musl-dynamic).
+    let dh_src = workspace_root.join("user/dyn_hello.elf");
+    let dh_dst = out_dir.join("dyn_hello.elf");
+    std::fs::copy(&dh_src, &dh_dst).expect("copy dyn_hello.elf");
+    println!("cargo:rerun-if-changed=../user/dyn_hello.elf");
+    println!("cargo:rustc-env=DYN_HELLO_ELF_PATH={}", dh_dst.display());
+
+    // ld-musl-riscv64.so.1 (musl's combined libc + ld).
+    let ld_src = workspace_root.join("user/ld-musl-riscv64.so.1");
+    let ld_dst = out_dir.join("ld-musl-riscv64.so.1");
+    std::fs::copy(&ld_src, &ld_dst).expect("copy ld-musl-riscv64.so.1");
+    println!("cargo:rerun-if-changed=../user/ld-musl-riscv64.so.1");
+    println!("cargo:rustc-env=LD_MUSL_PATH={}", ld_dst.display());
 }

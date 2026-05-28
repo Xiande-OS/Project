@@ -29,6 +29,10 @@ static REAL_GIT_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("REAL_GIT_ELF_PATH")));
 static BUSYBOX_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("BUSYBOX_ELF_PATH")));
+static DYN_HELLO_ALIGNED: &AlignedElf<[u8]> =
+    &AlignedElf(*include_bytes!(env!("DYN_HELLO_ELF_PATH")));
+static LD_MUSL_ALIGNED: &AlignedElf<[u8]> =
+    &AlignedElf(*include_bytes!(env!("LD_MUSL_PATH")));
 
 fn hello_elf() -> &'static [u8] {
     &HELLO_ALIGNED.0
@@ -44,6 +48,12 @@ fn real_git_elf() -> &'static [u8] {
 }
 fn busybox_elf() -> &'static [u8] {
     &BUSYBOX_ALIGNED.0
+}
+fn dyn_hello_elf() -> &'static [u8] {
+    &DYN_HELLO_ALIGNED.0
+}
+fn ld_musl_blob() -> &'static [u8] {
+    &LD_MUSL_ALIGNED.0
 }
 
 #[no_mangle]
@@ -65,7 +75,14 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         fs::link_into("/bin", applet, bb.clone()).unwrap();
     }
     fs::install_file("/bin", "git", real_git_elf()).unwrap();
-    println!("[ok] heap + frame allocator + trap vector + vfs + /bin");
+    fs::install_file("/bin", "dyn_hello", dyn_hello_elf()).unwrap();
+    // Install the dynamic linker so PT_INTERP="/lib/ld-musl-riscv64.so.1" works.
+    if let Some(td) = fs::tmpfs::downcast_dir(&fs::root()) {
+        let lib_dir = fs::tmpfs::TmpfsDir::new_root();
+        td.place_inode("lib", lib_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
+    }
+    fs::install_file("/lib", "ld-musl-riscv64.so.1", ld_musl_blob()).unwrap();
+    println!("[ok] heap + frame allocator + trap vector + vfs + /bin + /lib");
     if option_env!("SYSTRACE").is_some() {
         syscall::set_syscall_trace(true);
     }
@@ -93,6 +110,8 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
             }
         }
         (applet, busybox_elf(), a)
+    } else if cfg!(feature = "dyn_hello") {
+        ("dyn_hello", dyn_hello_elf(), alloc::vec!["dyn_hello", "alpha", "beta"])
     } else {
         let cmd = option_env!("GIT_CMD").unwrap_or("--version");
         let split: alloc::vec::Vec<&str> = cmd.split_whitespace().collect();
