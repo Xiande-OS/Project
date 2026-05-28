@@ -11,6 +11,22 @@ use super::address::{PhysPageNum, VirtAddr, VirtPageNum, PAGE_SIZE};
 use super::frame::{alloc as alloc_frame, FrameTracker};
 use super::page_table::{PageTable, PteFlags};
 
+/// Split a BTreeMap so the returned half contains keys < `pivot` and the
+/// original retains keys >= `pivot`.
+fn split_off_le<V>(
+    map: &mut BTreeMap<VirtPageNum, V>,
+    pivot: VirtPageNum,
+) -> BTreeMap<VirtPageNum, V> {
+    let mut head = BTreeMap::new();
+    let keys: Vec<VirtPageNum> = map.range(..pivot).map(|(k, _)| *k).collect();
+    for k in keys {
+        if let Some(v) = map.remove(&k) {
+            head.insert(k, v);
+        }
+    }
+    head
+}
+
 bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct VmPerm: u8 {
@@ -66,7 +82,7 @@ impl VmArea {
 
 pub struct MemorySet {
     pub page_table: PageTable,
-    areas: Vec<VmArea>,
+    pub areas: Vec<VmArea>,
     /// Heap (brk) state.
     pub brk_base: VirtAddr,
     pub brk_cur: VirtAddr,
@@ -138,6 +154,127 @@ impl MemorySet {
 
     pub fn translate(&self, va: VirtAddr) -> Option<super::address::PhysAddr> {
         self.page_table.translate(va)
+    }
+
+    /// Real munmap: unmap every page in `[va, va+len)`. If a VmArea is
+    /// fully covered, drop it (and all its frames). If partially covered,
+    /// shrink or split it. PTEs in the range are cleared and the local TLB
+    /// is flushed page-by-page.
+    pub fn unmap_range(&mut self, va: VirtAddr, len: usize) {
+        let start = va.0 & !(PAGE_SIZE - 1);
+        let end = (va.0 + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let start_vpn = VirtPageNum(start / PAGE_SIZE);
+        let end_vpn = VirtPageNum(end / PAGE_SIZE);
+
+        let mut new_areas: Vec<VmArea> = Vec::new();
+        for area in core::mem::take(&mut self.areas) {
+            // No overlap → keep verbatim.
+            if area.vpn_end <= start_vpn || area.vpn_start >= end_vpn {
+                new_areas.push(area);
+                continue;
+            }
+
+            let a_start = area.vpn_start;
+            let a_end = area.vpn_end;
+            let perm = area.perm;
+            let mut frames = area.frames;
+
+            // Compute overlap.
+            let cut_start = core::cmp::max(a_start, start_vpn);
+            let cut_end = core::cmp::min(a_end, end_vpn);
+
+            // Unmap pages in the overlap.
+            for vpn_raw in cut_start.0..cut_end.0 {
+                let vpn = VirtPageNum(vpn_raw);
+                if frames.remove(&vpn).is_some() {
+                    let _ = self.page_table.unmap(vpn);
+                    super::page_table::local_flush_va(vpn);
+                }
+            }
+
+            // Reconstitute the head, if any.
+            if a_start < cut_start {
+                let head_frames = split_off_le(&mut frames, cut_start);
+                new_areas.push(VmArea {
+                    vpn_start: a_start,
+                    vpn_end: cut_start,
+                    perm,
+                    frames: head_frames,
+                });
+            }
+            // Reconstitute the tail, if any.
+            if cut_end < a_end {
+                new_areas.push(VmArea {
+                    vpn_start: cut_end,
+                    vpn_end: a_end,
+                    perm,
+                    frames,
+                });
+            }
+            // (If the area was fully covered, both branches above are false
+            // and we just drop everything, releasing frames via Drop.)
+        }
+        self.areas = new_areas;
+    }
+
+    /// Real mprotect: change perms on every page in `[va, va+len)`. Splits
+    /// VmAreas at boundaries as needed and rewrites the PTE flags. Pages
+    /// outside any existing area are silently skipped.
+    pub fn protect_range(&mut self, va: VirtAddr, len: usize, perm: VmPerm) {
+        let start = va.0 & !(PAGE_SIZE - 1);
+        let end = (va.0 + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let start_vpn = VirtPageNum(start / PAGE_SIZE);
+        let end_vpn = VirtPageNum(end / PAGE_SIZE);
+        let new_pte = perm.to_pte();
+
+        let mut new_areas: Vec<VmArea> = Vec::new();
+        for area in core::mem::take(&mut self.areas) {
+            if area.vpn_end <= start_vpn || area.vpn_start >= end_vpn {
+                new_areas.push(area);
+                continue;
+            }
+
+            let a_start = area.vpn_start;
+            let a_end = area.vpn_end;
+            let a_perm = area.perm;
+            let mut frames = area.frames;
+
+            let cut_start = core::cmp::max(a_start, start_vpn);
+            let cut_end = core::cmp::min(a_end, end_vpn);
+
+            // Head with old perm.
+            if a_start < cut_start {
+                let head_frames = split_off_le(&mut frames, cut_start);
+                new_areas.push(VmArea {
+                    vpn_start: a_start,
+                    vpn_end: cut_start,
+                    perm: a_perm,
+                    frames: head_frames,
+                });
+            }
+            // Middle with new perm — rewrite PTEs.
+            let mid_frames = split_off_le(&mut frames, cut_end);
+            for (&vpn, frame) in &mid_frames {
+                self.page_table.map(vpn, frame.ppn, new_pte);
+                super::page_table::local_flush_va(vpn);
+            }
+            new_areas.push(VmArea {
+                vpn_start: cut_start,
+                vpn_end: cut_end,
+                perm,
+                frames: mid_frames,
+            });
+            // Tail with old perm.
+            if cut_end < a_end {
+                new_areas.push(VmArea {
+                    vpn_start: cut_end,
+                    vpn_end: a_end,
+                    perm: a_perm,
+                    frames,
+                });
+            }
+        }
+        self.areas = new_areas;
     }
 
     /// Deep-copy this address space (fork). Each user VmArea gets fresh
