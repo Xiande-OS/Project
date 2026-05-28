@@ -163,6 +163,13 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(a0, a1, a2),
         nr::SYS_RT_SIGSUSPEND => sys_rt_sigsuspend(a0, a1),
         nr::SYS_SYSINFO => 0,
+        // SysV shared memory: iozone -t (throughput mode), netperf, libcbench
+        // all try shmget/shmat. Stub as ENOSYS-ish failure (-1) which makes
+        // them fall back to non-SysV-shmem paths.
+        nr::SYS_SHMGET => -1,
+        nr::SYS_SHMCTL => -1,
+        nr::SYS_SHMAT => -1,
+        nr::SYS_SHMDT => -1,
         nr::SYS_GETRUSAGE => 0,
         nr::SYS_MEMBARRIER => 0,
         nr::SYS_TIMES => 0,
