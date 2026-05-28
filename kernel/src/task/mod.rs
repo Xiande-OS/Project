@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
 
 use crate::arch::riscv64::trap::TrapFrame;
@@ -86,6 +86,16 @@ pub struct Task {
     /// busybox `timeout`'s saved child pid).
     /// Holds Some(child_pid) while waiting; cleared when child exec's/exits.
     pub vfork_child: Mutex<Option<i32>>,
+    /// For genuine pthreads (CLONE_VM|CLONE_THREAD): the user stack pointer
+    /// handed to `clone` (top of the thread's mmap'd stack). When such a
+    /// thread exits, the exit path queues this address for *deferred* reclaim
+    /// on the shared address space (freed at the next thread creation, after
+    /// any pending join has read the descriptor). This stops never-joined
+    /// thread stacks from piling up (e.g. libc-bench's
+    /// `b_pthread_create_serial1` spawns 2500 — without reclaim,
+    /// /proc/self/smaps balloons to thousands of regions and reading it in
+    /// print_stats becomes quadratic). 0 = not a reclaimable thread stack.
+    pub thread_stack_top: AtomicUsize,
 }
 
 unsafe impl Send for Task {}
@@ -561,6 +571,7 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
         signals: crate::signal::SignalState::new(),
         clear_child_tid: Mutex::new(0),
         vfork_child: Mutex::new(None),
+        thread_stack_top: AtomicUsize::new(0),
     });
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
@@ -722,6 +733,12 @@ pub fn clone_current(
     // ---- Address space ----
     let memory_set: Arc<Mutex<MemorySet>> = if flags & CLONE_VM != 0 {
         // Share: same Arc, same satp, same page table.
+        // Before spawning a new thread, reclaim the stacks of any threads
+        // that have since exited and were never joined. Doing this here (and
+        // not at thread exit) guarantees any join already read the exiting
+        // thread's descriptor. Keeps the region count bounded for workloads
+        // that spawn thousands of unjoined threads (b_pthread_create_serial1).
+        parent.memory_set.lock().drain_stack_reclaim();
         parent.memory_set.clone()
     } else {
         // Deep-copy parent's user areas; remap the kernel/MMIO identity into
@@ -801,6 +818,24 @@ pub fn clone_current(
         },
         clear_child_tid: Mutex::new(0),
         vfork_child: Mutex::new(None),
+        // Record the thread stack only for genuine pthreads: CLONE_VM AND
+        // CLONE_THREAD with an explicit, distinct stack, and NOT vfork.
+        // vfork() also sets CLONE_VM and may pass a stack but *shares* the
+        // parent's stack — reclaiming it on the vfork child's exit would
+        // unmap the parent's live stack. Requiring CLONE_THREAD (which vfork
+        // never sets) excludes that case. Used by the exit path to reclaim a
+        // never-joined thread's stack from the shared address space.
+        thread_stack_top: AtomicUsize::new(
+            if flags & CLONE_VM != 0
+                && flags & CLONE_THREAD != 0
+                && flags & CLONE_VFORK == 0
+                && child_sp != 0
+            {
+                child_sp
+            } else {
+                0
+            },
+        ),
     });
     // Write the TF onto the new kstack.
     unsafe {

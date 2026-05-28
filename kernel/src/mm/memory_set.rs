@@ -97,6 +97,10 @@ pub struct MemorySet {
     /// Next free virtual address for anonymous/file mmap. Always
     /// page-aligned. Grows upward.
     pub mmap_top: VirtAddr,
+    /// Stack tops of exited pthreads awaiting reclaim. Drained (and the
+    /// corresponding stack mappings freed) at the next thread creation in
+    /// this address space. See `queue_stack_reclaim` / `drain_stack_reclaim`.
+    pub pending_stack_reclaim: Vec<usize>,
 }
 
 impl MemorySet {
@@ -107,6 +111,7 @@ impl MemorySet {
             brk_base: VirtAddr(0),
             brk_cur: VirtAddr(0),
             mmap_top: VirtAddr(MMAP_BASE),
+            pending_stack_reclaim: Vec::new(),
         }
     }
 
@@ -352,6 +357,109 @@ impl MemorySet {
     pub fn free_user_frames(&mut self) {
         // Dropping the Frame values returns them to the allocator.
         self.areas.clear();
+    }
+
+    /// Unmap and free the single VmArea at index `idx`, clearing its PTEs,
+    /// flushing the local TLB, and dropping the backing frames. Returns the
+    /// freed area so the caller can inspect its bounds.
+    fn drop_area_at(&mut self, idx: usize) -> VmArea {
+        let area = self.areas.remove(idx);
+        for (&vpn, _frame) in area.frames.iter() {
+            let _ = self.page_table.unmap(vpn);
+            super::page_table::local_flush_va(vpn);
+        }
+        // `area` (and its FrameTrackers) drop on return / at the call site,
+        // releasing the frames.
+        area
+    }
+
+    /// Queue an exited pthread's stack top for deferred reclamation. The
+    /// actual unmap happens at the next `drain_stack_reclaim` (called when a
+    /// new thread is created in this address space) so that a concurrent
+    /// `pthread_join` can still read the exiting thread's descriptor first.
+    pub fn queue_stack_reclaim(&mut self, stack_top: usize) {
+        if stack_top != 0 {
+            self.pending_stack_reclaim.push(stack_top);
+        }
+    }
+
+    /// Number of most-recently-queued exited-thread stacks we never reclaim.
+    /// Must exceed the largest number of threads that can be exited-but-not-
+    /// yet-joined at once for any well-behaved workload, so we never unmap a
+    /// stack whose descriptor a pending `pthread_join` still needs. libc-bench
+    /// `b_pthread_createjoin_serial2` batches 50 creates before 50 joins, so a
+    /// margin well above 50 keeps every not-yet-joined stack safe.
+    const RECLAIM_KEEP_NEWEST: usize = 96;
+    /// Only start reclaiming once the queue grows past this. Keeps the common
+    /// case (threads promptly joined → musl munmaps the stack itself, our
+    /// queue entries are stale no-ops) cheap, and means batched create/join
+    /// patterns never trip reclaim.
+    const RECLAIM_HIGH_WATER: usize = 192;
+
+    /// Reclaim *old* queued pthread stacks once the backlog grows large. The
+    /// newest `RECLAIM_KEEP_NEWEST` entries are always retained (a pending
+    /// join may still read their descriptor); older entries belong to threads
+    /// that were abandoned (never joined — e.g. b_pthread_create_serial1's
+    /// 2500 threads) and are freed so the region count stays bounded and
+    /// /proc/self/smaps reads don't go quadratic. Reclaiming an already-joined
+    /// (musl-munmap'd) stack is a harmless no-op. Returns the count freed.
+    pub fn drain_stack_reclaim(&mut self) -> usize {
+        let len = self.pending_stack_reclaim.len();
+        if len <= Self::RECLAIM_HIGH_WATER {
+            return 0;
+        }
+        // Take the oldest entries, keep the newest RECLAIM_KEEP_NEWEST.
+        let take = len - Self::RECLAIM_KEEP_NEWEST;
+        let old: Vec<usize> = self.pending_stack_reclaim.drain(..take).collect();
+        let mut n = 0;
+        for stack_top in old {
+            if self.reclaim_thread_stack(stack_top) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Reclaim a never-joined thread's stack allocation from the (shared)
+    /// address space, given the stack pointer handed to `clone` (`stack_top`,
+    /// the highest stack address). Frees the VmArea that contains
+    /// `stack_top - 1`, plus any immediately-preceding contiguous guard
+    /// region (the PROT_NONE page musl maps just below the usable stack).
+    /// Never touches the heap (brk) area. Returns true if anything was freed.
+    ///
+    /// libc-bench's `b_pthread_create_serial1` spawns 2500 threads it never
+    /// joins; without reclaiming their stacks here, the address space grows
+    /// to ~5000 regions and reading /proc/self/smaps (which print_stats does)
+    /// turns quadratic and effectively hangs.
+    fn reclaim_thread_stack(&mut self, stack_top: usize) -> bool {
+        if stack_top == 0 {
+            return false;
+        }
+        // Probe the highest valid stack byte (stack_top is exclusive / points
+        // one past the top in the typical "sp = base + size" convention).
+        let probe = VirtAddr(stack_top.saturating_sub(1));
+        let vpn = probe.floor();
+        let brk_start_vpn = self.brk_base.floor();
+        let Some(idx) = self
+            .areas
+            .iter()
+            .position(|a| a.contains(vpn) && a.vpn_start != brk_start_vpn)
+        else {
+            return false;
+        };
+        let stack_area = self.drop_area_at(idx);
+        // Free a contiguous guard region directly below the stack, if present
+        // (vpn_end touches the stack's vpn_start). Only the guard immediately
+        // adjacent is reclaimed, never the heap.
+        let guard_top = stack_area.vpn_start;
+        if let Some(gidx) = self
+            .areas
+            .iter()
+            .position(|a| a.vpn_end == guard_top && a.vpn_start != brk_start_vpn)
+        {
+            let _ = self.drop_area_at(gidx);
+        }
+        true
     }
 
     /// Grow the brk segment to `new_brk`. Returns the new program-break.
