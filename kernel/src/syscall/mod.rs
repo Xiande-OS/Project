@@ -109,6 +109,13 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_FTRUNCATE => sys_ftruncate(a0 as i32, a1 as u64),
         nr::SYS_PSELECT6 => sys_pselect6(a0, a1, a2, a3, a4, a5),
         nr::SYS_EVENTFD2 => sys_eventfd2(a0 as u32, a1 as i32),
+        nr::SYS_SENDFILE => sys_sendfile(a0 as i32, a1 as i32, a2, a3),
+        nr::SYS_COPY_FILE_RANGE => sys_copy_file_range(a0 as i32, a1, a2 as i32, a3, a4, a5 as u32),
+        nr::SYS_MEMFD_CREATE => sys_memfd_create(a0, a1 as u32),
+        nr::SYS_SYNC | nr::SYS_FDATASYNC | nr::SYS_SYNCFS => 0,
+        nr::SYS_MLOCK | nr::SYS_MUNLOCK | nr::SYS_MLOCKALL | nr::SYS_MUNLOCKALL => 0,
+        nr::SYS_MREMAP => sys_mremap(a0, a1, a2, a3 as i32, a4),
+        nr::SYS_CLOSE_RANGE => sys_close_range(a0 as u32, a1 as u32, a2 as u32),
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         nr::SYS_GETTIMEOFDAY => sys_gettimeofday(a0),
         nr::SYS_SCHED_YIELD => 0,
@@ -772,6 +779,114 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
         F_SETFL => 0,
         _ => 0,
     }
+}
+
+// ---------- sendfile / copy_file_range / memfd_create / close_range / mremap ----------
+
+fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: usize, count: usize) -> isize {
+    let task = current_task();
+    let in_file = match task.fd_table.lock().get(in_fd) { Some(f) => f, None => return EBADF };
+    let out_file = match task.fd_table.lock().get(out_fd) { Some(f) => f, None => return EBADF };
+
+    let mut off = if offset_ptr != 0 {
+        let bytes = task.copy_in_bytes(offset_ptr, 8).unwrap_or(alloc::vec![0u8; 8]);
+        u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]))
+    } else {
+        *in_file.offset.lock()
+    };
+
+    let mut copied = 0usize;
+    let chunk = 8192;
+    while copied < count {
+        let want = core::cmp::min(chunk, count - copied);
+        let mut buf = alloc::vec![0u8; want];
+        let n = match in_file.inode.read_at(off, &mut buf) {
+            Ok(n) => n,
+            Err(e) => { if copied == 0 { return err_to_isize(e); } else { break; } }
+        };
+        if n == 0 { break; }
+        match out_file.write(&buf[..n]) {
+            Ok(w) => { copied += w; off += w as u64; if w < n { break; } }
+            Err(e) => { if copied == 0 { return err_to_isize(e); } else { break; } }
+        }
+    }
+    if offset_ptr != 0 {
+        let _ = task.copy_out_bytes(offset_ptr, &off.to_le_bytes());
+    } else {
+        *in_file.offset.lock() = off;
+    }
+    copied as isize
+}
+
+fn sys_copy_file_range(fd_in: i32, off_in: usize, fd_out: i32, off_out: usize, len: usize, _flags: u32) -> isize {
+    let task = current_task();
+    let in_file = match task.fd_table.lock().get(fd_in) { Some(f) => f, None => return EBADF };
+    let out_file = match task.fd_table.lock().get(fd_out) { Some(f) => f, None => return EBADF };
+
+    let mut in_off = if off_in != 0 {
+        let bytes = task.copy_in_bytes(off_in, 8).unwrap_or(alloc::vec![0u8; 8]);
+        u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]))
+    } else { *in_file.offset.lock() };
+    let mut out_off = if off_out != 0 {
+        let bytes = task.copy_in_bytes(off_out, 8).unwrap_or(alloc::vec![0u8; 8]);
+        u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]))
+    } else { *out_file.offset.lock() };
+
+    let mut copied = 0usize;
+    let chunk = 8192;
+    while copied < len {
+        let want = core::cmp::min(chunk, len - copied);
+        let mut buf = alloc::vec![0u8; want];
+        let n = match in_file.inode.read_at(in_off, &mut buf) {
+            Ok(n) => n, Err(e) => { if copied == 0 { return err_to_isize(e); } else { break; } }
+        };
+        if n == 0 { break; }
+        match out_file.inode.write_at(out_off, &buf[..n]) {
+            Ok(w) => { copied += w; in_off += w as u64; out_off += w as u64; if w < n { break; } }
+            Err(e) => { if copied == 0 { return err_to_isize(e); } else { break; } }
+        }
+    }
+    if off_in != 0 { let _ = task.copy_out_bytes(off_in, &in_off.to_le_bytes()); }
+    else { *in_file.offset.lock() = in_off; }
+    if off_out != 0 { let _ = task.copy_out_bytes(off_out, &out_off.to_le_bytes()); }
+    else { *out_file.offset.lock() = out_off; }
+    copied as isize
+}
+
+/// memfd_create(name, flags) — anonymous in-memory file.
+fn sys_memfd_create(_name: usize, flags: u32) -> isize {
+    const MFD_CLOEXEC: u32 = 1;
+    let file_inode: Arc<dyn Inode> = Arc::new(crate::fs::tmpfs::TmpfsFile::new());
+    let f = Arc::new(crate::fs::File::from_inode(file_inode, true, true, false));
+    match current_task().fd_table.lock().alloc(f, flags & MFD_CLOEXEC != 0) {
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+fn sys_close_range(first: u32, last: u32, _flags: u32) -> isize {
+    let task = current_task();
+    let t = task.fd_table.lock();
+    let max = t.table.lock().len() as u32;
+    let end = core::cmp::min(last, max.saturating_sub(1));
+    for fd in first..=end {
+        let _ = t.close(fd as i32);
+    }
+    0
+}
+
+/// mremap(old, old_sz, new_sz, flags, new_addr) — alloc new range,
+/// copy old contents, unmap old.
+fn sys_mremap(old: usize, old_sz: usize, new_sz: usize, _flags: i32, _new_addr: usize) -> isize {
+    if old == 0 || old_sz == 0 || new_sz == 0 { return EINVAL; }
+    let task = current_task();
+    let copy_n = core::cmp::min(old_sz, new_sz);
+    let buf = task.copy_in_bytes(old, copy_n).unwrap_or_default();
+    let new_va = sys_mmap(0, new_sz, 0x3, 0x22, -1, 0);
+    if new_va < 0 { return new_va; }
+    let _ = task.copy_out_bytes(new_va as usize, &buf);
+    task.memory_set_mut().unmap_range(crate::mm::VirtAddr(old), old_sz);
+    new_va
 }
 
 // ---------- rlimit / truncate / pselect / eventfd ----------
