@@ -90,6 +90,11 @@ impl LoopbackEnd {
         let cap = BUF_CAP.saturating_sub(q.len());
         let n = core::cmp::min(cap, data.len());
         q.extend(data[..n].iter().copied());
+        drop(q);
+        // Wake the peer if it's blocked in a recv/select.
+        if n > 0 {
+            crate::task::wake_socket_waiters();
+        }
         n
     }
 
@@ -250,5 +255,9 @@ pub fn udp_deliver(dst_port: u16, src_port: u16, data: &[u8]) -> bool {
         src_port,
         data: data.to_vec(),
     });
+    // Wake any task blocked in recv/select on this UDP socket so the
+    // scheduler can promote it back to Ready before the next time slice
+    // expires.
+    crate::task::wake_socket_waiters();
     true
 }

@@ -127,6 +127,7 @@ pub type Result<T> = core::result::Result<T, i32>;
 
 pub const ENOENT: i32 = -2;
 pub const EBADF: i32 = -9;
+pub const EAGAIN: i32 = -11;
 pub const ENOMEM: i32 = -12;
 pub const EFAULT: i32 = -14;
 pub const EEXIST: i32 = -17;

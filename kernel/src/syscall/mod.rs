@@ -731,7 +731,7 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
     // signal POLLIN immediately and let the subsequent read syscall
     // do the actual blocking against the pipe / file).
     let mut console_indices: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-    let mut other_indices: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    let mut other_indices: alloc::vec::Vec<(usize, Arc<crate::fs::File>)> = alloc::vec::Vec::new();
     for (i, p) in polls.iter().enumerate() {
         if p.fd < 0 {
             continue;
@@ -741,27 +741,27 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
                 if f.is_console {
                     console_indices.push(i);
                 } else {
-                    other_indices.push(i);
+                    other_indices.push((i, f));
                 }
             }
         }
     }
 
     let mut ready = 0;
-    // Non-console fd asked about POLLIN: tell userland it's readable.
-    // Read will block correctly if the data hasn't arrived yet (pipes
-    // park in sys_read; sockets have their own block path). Without
-    // this, busybox sh's `read` builtin sees ppoll return 0, treats
-    // the fd as never-ready, and bails — `printf X | while read line`
-    // never iterates the body.
-    if !other_indices.is_empty() {
-        for &i in &other_indices {
-            polls[i].revents = 0x1; // POLLIN
+    // Non-console fd asked about POLLIN: tell userland it's readable
+    // only when the underlying source actually has data (sockets check
+    // their loopback/smoltcp recv state; pipes check the buffer). This
+    // matters for iperf3 loopback: if we lied, the server would try to
+    // read the empty control fd in a tight blocking loop and never see
+    // the data datagram on its UDP fd via select.
+    for (i, f) in &other_indices {
+        if fd_is_readable(f) {
+            polls[*i].revents = 0x1;
+            ready += 1;
         }
-        ready += other_indices.len() as isize;
     }
     if !console_indices.is_empty() {
-        if timeout == 0 && ready == 0 {
+        if timeout == 0 && ready == 0 && other_indices.is_empty() {
             // NULL timeout = block until something readable.
             crate::fs::console_wait_readable();
             for &i in &console_indices {
@@ -774,6 +774,19 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
             }
             ready += console_indices.len() as isize;
         }
+    }
+    // If nothing was ready, yield so peers can produce data. The poll
+    // (selectish) caller will see EAGAIN-via-zero and rerun us via the
+    // scheduler's socket-waiter wake path.
+    if ready == 0 && !other_indices.is_empty() && console_indices.is_empty() {
+        crate::task::mark_socket_waiter(task.pid);
+        *task.state.lock() = crate::task::TaskState::Waiting;
+        unsafe {
+            let tf = task.tf_ptr();
+            (*tf).sepc -= 4;
+        }
+        // Don't write polls back; the retry will redo the computation.
+        return -11;
     }
 
     // Write revents back.
@@ -1711,6 +1724,56 @@ fn sys_ftruncate(fd: i32, length: u64) -> isize {
     }
 }
 
+/// Best-effort readability check for poll/select. Returns true if a read on
+/// this fd would succeed without blocking (data available or EOF). Sockets
+/// look at their loopback queue / smoltcp state; pipes look at their buffer.
+fn fd_is_readable(file: &Arc<crate::fs::File>) -> bool {
+    if file.is_console {
+        return crate::fs::console_has_readable();
+    }
+    if let Some(pipe) = file.inode.as_any().downcast_ref::<crate::fs::pipe::PipeEnd>() {
+        return pipe.buffered() > 0 || !pipe.writer_alive();
+    }
+    if let Some(sock) = file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>() {
+        let st = sock.state.lock();
+        if let Some(lb) = st.loopback.as_ref() {
+            return lb.can_recv() || lb.peer_eof();
+        }
+        if let Some(ue) = st.udp_end.as_ref() {
+            if !ue.incoming.lock().is_empty() {
+                return true;
+            }
+        }
+        if let Some(l) = st.listener.as_ref() {
+            if !l.pending.lock().is_empty() {
+                return true;
+            }
+        }
+        drop(st);
+        match sock.kind {
+            crate::fs::socket::SocketKind::Tcp => {
+                crate::net::poll();
+                if crate::net::tcp_can_recv(sock.handle) {
+                    return true;
+                }
+                // EOF / closed connection also counts as readable so the
+                // caller wakes up to see the zero-byte read.
+                if !crate::net::tcp_may_recv(sock.handle) {
+                    return true;
+                }
+                false
+            }
+            crate::fs::socket::SocketKind::Udp => {
+                crate::net::poll();
+                crate::net::udp_can_recv(sock.handle)
+            }
+        }
+    } else {
+        // Regular files / dirs / etc. are always readable.
+        true
+    }
+}
+
 /// pselect6(nfds, rfds, wfds, efds, timeout, sigmask_arg).
 /// We translate to ppoll by walking the fd bitmaps and building a
 /// pollfd[] for the union, then waiting via the console-aware ppoll
@@ -1732,46 +1795,86 @@ fn sys_pselect6(
         if addr == 0 { alloc::vec![0u8; bytes] }
         else { task.copy_in_bytes(addr, bytes).unwrap_or_else(|| alloc::vec![0u8; bytes]) }
     };
-    let r = read_set(rfds);
-    let w = read_set(wfds);
+    let r_in = read_set(rfds);
+    let w_in = read_set(wfds);
     let _e = read_set(efds);
+    let mut r_out = alloc::vec![0u8; bytes];
+    let mut w_out = alloc::vec![0u8; bytes];
     let mut ready = 0isize;
-    let mut zero = alloc::vec![0u8; bytes];
+    let zero = alloc::vec![0u8; bytes];
 
-    // Trivial case: any read-fd is the console -> block on it; mark
-    // ready when it becomes readable. Non-console reads we say "ready
-    // now" (so unblocking sockets work cooperatively). Writes always
-    // ready.
-    let mut blocking_console = false;
+    // Resolve interesting fds once.
+    let mut readers: alloc::vec::Vec<(usize, Arc<crate::fs::File>)> = alloc::vec::Vec::new();
+    let mut writers: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
     for fd in 0..nfds {
-        if r[fd / 8] & (1 << (fd % 8)) != 0 {
+        if r_in[fd / 8] & (1 << (fd % 8)) != 0 {
             if let Some(f) = task.fd_table.lock().get(fd as i32) {
-                if f.is_console {
-                    blocking_console = true;
-                    break;
-                }
+                readers.push((fd, f));
             }
         }
-    }
-    if blocking_console {
-        crate::fs::console_wait_readable();
+        if w_in[fd / 8] & (1 << (fd % 8)) != 0 {
+            writers.push(fd);
+        }
     }
 
-    // Build result: keep r/w bits set as input said (everything ready).
-    if rfds != 0 {
-        let _ = task.copy_out_bytes(rfds, &r);
-        for fd in 0..nfds {
-            if r[fd / 8] & (1 << (fd % 8)) != 0 { ready += 1; }
+    // Compute readable readers. We don't actually block here — the
+    // syscall layer relies on read() to park the task if userland tries
+    // to read an fd that turns out empty (sockets do this via their own
+    // block-and-retry path). But if NO read fd is ready, yield once so
+    // we don't starve the peer (especially the iperf3 loopback case).
+    for (fd, f) in &readers {
+        if fd_is_readable(f) {
+            r_out[fd / 8] |= 1 << (fd % 8);
+            ready += 1;
         }
+    }
+    for fd in &writers {
+        w_out[fd / 8] |= 1 << (fd % 8);
+        ready += 1;
+    }
+
+    // Block if nothing is ready and we were asked to wait. The console
+    // path uses its dedicated peek+block; for socket-only select we mark
+    // ourselves Waiting + rewind sepc so the scheduler can advance peers.
+    if ready == 0 && !readers.is_empty() {
+        let mut console_in_set = false;
+        for (_, f) in &readers {
+            if f.is_console {
+                console_in_set = true;
+                break;
+            }
+        }
+        if console_in_set {
+            crate::fs::console_wait_readable();
+            // After waking, recompute readiness.
+            for (fd, f) in &readers {
+                if fd_is_readable(f) {
+                    r_out[fd / 8] |= 1 << (fd % 8);
+                    ready += 1;
+                }
+            }
+        } else {
+            // Park briefly: the same block_and_retry pattern used by
+            // socket reads. The scheduler picks another runnable task
+            // (often the peer that needs to send) and reattempts.
+            crate::task::mark_socket_waiter(task.pid);
+            *task.state.lock() = crate::task::TaskState::Waiting;
+            unsafe {
+                let tf = task.tf_ptr();
+                (*tf).sepc -= 4;
+            }
+            return -11; // EAGAIN — caller will be retried by scheduler.
+        }
+    }
+
+    // Write result bitmaps back.
+    if rfds != 0 {
+        let _ = task.copy_out_bytes(rfds, &r_out);
     }
     if wfds != 0 {
-        let _ = task.copy_out_bytes(wfds, &w);
-        for fd in 0..nfds {
-            if w[fd / 8] & (1 << (fd % 8)) != 0 { ready += 1; }
-        }
+        let _ = task.copy_out_bytes(wfds, &w_out);
     }
     if efds != 0 {
-        zero.fill(0);
         let _ = task.copy_out_bytes(efds, &zero);
     }
     ready
