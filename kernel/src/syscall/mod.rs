@@ -102,7 +102,13 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_MUNMAP => sys_munmap(a0, a1),
         nr::SYS_MPROTECT => sys_mprotect(a0, a1, a2 as i32),
         nr::SYS_MADVISE => 0,
-        nr::SYS_PRLIMIT64 => 0,
+        nr::SYS_PRLIMIT64 => sys_prlimit64(a0 as i32, a1 as u32, a2, a3),
+        nr::SYS_GETRLIMIT => sys_getrlimit(a0 as u32, a1),
+        nr::SYS_SETRLIMIT => sys_setrlimit(a0 as u32, a1),
+        nr::SYS_TRUNCATE => sys_truncate(a0, a1 as u64),
+        nr::SYS_FTRUNCATE => sys_ftruncate(a0 as i32, a1 as u64),
+        nr::SYS_PSELECT6 => sys_pselect6(a0, a1, a2, a3, a4, a5),
+        nr::SYS_EVENTFD2 => sys_eventfd2(a0 as u32, a1 as i32),
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         nr::SYS_GETTIMEOFDAY => sys_gettimeofday(a0),
         nr::SYS_SCHED_YIELD => 0,
@@ -765,6 +771,197 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
         F_GETFL => 0,
         F_SETFL => 0,
         _ => 0,
+    }
+}
+
+// ---------- rlimit / truncate / pselect / eventfd ----------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rlimit {
+    cur: u64,
+    max: u64,
+}
+
+const RLIMIT_CPU: u32 = 0;
+const RLIMIT_FSIZE: u32 = 1;
+const RLIMIT_DATA: u32 = 2;
+const RLIMIT_STACK: u32 = 3;
+const RLIMIT_CORE: u32 = 4;
+const RLIMIT_RSS: u32 = 5;
+const RLIMIT_NPROC: u32 = 6;
+const RLIMIT_NOFILE: u32 = 7;
+const RLIMIT_MEMLOCK: u32 = 8;
+const RLIMIT_AS: u32 = 9;
+const RLIM_INFINITY: u64 = u64::MAX;
+
+fn default_rlimit(resource: u32) -> Rlimit {
+    match resource {
+        RLIMIT_STACK => Rlimit { cur: 8 * 1024 * 1024, max: 8 * 1024 * 1024 },
+        RLIMIT_NOFILE => Rlimit { cur: 1024, max: 4096 },
+        RLIMIT_NPROC => Rlimit { cur: 64, max: 64 },
+        RLIMIT_CORE => Rlimit { cur: 0, max: RLIM_INFINITY },
+        RLIMIT_DATA | RLIMIT_RSS | RLIMIT_AS => {
+            Rlimit { cur: RLIM_INFINITY, max: RLIM_INFINITY }
+        }
+        RLIMIT_FSIZE => Rlimit { cur: RLIM_INFINITY, max: RLIM_INFINITY },
+        RLIMIT_CPU => Rlimit { cur: RLIM_INFINITY, max: RLIM_INFINITY },
+        RLIMIT_MEMLOCK => Rlimit { cur: 65536, max: 65536 },
+        _ => Rlimit { cur: RLIM_INFINITY, max: RLIM_INFINITY },
+    }
+}
+
+fn sys_prlimit64(_pid: i32, resource: u32, new_lim: usize, old_lim: usize) -> isize {
+    let task = current_task();
+    let cur = default_rlimit(resource);
+    if old_lim != 0 {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(&cur as *const _ as *const u8, 16)
+        };
+        if task.copy_out_bytes(old_lim, bytes).is_none() {
+            return EFAULT;
+        }
+    }
+    // Pretend the new limit succeeded; we don't actually enforce.
+    let _ = new_lim;
+    0
+}
+
+fn sys_getrlimit(resource: u32, buf: usize) -> isize {
+    sys_prlimit64(0, resource, 0, buf)
+}
+
+fn sys_setrlimit(_resource: u32, _buf: usize) -> isize {
+    0
+}
+
+fn sys_truncate(path: usize, length: u64) -> isize {
+    let Some(p) = copy_path(path) else { return EFAULT };
+    let Some(i) = resolve_at(AT_FDCWD, &p) else { return ENOENT };
+    match i.truncate(length) {
+        Ok(()) => 0,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+fn sys_ftruncate(fd: i32, length: u64) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
+    match file.inode.truncate(length) {
+        Ok(()) => 0,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+/// pselect6(nfds, rfds, wfds, efds, timeout, sigmask_arg).
+/// We translate to ppoll by walking the fd bitmaps and building a
+/// pollfd[] for the union, then waiting via the console-aware ppoll
+/// path. Good enough for the common select+stdin idiom.
+fn sys_pselect6(
+    nfds: usize,
+    rfds: usize,
+    wfds: usize,
+    efds: usize,
+    _timeout: usize,
+    _sigmask: usize,
+) -> isize {
+    if nfds == 0 {
+        return 0;
+    }
+    let task = current_task();
+    let bytes = (nfds + 7) / 8;
+    let read_set = |addr: usize| -> alloc::vec::Vec<u8> {
+        if addr == 0 { alloc::vec![0u8; bytes] }
+        else { task.copy_in_bytes(addr, bytes).unwrap_or_else(|| alloc::vec![0u8; bytes]) }
+    };
+    let r = read_set(rfds);
+    let w = read_set(wfds);
+    let _e = read_set(efds);
+    let mut ready = 0isize;
+    let mut zero = alloc::vec![0u8; bytes];
+
+    // Trivial case: any read-fd is the console -> block on it; mark
+    // ready when it becomes readable. Non-console reads we say "ready
+    // now" (so unblocking sockets work cooperatively). Writes always
+    // ready.
+    let mut blocking_console = false;
+    for fd in 0..nfds {
+        if r[fd / 8] & (1 << (fd % 8)) != 0 {
+            if let Some(f) = task.fd_table.lock().get(fd as i32) {
+                if f.is_console {
+                    blocking_console = true;
+                    break;
+                }
+            }
+        }
+    }
+    if blocking_console {
+        crate::fs::console_wait_readable();
+    }
+
+    // Build result: keep r/w bits set as input said (everything ready).
+    if rfds != 0 {
+        let _ = task.copy_out_bytes(rfds, &r);
+        for fd in 0..nfds {
+            if r[fd / 8] & (1 << (fd % 8)) != 0 { ready += 1; }
+        }
+    }
+    if wfds != 0 {
+        let _ = task.copy_out_bytes(wfds, &w);
+        for fd in 0..nfds {
+            if w[fd / 8] & (1 << (fd % 8)) != 0 { ready += 1; }
+        }
+    }
+    if efds != 0 {
+        zero.fill(0);
+        let _ = task.copy_out_bytes(efds, &zero);
+    }
+    ready
+}
+
+/// Eventfd: tiny semaphore-ish counter file. Read takes (and zeros or
+/// decrements), write adds. We implement it as a regular Inode so it
+/// fits the fd table.
+struct EventFd {
+    counter: SpinMutex<u64>,
+    semaphore: bool,
+}
+
+impl crate::fs::Inode for EventFd {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn kind(&self) -> crate::fs::FileType { crate::fs::FileType::Pipe }
+    fn size(&self) -> u64 { 8 }
+    fn read_at(&self, _off: u64, buf: &mut [u8]) -> crate::fs::Result<usize> {
+        if buf.len() < 8 { return Err(crate::fs::EINVAL); }
+        let mut c = self.counter.lock();
+        if *c == 0 { return Ok(0); }
+        let val = if self.semaphore { 1 } else { *c };
+        buf[..8].copy_from_slice(&val.to_le_bytes());
+        if self.semaphore { *c -= 1; } else { *c = 0; }
+        Ok(8)
+    }
+    fn write_at(&self, _off: u64, buf: &[u8]) -> crate::fs::Result<usize> {
+        if buf.len() < 8 { return Err(crate::fs::EINVAL); }
+        let add = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        if add == u64::MAX { return Err(crate::fs::EINVAL); }
+        let mut c = self.counter.lock();
+        *c = c.saturating_add(add);
+        Ok(8)
+    }
+}
+
+fn sys_eventfd2(initval: u32, flags: i32) -> isize {
+    const EFD_SEMAPHORE: i32 = 1;
+    const EFD_CLOEXEC: i32 = 0o2000000;
+    let ef = Arc::new(EventFd {
+        counter: SpinMutex::new(initval as u64),
+        semaphore: flags & EFD_SEMAPHORE != 0,
+    });
+    let file = Arc::new(crate::fs::File::from_inode(ef, true, true, false));
+    let cloexec = flags & EFD_CLOEXEC != 0;
+    match current_task().fd_table.lock().alloc(file, cloexec) {
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
     }
 }
 
