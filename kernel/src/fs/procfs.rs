@@ -448,6 +448,7 @@ fn gen_fd_target(pid: i32, fd: i32) -> Vec<u8> {
         FileType::CharDevice => alloc::string::String::from("/dev/null"),
         FileType::Directory => alloc::string::String::from("anon_inode:dir"),
         FileType::Regular => alloc::string::String::from("anon_inode:file"),
+        FileType::Symlink => alloc::string::String::from("anon_inode:symlink"),
     };
     label.into_bytes()
 }

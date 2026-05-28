@@ -166,6 +166,17 @@ impl Inode for TmpfsDir {
         entries.insert(name.to_string(), node.clone());
         Ok(node)
     }
+    fn symlink(&self, name: &str, target: &str) -> Result<()> {
+        let mut entries = self.entries.lock();
+        if entries.contains_key(name) {
+            return Err(EEXIST);
+        }
+        let link: Arc<dyn Inode> = Arc::new(super::Symlink {
+            target: target.to_string(),
+        });
+        entries.insert(name.to_string(), link);
+        Ok(())
+    }
     fn unlink(&self, name: &str) -> Result<()> {
         let mut entries = self.entries.lock();
         if entries.remove(name).is_some() {
