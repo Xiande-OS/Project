@@ -63,7 +63,31 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 "  ra={:#x} sp={:#x} a0={:#x} a1={:#x} a7={:#x}",
                 tf.x[0], tf.x[1], tf.x[9], tf.x[10], tf.x[16]
             );
-            crate::syscall::sys_kill_current(139);
+            // Translate the fault into a signal targeting the current task.
+            let signo = match e {
+                Exception::IllegalInstruction => crate::signal::SIGILL,
+                Exception::LoadMisaligned
+                | Exception::StoreMisaligned
+                | Exception::InstructionMisaligned => crate::signal::SIGBUS,
+                Exception::LoadPageFault
+                | Exception::StorePageFault
+                | Exception::InstructionPageFault
+                | Exception::LoadFault
+                | Exception::StoreFault
+                | Exception::InstructionFault => crate::signal::SIGSEGV,
+                _ => crate::signal::SIGSEGV,
+            };
+            let task = crate::task::current_task();
+            // If the default action is SIG_DFL and would terminate, calling
+            // raise + letting check_signals do its thing also clears the
+            // PC so we don't loop. But if the user installed a handler we
+            // must not re-execute the faulting instruction after the
+            // handler returns; signals run at trap boundary which means we
+            // re-enter user mode after the handler -> sret -> faulting
+            // PC. So for unhandled / DFL faults this is fine; for handler-
+            // returns, the handler still runs but then user faults again.
+            // For now we just deliver and let the natural flow proceed.
+            let _ = crate::signal::raise_signal(&task, signo);
         }
         Trap::Exception(e) => {
             panic!(

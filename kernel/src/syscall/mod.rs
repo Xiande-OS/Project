@@ -83,8 +83,14 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_BRK => sys_brk(a0),
         nr::SYS_SET_TID_ADDRESS => 1,
         nr::SYS_SET_ROBUST_LIST => 0,
-        nr::SYS_RT_SIGACTION => 0,
-        nr::SYS_RT_SIGPROCMASK => 0,
+        nr::SYS_RT_SIGACTION => sys_rt_sigaction(a0 as i32, a1, a2, a3),
+        nr::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(a0 as i32, a1, a2, a3),
+        nr::SYS_RT_SIGRETURN => {
+            // Restore tf (incl. a0) from the rt_sigframe. Return the
+            // restored a0 so the trailing `tf.x[9] = ret` is a no-op.
+            let task = current_task();
+            crate::signal::do_sigreturn(&task, tf)
+        }
         nr::SYS_IOCTL => sys_ioctl(a0 as i32, a1 as u32, a2),
         nr::SYS_GETUID | nr::SYS_GETEUID | nr::SYS_GETGID | nr::SYS_GETEGID => 0,
         nr::SYS_GETPID | nr::SYS_GETTID => current_task().pid as isize,
@@ -132,14 +138,14 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         nr::SYS_GETTIMEOFDAY => sys_gettimeofday(a0),
         nr::SYS_SCHED_YIELD => 0,
-        nr::SYS_TGKILL => 0,
-        nr::SYS_TKILL => 0,
-        nr::SYS_KILL => 0,
+        nr::SYS_TGKILL => sys_tgkill(a0 as i32, a1 as i32, a2 as i32),
+        nr::SYS_TKILL => sys_tkill(a0 as i32, a1 as i32),
+        nr::SYS_KILL => sys_kill(a0 as i32, a1 as i32),
         nr::SYS_FUTEX => 0,
         nr::SYS_PPOLL => sys_ppoll(a0, a1, a2),
-        nr::SYS_SIGALTSTACK => 0,
-        nr::SYS_RT_SIGTIMEDWAIT => 0,
-        nr::SYS_RT_SIGSUSPEND => 0,
+        nr::SYS_SIGALTSTACK => sys_sigaltstack(a0, a1),
+        nr::SYS_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(a0, a1, a2),
+        nr::SYS_RT_SIGSUSPEND => sys_rt_sigsuspend(a0, a1),
         nr::SYS_SYSINFO => 0,
         nr::SYS_GETRUSAGE => 0,
         nr::SYS_MEMBARRIER => 0,
@@ -1851,17 +1857,23 @@ fn sys_setsid() -> isize {
 
 fn sys_exit(status: i32) -> isize {
     let task = current_task();
-    task.exit_code.store(status, core::sync::atomic::Ordering::Relaxed);
+    // Pre-encode the wait4 status as Linux expects: normal exit puts the
+    // low byte of `status` in bits 8..15. wait4 returns it verbatim.
+    task.exit_code
+        .store((status & 0xff) << 8, core::sync::atomic::Ordering::Relaxed);
     *task.state.lock() = crate::task::TaskState::Zombie;
     println!("[exit] pid={} status={}", task.pid, status);
 
-    // Wake any parent in wait4.
+    // Wake any parent in wait4 and send SIGCHLD.
     let ppid = task.ppid.load(core::sync::atomic::Ordering::Relaxed);
     if let Some(parent) = crate::task::task_by_pid(ppid) {
-        let mut s = parent.state.lock();
-        if *s == crate::task::TaskState::Waiting {
-            *s = crate::task::TaskState::Ready;
+        {
+            let mut s = parent.state.lock();
+            if *s == crate::task::TaskState::Waiting {
+                *s = crate::task::TaskState::Ready;
+            }
         }
+        let _ = crate::signal::raise_signal(&parent, crate::signal::SIGCHLD);
     }
 
     // If no other runnable/waiting/zombie task exists, halt.
@@ -1982,8 +1994,8 @@ fn sys_wait4(pid: i32, status_addr: usize, _options: i32) -> isize {
     if let Some(z) = zombie {
         let code = z.exit_code.load(core::sync::atomic::Ordering::Relaxed);
         if status_addr != 0 {
-            let val: i32 = (code & 0xff) << 8;
-            let _ = me.copy_out_bytes(status_addr, &val.to_le_bytes());
+            // exit_code is already pre-encoded by sys_exit / signal-death.
+            let _ = me.copy_out_bytes(status_addr, &code.to_le_bytes());
         }
         me.children.lock().retain(|&cpid| cpid != z.pid);
         crate::task::reap(z.pid);
@@ -2247,5 +2259,354 @@ pub fn request_exit(status: i32) -> ! {
     sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::SystemFailure);
     loop {
         unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+// =========================================================================
+//   Signal syscalls
+// =========================================================================
+
+const ESRCH: isize = -3;
+const EPERM: isize = -1;
+
+/// Kernel-side `struct sigaction` layout that musl's __libc_sigaction
+/// passes to the kernel on riscv64. On riscv64, musl does NOT use
+/// SA_RESTORER -- it relies on the kernel to set the return PC to a
+/// VDSO/fixed restorer. Layout:
+///     sa_handler : 8
+///     sa_flags   : 8
+///     sa_mask    : 8 (1024-bit sigset, but sigsetsize=8 so just low 64)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct UserSigAction {
+    handler: usize,
+    flags: u64,
+    mask: u64,
+}
+
+fn sys_rt_sigaction(signo: i32, new_ptr: usize, old_ptr: usize, sigsetsize: usize) -> isize {
+    use crate::signal::*;
+    if sigsetsize != 8 {
+        return EINVAL;
+    }
+    let signo_u = signo as u32;
+    if !is_valid_signo(signo_u) {
+        return EINVAL;
+    }
+    // SIGKILL/SIGSTOP cannot have their dispositions changed.
+    if signo_u == SIGKILL || signo_u == SIGSTOP {
+        // POSIX: writing returns EINVAL; reading old value is allowed.
+        if new_ptr != 0 {
+            return EINVAL;
+        }
+    }
+    let task = current_task();
+
+    let prev = task.signals.actions.lock()[signo_u as usize];
+
+    if new_ptr != 0 {
+        let Some(bytes) = task.copy_in_bytes(new_ptr, core::mem::size_of::<UserSigAction>()) else {
+            return EFAULT;
+        };
+        let usa: UserSigAction = unsafe { core::ptr::read(bytes.as_ptr() as *const _) };
+        let new_act = KSigAction {
+            handler: usa.handler,
+            flags: usa.flags,
+            restorer: 0, // riscv64: kernel-provided restorer (set at delivery)
+            mask: usa.mask & !unblockable_mask(),
+        };
+        task.signals.actions.lock()[signo_u as usize] = new_act;
+    }
+
+    if old_ptr != 0 {
+        let old_usa = UserSigAction {
+            handler: prev.handler,
+            flags: prev.flags,
+            mask: prev.mask,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &old_usa as *const _ as *const u8,
+                core::mem::size_of::<UserSigAction>(),
+            )
+        };
+        if task.copy_out_bytes(old_ptr, bytes).is_none() {
+            return EFAULT;
+        }
+    }
+
+    0
+}
+
+fn sys_rt_sigprocmask(how: i32, new_ptr: usize, old_ptr: usize, sigsetsize: usize) -> isize {
+    use crate::signal::*;
+    if sigsetsize != 8 {
+        return EINVAL;
+    }
+    let task = current_task();
+
+    let cur = task.signals.mask.load(core::sync::atomic::Ordering::SeqCst);
+    if old_ptr != 0 {
+        if task.copy_out_bytes(old_ptr, &cur.to_le_bytes()).is_none() {
+            return EFAULT;
+        }
+    }
+    if new_ptr != 0 {
+        let Some(bytes) = task.copy_in_bytes(new_ptr, 8) else {
+            return EFAULT;
+        };
+        let new_set =
+            u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0u8; 8]));
+        let next = match how {
+            SIG_BLOCK => cur | new_set,
+            SIG_UNBLOCK => cur & !new_set,
+            SIG_SETMASK => new_set,
+            _ => return EINVAL,
+        };
+        task.signals
+            .mask
+            .store(next & !unblockable_mask(), core::sync::atomic::Ordering::SeqCst);
+    }
+    0
+}
+
+fn sys_kill(pid: i32, sig: i32) -> isize {
+    use crate::signal::*;
+    let signo = sig as u32;
+    if sig != 0 && !is_valid_signo(signo) {
+        return EINVAL;
+    }
+    let me = current_task();
+
+    let targets: alloc::vec::Vec<Arc<crate::task::Task>> = if pid > 0 {
+        match crate::task::task_by_pid(pid) {
+            Some(t) => alloc::vec![t],
+            None => return ESRCH,
+        }
+    } else if pid == 0 {
+        // own pgrp
+        let pg = me.pgid.load(core::sync::atomic::Ordering::Relaxed);
+        tasks_in_pgrp(pg)
+    } else if pid == -1 {
+        // every task in our session, excluding init/self per POSIX (we
+        // include self -- nothing has more privilege here)
+        let sid = me.sid.load(core::sync::atomic::Ordering::Relaxed);
+        tasks_in_session(sid)
+    } else {
+        // pid < -1 → pgid = -pid
+        tasks_in_pgrp(-pid)
+    };
+
+    if targets.is_empty() {
+        return ESRCH;
+    }
+    if sig == 0 {
+        // signal 0: probe only
+        return 0;
+    }
+
+    let mut delivered = false;
+    for t in &targets {
+        if raise_signal(t, signo) {
+            delivered = true;
+        }
+    }
+    if delivered { 0 } else { EINVAL }
+}
+
+fn sys_tkill(tid: i32, sig: i32) -> isize {
+    use crate::signal::*;
+    let signo = sig as u32;
+    if sig != 0 && !is_valid_signo(signo) {
+        return EINVAL;
+    }
+    let Some(t) = crate::task::task_by_pid(tid) else {
+        return ESRCH;
+    };
+    if sig == 0 {
+        return 0;
+    }
+    if raise_signal(&t, signo) { 0 } else { EINVAL }
+}
+
+fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> isize {
+    // We don't model threads-per-process distinctly; tgid is the same as tid.
+    use crate::signal::*;
+    let signo = sig as u32;
+    if sig != 0 && !is_valid_signo(signo) {
+        return EINVAL;
+    }
+    let Some(t) = crate::task::task_by_pid(tid) else {
+        return ESRCH;
+    };
+    if tgid > 0 && t.pid != tgid {
+        return ESRCH;
+    }
+    if sig == 0 {
+        return 0;
+    }
+    if raise_signal(&t, signo) { 0 } else { EINVAL }
+}
+
+fn tasks_in_pgrp(pgid: i32) -> alloc::vec::Vec<Arc<crate::task::Task>> {
+    crate::task::all_tasks()
+        .into_iter()
+        .filter(|t| t.pgid.load(core::sync::atomic::Ordering::Relaxed) == pgid)
+        .collect()
+}
+
+fn tasks_in_session(sid: i32) -> alloc::vec::Vec<Arc<crate::task::Task>> {
+    crate::task::all_tasks()
+        .into_iter()
+        .filter(|t| t.sid.load(core::sync::atomic::Ordering::Relaxed) == sid)
+        .collect()
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct UserSigAltStack {
+    ss_sp: usize,
+    ss_flags: i32,
+    _pad: u32,
+    ss_size: usize,
+}
+
+fn sys_sigaltstack(new_ptr: usize, old_ptr: usize) -> isize {
+    use crate::signal::*;
+    let task = current_task();
+    let cur = *task.signals.altstack.lock();
+
+    if old_ptr != 0 {
+        let old_uss = match cur {
+            Some(s) => UserSigAltStack {
+                ss_sp: s.ss_sp,
+                ss_flags: s.ss_flags,
+                _pad: 0,
+                ss_size: s.ss_size,
+            },
+            None => UserSigAltStack {
+                ss_sp: 0,
+                ss_flags: SS_DISABLE,
+                _pad: 0,
+                ss_size: 0,
+            },
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &old_uss as *const _ as *const u8,
+                core::mem::size_of::<UserSigAltStack>(),
+            )
+        };
+        if task.copy_out_bytes(old_ptr, bytes).is_none() {
+            return EFAULT;
+        }
+    }
+
+    if new_ptr != 0 {
+        let Some(bytes) = task.copy_in_bytes(new_ptr, core::mem::size_of::<UserSigAltStack>()) else {
+            return EFAULT;
+        };
+        let uss: UserSigAltStack = unsafe { core::ptr::read(bytes.as_ptr() as *const _) };
+        if (uss.ss_flags & SS_DISABLE) != 0 {
+            *task.signals.altstack.lock() = None;
+            return 0;
+        }
+        if uss.ss_size < MINSIGSTKSZ {
+            return EINVAL;
+        }
+        *task.signals.altstack.lock() = Some(SigAltStack {
+            ss_sp: uss.ss_sp,
+            ss_flags: uss.ss_flags,
+            ss_size: uss.ss_size,
+        });
+    }
+    0
+}
+
+fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize) -> isize {
+    use crate::signal::*;
+    let task = current_task();
+    let Some(bytes) = task.copy_in_bytes(set_ptr, 8) else {
+        return EFAULT;
+    };
+    let set = u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0u8; 8]));
+    let set = set & !unblockable_mask();
+    let _ = timeout_ptr; // we don't sleep; polling once is what musl tolerates
+
+    // Check immediately: if any pending bit overlaps set, dequeue + return signo.
+    let pending = task.signals.pending.load(core::sync::atomic::Ordering::SeqCst);
+    let hit = pending & set;
+    if hit == 0 {
+        return -11; // EAGAIN -- no signal currently pending in set
+    }
+    let signo = (hit.trailing_zeros() + 1) as i32;
+    task.signals
+        .pending
+        .fetch_and(!(1u64 << (signo - 1)), core::sync::atomic::Ordering::SeqCst);
+    if info_ptr != 0 {
+        let mut info = crate::signal::KSigInfo::default();
+        info.si_signo = signo;
+        info.si_code = SI_USER;
+        let bs = unsafe {
+            core::slice::from_raw_parts(
+                &info as *const _ as *const u8,
+                core::mem::size_of::<crate::signal::KSigInfo>(),
+            )
+        };
+        if task.copy_out_bytes(info_ptr, bs).is_none() {
+            return EFAULT;
+        }
+    }
+    signo as isize
+}
+
+fn sys_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
+    use crate::signal::*;
+    if sigsetsize != 8 {
+        return EINVAL;
+    }
+    let task = current_task();
+    let Some(bytes) = task.copy_in_bytes(mask_ptr, 8) else {
+        return EFAULT;
+    };
+    let temp =
+        u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0u8; 8])) & !unblockable_mask();
+    let saved = task.signals.mask.load(core::sync::atomic::Ordering::SeqCst);
+    task.signals.mask.store(temp, core::sync::atomic::Ordering::SeqCst);
+    *task.signals.saved_mask.lock() = Some(saved);
+
+    // Block until any signal arrives. We can't truly block without a
+    // signal-driven wakeup of waiting tasks; in this kernel any pending
+    // signal arrival is followed by check_signals at the next trap
+    // boundary. So we mark Waiting and rewind sepc so the syscall re-runs
+    // and we re-check pending.
+    let pending = task.signals.pending.load(core::sync::atomic::Ordering::SeqCst);
+    let deliverable = pending & !temp;
+    if deliverable != 0 {
+        // A signal is already pending and unblocked under temp mask --
+        // check_signals will deliver it on trap exit. Restore mask after.
+        task.signals.mask.store(saved, core::sync::atomic::Ordering::SeqCst);
+        *task.signals.saved_mask.lock() = None;
+        return -4; // EINTR
+    }
+    // No deliverable signal; mark Waiting and rewind so we get rescheduled.
+    *task.state.lock() = crate::task::TaskState::Waiting;
+    unsafe {
+        (*task.tf_ptr()).sepc -= 4;
+    }
+    0
+}
+
+/// Called by the console when ^C / ^\ / ^Z is observed on the foreground
+/// tty. Posts the appropriate signal to every task in the foreground
+/// process group.
+pub fn deliver_tty_signal(signo: u32) {
+    let pg = TTY_FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
+    if pg <= 0 {
+        return;
+    }
+    let targets = tasks_in_pgrp(pg);
+    for t in &targets {
+        let _ = crate::signal::raise_signal(t, signo);
     }
 }
