@@ -72,7 +72,13 @@ fn block_and_retry() {
 /// Running (a no-op), which would otherwise leave us parked forever. The
 /// peer always mutates the shared queue *before* waking, so re-checking
 /// here after the store closes that lost-wakeup window.
+///
+/// We also nudge other socket waiters *before* parking: in the iperf3 UDP
+/// finalization the client blocks here waiting for the server's last
+/// datagram while the server is parked in select; promoting the server to
+/// Ready lets it run its loop and produce that datagram.
 fn block_and_retry_recheck(ready: impl Fn() -> bool) {
+    crate::task::wake_socket_waiters();
     block_and_retry();
     if ready() {
         let me = current_task();
@@ -561,7 +567,9 @@ pub fn sys_recvfrom(
         (
             s.handle,
             s.kind,
-            st.nonblock,
+            // A recv timeout makes blocking recvfrom behave like non-blocking
+            // for our purposes (return EAGAIN rather than park forever).
+            st.nonblock || st.recv_timeout,
             st.loopback.clone(),
             st.udp_end.clone(),
         )
@@ -791,7 +799,31 @@ pub fn sys_getpeername(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
 
 // ---------- setsockopt / getsockopt ----------
 
-pub fn sys_setsockopt(_fd: i32, _level: i32, _optname: i32, _optval: usize, _optlen: i32) -> isize {
+pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: usize, _optlen: i32) -> isize {
+    const SOL_SOCKET: i32 = 1;
+    const SO_RCVTIMEO: i32 = 20;
+    // iperf3 puts a finite SO_RCVTIMEO on its UDP socket so its blocking
+    // recvfrom won't hang forever when no packet arrives. We can't track
+    // wall-clock per recv, but recording "a timeout is set" lets the recv
+    // path surface EAGAIN instead of parking — close enough for iperf3,
+    // which just retries on timeout. A zero timeval clears it.
+    if level == SOL_SOCKET && optname == SO_RCVTIMEO {
+        let task = current_task();
+        // struct timeval { i64 tv_sec; i64 tv_usec; } == 16 bytes.
+        let nonzero = if optval != 0 {
+            match task.copy_in_bytes(optval, 16) {
+                Some(b) => {
+                    let sec = i64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
+                    let usec = i64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
+                    sec != 0 || usec != 0
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        let _ = with_socket(fd, |s| s.state.lock().recv_timeout = nonzero);
+    }
     // Stub OK for SO_REUSEADDR / SO_KEEPALIVE / SO_LINGER / TCP_NODELAY etc.
     0
 }

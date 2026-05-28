@@ -401,10 +401,13 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             let lp = sock.state.lock().loopback.clone();
             if let Some(lp) = lp {
                 if !lp.peer_eof() && !lp.can_recv() {
-                    let nonblock = sock.state.lock().nonblock;
+                    let st = sock.state.lock();
+                    let nonblock = st.nonblock || st.recv_timeout;
+                    drop(st);
                     if nonblock {
                         return -11;
                     }
+                    crate::task::wake_socket_waiters();
                     crate::task::mark_socket_waiter(task.pid);
                     *task.state.lock() = crate::task::TaskState::Waiting;
                     unsafe {
@@ -812,6 +815,14 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         unsafe {
             let tf = task.tf_ptr();
             (*tf).sepc -= 4;
+        }
+        // Lost-wakeup guard (see sys_pselect6): re-scan after parking so a
+        // datagram/byte that landed during the park isn't missed.
+        for (_, f) in &other_indices {
+            if fd_is_readable(f) {
+                *task.state.lock() = crate::task::TaskState::Ready;
+                break;
+            }
         }
         // Don't write polls back; the retry will redo the computation.
         return -11;
@@ -1935,6 +1946,20 @@ fn sys_pselect6(
             unsafe {
                 let tf = task.tf_ptr();
                 (*tf).sepc -= 4;
+            }
+            // Lost-wakeup guard: a peer that makes one of our read fds
+            // ready between the scan above and the Waiting store would fire
+            // wake_socket_waiters() while we were still Running (a no-op).
+            // Re-scan after parking; flip back to Ready if anything is now
+            // readable. This is what the UDP server (which selects on its
+            // datagram fd with no write set) relies on. Only reached when
+            // ready==0, so it never affects a caller whose write set kept
+            // it runnable.
+            for (_, f) in &readers {
+                if fd_is_readable(f) {
+                    *task.state.lock() = crate::task::TaskState::Ready;
+                    break;
+                }
             }
             return -11; // EAGAIN — caller will be retried by scheduler.
         }
