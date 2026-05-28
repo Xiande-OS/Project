@@ -52,6 +52,7 @@ pub const SYS_SETITIMER: usize = 103;
 pub const SYS_CLOCK_GETTIME: usize = 113;
 pub const SYS_CLOCK_GETRES: usize = 114;
 pub const SYS_CLOCK_NANOSLEEP: usize = 115;
+pub const SYS_SYSLOG: usize = 116;
 pub const SYS_EPOLL_CREATE1: usize = 20;
 pub const SYS_EPOLL_CTL: usize = 21;
 pub const SYS_EPOLL_PWAIT: usize = 22;

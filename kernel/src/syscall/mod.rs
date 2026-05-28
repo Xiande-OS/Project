@@ -97,6 +97,10 @@ pub fn dispatch(tf: &mut TrapFrame) {
         }
         nr::SYS_IOCTL => sys_ioctl(a0 as i32, a1 as u32, a2),
         nr::SYS_GETUID | nr::SYS_GETEUID | nr::SYS_GETGID | nr::SYS_GETEGID => 0,
+        // klogctl(2): stub so busybox dmesg / klogd don't error with ENOSYS.
+        // Returns 0 for all actions — including SYSLOG_ACTION_READ_ALL (type 3),
+        // which dmesg uses by default — meaning "empty kernel ring buffer".
+        nr::SYS_SYSLOG => 0,
         nr::SYS_GETPID => current_task().tgid.load(core::sync::atomic::Ordering::Relaxed) as isize,
         nr::SYS_GETTID => current_task().pid as isize,
         nr::SYS_GETPPID => {
