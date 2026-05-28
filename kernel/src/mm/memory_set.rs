@@ -299,13 +299,20 @@ impl MemorySet {
     /// Deep-copy this address space (fork). Each user VmArea gets fresh
     /// frames whose contents are copied from the parent. Kernel + MMIO
     /// identity mappings need to be re-added by the caller.
-    pub fn fork(&self) -> Self {
+    ///
+    /// Returns None if any frame allocation fails (out of physical
+    /// memory). The caller must turn that into an ENOMEM for the fork
+    /// syscall instead of crashing — a fork-storm benchmark
+    /// (unixbench SHELL16) must not panic the whole kernel and lose
+    /// every test group sequenced after it. On None, all frames
+    /// allocated so far are freed when `new_ms` drops.
+    pub fn fork(&self) -> Option<Self> {
         let mut new_ms = MemorySet::new();
         for area in &self.areas {
             let mut new_frames = alloc::collections::BTreeMap::new();
             let pte_flags = area.perm.to_pte();
             for (&vpn, frame) in &area.frames {
-                let new_frame = super::frame::alloc().expect("OOM in fork");
+                let new_frame = super::frame::alloc()?; // None -> ENOMEM
                 let src = frame.ppn.as_byte_slice();
                 let dst = new_frame.ppn.as_byte_slice();
                 dst.copy_from_slice(src);
@@ -322,7 +329,7 @@ impl MemorySet {
         new_ms.brk_base = self.brk_base;
         new_ms.brk_cur = self.brk_cur;
         new_ms.mmap_top = self.mmap_top;
-        new_ms
+        Some(new_ms)
     }
 
     /// Find the area that contains `vpn` (for fault handlers, brk).

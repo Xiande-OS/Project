@@ -2819,8 +2819,13 @@ pub fn sys_kill_current(status: i32) -> isize {
 ///         |CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID
 ///   a1=child_sp, a2=&tid (==ptid), a3=tls, a4=&tid (==ctid)
 fn sys_clone(flags: usize, child_sp: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
-    let new_task = crate::task::clone_current(flags, child_sp, ptid, ctid, tls);
-    new_task.pid as isize
+    match crate::task::clone_current(flags, child_sp, ptid, ctid, tls) {
+        Some(new_task) => new_task.pid as isize,
+        // Out of physical memory during address-space copy. Return
+        // ENOMEM so userland's fork() fails gracefully instead of the
+        // kernel panicking and dropping every downstream test group.
+        None => -12, // ENOMEM
+    }
 }
 
 fn sys_set_tid_address(addr: usize) -> isize {

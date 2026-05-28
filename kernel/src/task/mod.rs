@@ -673,7 +673,7 @@ fn write_usize(ms: &mut MemorySet, va: usize, v: usize) {
 
 // ----- fork / execve -----
 
-pub fn fork_current() -> Arc<Task> {
+pub fn fork_current() -> Option<Arc<Task>> {
     clone_current(0, 0, 0, 0, 0)
 }
 
@@ -716,7 +716,7 @@ pub fn clone_current(
     ptid: usize,
     ctid: usize,
     newtls: usize,
-) -> Arc<Task> {
+) -> Option<Arc<Task>> {
     let parent = current_task();
 
     // ---- Address space ----
@@ -726,8 +726,10 @@ pub fn clone_current(
     } else {
         // Deep-copy parent's user areas; remap the kernel/MMIO identity into
         // the new page table so the trap handler keeps working after a
-        // future satp switch.
-        let mut new_ms = parent.memory_set.lock().fork();
+        // future satp switch. fork() returns None on physical-memory
+        // exhaustion — propagate as None so sys_clone returns ENOMEM
+        // instead of panicking the kernel.
+        let mut new_ms = parent.memory_set.lock().fork()?;
         map_kernel_into(&mut new_ms);
         Arc::new(Mutex::new(new_ms))
     };
@@ -854,7 +856,7 @@ pub fn clone_current(
         *parent.state.lock() = TaskState::Waiting;
     }
 
-    task
+    Some(task)
 }
 
 /// Replace the current task's image with `elf_image`, argv, envp.
