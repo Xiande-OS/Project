@@ -39,6 +39,15 @@ pub fn init() -> Option<Arc<NetDev>> {
         0x1000_8000,
     ];
     for &base in BASES {
+        // Peek the virtio-mmio header's DeviceID *without* constructing
+        // a transport. MmioTransport::new resets the device on drop,
+        // so probing every base would wipe state on the virtio-blk
+        // we already initialised.
+        if probe_device_id(base) != 1 {
+            // 1 = Network. Everything else (block=2, console=3, ...)
+            // belongs to someone else.
+            continue;
+        }
         let header = unsafe { NonNull::new(base as *mut VirtIOHeader)? };
         let transport = match unsafe { MmioTransport::new(header) } {
             Ok(t) => t,
@@ -71,6 +80,18 @@ pub fn init() -> Option<Arc<NetDev>> {
 
 pub fn get() -> Option<Arc<NetDev>> {
     NET.get().cloned()
+}
+
+/// Read the virtio-mmio header's DeviceID field at `base + 0x08` without
+/// constructing an MmioTransport (which would reset the device on
+/// drop). Returns 0 if the magic doesn't match.
+fn probe_device_id(base: usize) -> u32 {
+    let magic = unsafe { core::ptr::read_volatile(base as *const u32) };
+    if magic != 0x7472_6976 {
+        // "virt"
+        return 0;
+    }
+    unsafe { core::ptr::read_volatile((base + 0x08) as *const u32) }
 }
 
 impl NetDev {

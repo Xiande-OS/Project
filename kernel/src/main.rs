@@ -115,9 +115,14 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("[ok] heap + frame allocator + trap vector + vfs + /bin + /lib + /dev/shm");
 
     if let Some(_blk) = drivers::virtio_blk::init() {
-        match fs::fat32::mount("/mnt") {
-            Ok(()) => println!("[ok] virtio-blk + FAT32 mounted at /mnt"),
-            Err(e) => println!("[fat32] mount failed: {}", e),
+        // Contest mode mounts EXT4 inside contest_runner — skip FAT32
+        // probe here. Dev builds still get a FAT32 attempt for the
+        // local disk.img convenience.
+        if !cfg!(feature = "contest") {
+            match fs::fat32::mount("/mnt") {
+                Ok(()) => println!("[ok] virtio-blk + FAT32 mounted at /mnt"),
+                Err(e) => println!("[fat32] mount failed: {}", e),
+            }
         }
     } else {
         println!("[virtio-blk] no block device detected");
@@ -131,12 +136,32 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         syscall::set_syscall_trace(true);
     }
 
-    // Contest mode: skip the dev-time launchers and hand off to the
-    // testcode runner, which prints `#### OS COMP TEST GROUP START / END
-    // ####` banners around each /xxxx_testcode.sh on the second
-    // virtio-blk device, then shuts the machine down cleanly.
+    // Contest mode: mount the testsuite EXT4 disk, build a driver
+    // script that loops over every `*_testcode.sh`, and hand it to
+    // busybox sh. When sh exits the scheduler shuts the machine down
+    // via SBI on its own.
     if cfg!(feature = "contest") || option_env!("XIANDE_CONTEST").is_some() {
-        contest_runner::run_and_shutdown();
+        if let Some((bb_inode, argv)) = contest_runner::prepare_init() {
+            let size = bb_inode.size() as usize;
+            let mut elf_bytes = alloc::vec![0u8; size];
+            if let Err(e) = bb_inode.read_at(0, &mut elf_bytes) {
+                panic!("contest: read busybox: {:?}", e);
+            }
+            let argv_refs: alloc::vec::Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            let task = task::create_task_from_elf_with_path(
+                &elf_bytes,
+                &argv_refs,
+                &["PATH=/bin:/mnt:/mnt/musl:/mnt/glibc", "HOME=/", "TERM=dumb", "PWD=/"],
+                "/bin/busybox",
+            );
+            drop(elf_bytes);
+            println!("[user] contest init: busybox sh /init.sh");
+            task::run_user_loop(&task);
+        }
+        // Fall through to a hard shutdown if prepare_init failed.
+        println!("[xiande-os] contest prep failed — shutting down");
+        sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+        loop { unsafe { core::arch::asm!("wfi") }; }
     }
 
     let (name, elf, argv) = if cfg!(feature = "bare_hello") {

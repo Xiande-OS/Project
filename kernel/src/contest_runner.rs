@@ -1,41 +1,139 @@
 //! OS-contest test harness driver.
 //!
 //! The 2026 OS-Kernel contest evaluator boots us with a testsuite EXT4
-//! image attached to `virtio-mmio-bus.0` (the harness expects us to scan
-//! its root for `xxxx_testcode.sh`, run each, print the
-//! `#### OS COMP TEST GROUP START/END xxxx ####` banners around them,
-//! then shut down).
+//! image attached to `virtio-mmio-bus.0`. The image's root has two
+//! variant directories — `musl/` and `glibc/` — each containing a
+//! flat layout of `*_testcode.sh` scripts plus a `busybox` binary and
+//! the ELFs the scripts invoke. Each script is responsible for
+//! printing its own `#### OS COMP TEST GROUP START/END <group>-<variant>
+//! ####` markers; our job is just to enumerate them and feed each one
+//! to a shell.
 //!
-//! This module is intentionally small for now:
-//!  - print a recognisable startup banner so the harness sees us alive,
-//!  - enumerate any block device we *can* read (FAT32 today, EXT4 in
-//!    the next iteration) and walk for testcode scripts,
-//!  - if none can be discovered, emit an empty banner pair per the
-//!    spec ("未被运行的测试点将不计分" — at least our markers exist),
-//!  - shut the machine down via SBI so QEMU exits and the evaluator
-//!    can score us.
+//! Strategy: mount the EXT4 disk at /mnt, materialise a tiny driver
+//! script (/init.sh) that `cd`s into each variant in turn and loops
+//! over the testcode scripts, then exec busybox-sh on it. When the
+//! shell exits, the scheduler hits "no runnable tasks" and reboots
+//! via SBI.
 
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use crate::fs::{self, FileType, Inode};
 use crate::println;
 
-/// Names of the syscall-spec test groups the contest uses. We always
-/// emit START/END pairs for these so the evaluator can recognise our
-/// run even before the EXT4 reader is in place.
-const KNOWN_GROUPS: &[&str] = &["basic"];
+const BUSYBOX_PATH: &str = "/bin/busybox";
 
-pub fn run_and_shutdown() -> ! {
-    println!("[xiande-os] contest harness starting");
+pub fn prepare_init() -> Option<(Arc<dyn Inode>, Vec<String>)> {
+    let mounted = match fs::ext4::mount_at("mnt") {
+        Ok(()) => {
+            println!("[xiande-os] ext4 mounted at /mnt");
+            true
+        }
+        Err(e) => {
+            println!("[xiande-os] ext4 mount failed: {} — empty harness", e);
+            false
+        }
+    };
 
-    for group in KNOWN_GROUPS {
-        println!("#### OS COMP TEST GROUP START {} ####", group);
-        // TODO: enumerate /<group>_testcode.sh on the testsuite disk,
-        // fork busybox sh for each, capture exit codes. Requires the
-        // EXT4 reader and the fork+exec fix that's still in progress.
-        println!("#### OS COMP TEST GROUP END {} ####", group);
+    let variants: Vec<(String, Vec<String>)> = if mounted {
+        enumerate_variants("/mnt")
+    } else {
+        Vec::new()
+    };
+
+    let body = build_driver_script(&variants);
+    if let Err(e) = fs::install_file("/", "init.sh", body.as_bytes()) {
+        println!("[xiande-os] install_file /init.sh failed: {}", e);
+        return None;
     }
 
-    println!("[xiande-os] contest harness done — shutting down");
-    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+    let bb = match fs::lookup_path(fs::root(), BUSYBOX_PATH) {
+        Ok(i) => i,
+        Err(_) => {
+            println!("[xiande-os] {} missing — abort", BUSYBOX_PATH);
+            return None;
+        }
+    };
+
+    let argv: Vec<String> = ["sh", "/init.sh"].iter().map(|s| s.to_string()).collect();
+    Some((bb, argv))
+}
+
+/// Walk /mnt and pick up the variant directories (musl/glibc) along
+/// with their testcode scripts. Falls back to treating /mnt itself as
+/// the variant dir when no musl/glibc subdir exists (some test images
+/// drop everything at root).
+fn enumerate_variants(mount: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let root = match fs::lookup_path(fs::root(), mount) {
+        Ok(i) => i,
+        Err(_) => return out,
+    };
+    let entries = root.list().unwrap_or_default();
+    let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+
+    let mut has_variant = false;
+    for v in ["musl", "glibc"] {
+        if names.iter().any(|n| n == v) {
+            let dir_path = alloc::format!("{}/{}", mount, v);
+            let scripts = list_testcodes(&dir_path);
+            if !scripts.is_empty() {
+                out.push((dir_path, scripts));
+                has_variant = true;
+            }
+        }
     }
+
+    if !has_variant {
+        let scripts = list_testcodes(mount);
+        if !scripts.is_empty() {
+            out.push((mount.to_string(), scripts));
+        }
+    }
+
+    out
+}
+
+fn list_testcodes(dir: &str) -> Vec<String> {
+    let inode = match fs::lookup_path(fs::root(), dir) {
+        Ok(i) => i,
+        Err(_) => return Vec::new(),
+    };
+    if inode.kind() != FileType::Directory {
+        return Vec::new();
+    }
+    let mut entries = inode.list().unwrap_or_default();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+        .into_iter()
+        .filter(|(n, _)| n.ends_with("_testcode.sh"))
+        .map(|(n, _)| n)
+        .collect()
+}
+
+fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
+    let mut s = String::from("#!/bin/sh\n");
+    if variants.is_empty() {
+        // No usable disk — emit a single empty pair so the evaluator
+        // at least sees that we're alive.
+        s.push_str("echo '#### OS COMP TEST GROUP START basic ####'\n");
+        s.push_str("echo '#### OS COMP TEST GROUP END basic ####'\n");
+        return s;
+    }
+    for (dir, scripts) in variants {
+        s.push_str(&alloc::format!("cd {}\n", dir));
+        for script in scripts {
+            // Each *_testcode.sh emits its own START/END markers; just
+            // run it. If `./busybox` is shipped inside the variant we
+            // prefer it (matches the script's expectation), otherwise
+            // fall back to our embedded one.
+            s.push_str(&alloc::format!(
+                "if [ -x ./busybox ]; then ./busybox sh ./{s}; \
+                 else /bin/busybox sh ./{s}; fi\n",
+                s = script
+            ));
+        }
+    }
+    s
 }

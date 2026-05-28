@@ -80,6 +80,13 @@ pub fn init() -> Option<Arc<BlockDevice>> {
         0x1000_8000,
     ];
     for &base in BASES {
+        // Peek DeviceID before opening — MmioTransport::new resets the
+        // device on drop, so probing a non-block device with it would
+        // disturb whatever else is sitting there.
+        if probe_device_id(base) != 2 {
+            // 2 = Block.
+            continue;
+        }
         let header = unsafe { NonNull::new(base as *mut VirtIOHeader)? };
         let transport = match unsafe { MmioTransport::new(header) } {
             Ok(t) => t,
@@ -107,6 +114,14 @@ pub fn init() -> Option<Arc<BlockDevice>> {
 
 pub fn get() -> Option<Arc<BlockDevice>> {
     BLK.get().cloned()
+}
+
+fn probe_device_id(base: usize) -> u32 {
+    let magic = unsafe { core::ptr::read_volatile(base as *const u32) };
+    if magic != 0x7472_6976 {
+        return 0;
+    }
+    unsafe { core::ptr::read_volatile((base + 0x08) as *const u32) }
 }
 
 impl BlockDevice {

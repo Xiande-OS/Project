@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use spin::{Mutex, Once};
 
 pub mod devfs;
+pub mod ext4;
 pub mod fat32;
 pub mod pipe;
 pub mod procfs;
