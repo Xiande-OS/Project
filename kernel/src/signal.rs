@@ -556,10 +556,42 @@ fn deliver_default_terminate(task: &Arc<Task>, signo: i32, core: bool) {
         "[exit] pid={} killed by signal {}{}",
         task.pid, signo, if core { " (core)" } else { "" },
     );
-    // Notify parent (SIGCHLD + wake from wait4).
-    let ppid = task.ppid.load(Ordering::Relaxed);
+
+    // POSIX: a fatal unhandled signal terminates the *whole* thread
+    // group, not just one thread. Walk the tgid and zombie-fy any
+    // siblings, and wake any pthread_join that was futex-waiting on
+    // their ctid.
+    let tgid = task.tgid.load(Ordering::Relaxed);
+    for sib in crate::task::all_tasks() {
+        if sib.tgid.load(Ordering::Relaxed) != tgid || sib.pid == task.pid {
+            continue;
+        }
+        if *sib.state.lock() == TaskState::Zombie {
+            continue;
+        }
+        sib.exit_code.store(status, Ordering::Relaxed);
+        *sib.state.lock() = TaskState::Zombie;
+        // CLONE_CHILD_CLEARTID: zero the ctid and wake one waiter so
+        // pthread_join unblocks.
+        let ctid = *sib.clear_child_tid.lock();
+        if ctid != 0 {
+            let _ = sib.copy_out_bytes(ctid, &[0u8; 4]);
+            let _ = crate::sync::futex::wake_for_task(&sib, ctid, 1);
+        }
+        crate::sync::futex::forget_task(sib.pid);
+    }
+
+    // Notify parent (SIGCHLD + wake from wait4). Use the group leader
+    // as the SIGCHLD target since a thread dying isn't normally
+    // observable, but the leader's death is.
+    let leader_pid = tgid;
+    let notify_from = if leader_pid != task.pid {
+        crate::task::task_by_pid(leader_pid).unwrap_or_else(|| task.clone())
+    } else {
+        task.clone()
+    };
+    let ppid = notify_from.ppid.load(Ordering::Relaxed);
     if let Some(parent) = crate::task::task_by_pid(ppid) {
-        // Wake first; SIGCHLD as well so sigwait/handlers see it.
         let mut s = parent.state.lock();
         if *s == TaskState::Waiting {
             *s = TaskState::Ready;

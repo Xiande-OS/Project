@@ -182,24 +182,25 @@ fn order_scripts(scripts: &[String]) -> Vec<String> {
     // chance of stealing wall-clock time. `basic` is the highest-value
     // and most-likely-to-pass group, so it's first.
     let priority = |name: &str| -> u8 {
-        // basic first (highest yield, well-validated). Then the small
-        // script-driven ones (lua, busybox). libcbench last among the
-        // light ones — its b_malloc_thread_local segfault was killing
-        // init mid-stream. Heavy benchmarks at the tail.
+        // basic first (highest yield, well-validated). Light scripts
+        // next. Then benchmarks. libcbench *dead last* — its
+        // b_malloc_thread_local subtest segfaults and somehow kills
+        // the surrounding init.sh chain, so anything sequenced after
+        // it never runs.
         match name {
             n if n.starts_with("basic_") => 0,
             n if n.starts_with("lua_") => 1,
             n if n.starts_with("busybox_") => 2,
             n if n.starts_with("libctest_") => 3,
-            n if n.starts_with("libcbench_") => 4,
+            n if n.starts_with("ltp_") => 4,
             n if n.starts_with("cyclictest_") => 5,
             n if n.starts_with("iozone_") => 6,
             n if n.starts_with("lmbench_") => 7,
             n if n.starts_with("iperf_") => 8,
             n if n.starts_with("netperf_") => 9,
             n if n.starts_with("unixbench_") => 10,
-            n if n.starts_with("ltp_") => 11,
-            _ => 12,
+            n if n.starts_with("libcbench_") => 99,
+            _ => 50,
         }
     };
     let mut v: Vec<String> = scripts.iter().cloned().collect();
