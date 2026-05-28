@@ -4,3 +4,13 @@
 **/*.swp
 .DS_Store
 .claude/worktrees/
+
+# Build artifacts produced by `make all`.
+/kernel-rv
+/kernel-la
+
+# `make prepare` materialises these from cargo/ on contest boxes
+# where hidden dirs got stripped on clone. Don't commit them — the
+# canonical copy lives under cargo/ and kernel/cargo/.
+/.cargo/
+/kernel/.cargo/

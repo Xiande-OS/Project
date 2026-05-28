@@ -7,6 +7,7 @@ extern crate alloc;
 mod arch;
 #[macro_use]
 mod console;
+mod contest_runner;
 mod drivers;
 mod fs;
 mod loader;
@@ -128,6 +129,14 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     }
     if option_env!("SYSTRACE").is_some() {
         syscall::set_syscall_trace(true);
+    }
+
+    // Contest mode: skip the dev-time launchers and hand off to the
+    // testcode runner, which prints `#### OS COMP TEST GROUP START / END
+    // ####` banners around each /xxxx_testcode.sh on the second
+    // virtio-blk device, then shuts the machine down cleanly.
+    if cfg!(feature = "contest") || option_env!("XIANDE_CONTEST").is_some() {
+        contest_runner::run_and_shutdown();
     }
 
     let (name, elf, argv) = if cfg!(feature = "bare_hello") {

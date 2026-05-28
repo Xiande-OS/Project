@@ -19,7 +19,10 @@ fdt = "0.1"
 smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dns"] }
 
 [features]
-default = []
+default = ["contest"]
+# Contest mode: boot straight into the OS-comp test runner and shut
+# down when done. Default so `make all` produces a contest-ready ELF.
+contest = []
 bare_hello = []
 musl_hello = []
 rust_git = []
