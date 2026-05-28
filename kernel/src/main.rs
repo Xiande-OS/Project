@@ -11,6 +11,7 @@ mod drivers;
 mod fs;
 mod loader;
 mod mm;
+mod net;
 mod signal;
 mod sync;
 mod syscall;
@@ -100,6 +101,11 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         }
     } else {
         println!("[virtio-blk] no block device detected");
+    }
+    if let Some(_n) = drivers::virtio_net::init() {
+        fs::socket::init();
+    } else {
+        println!("[virtio-net] no network device detected");
     }
     if option_env!("SYSTRACE").is_some() {
         syscall::set_syscall_trace(true);
