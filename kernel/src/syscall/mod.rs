@@ -98,17 +98,17 @@ pub fn set_syscall_trace(on: bool) {
 }
 
 fn sys_write(fd: usize, buf: usize, len: usize) -> isize {
-    if fd != 1 && fd != 2 {
-        return EBADF;
-    }
     let task = current_task();
     let Some(bytes) = task.copy_in_bytes(buf, len) else {
         return EFAULT;
     };
-    for b in &bytes {
-        #[allow(deprecated)]
-        sbi_rt::legacy::console_putchar(*b as usize);
+    if fd == 1 || fd == 2 {
+        for b in &bytes {
+            #[allow(deprecated)]
+            sbi_rt::legacy::console_putchar(*b as usize);
+        }
     }
+    // fd >= 3 -> /dev/null-ish, discard.
     bytes.len() as isize
 }
 
@@ -119,9 +119,6 @@ struct IoVec {
 }
 
 fn sys_writev(fd: usize, iov: usize, count: usize) -> isize {
-    if fd != 1 && fd != 2 {
-        return EBADF;
-    }
     if count == 0 {
         return 0;
     }
@@ -133,6 +130,7 @@ fn sys_writev(fd: usize, iov: usize, count: usize) -> isize {
         core::slice::from_raw_parts(iovs_bytes.as_ptr() as *const IoVec, count)
     };
     let mut total = 0isize;
+    let to_console = fd == 1 || fd == 2;
     for v in iovs {
         if v.len == 0 {
             continue;
@@ -140,9 +138,11 @@ fn sys_writev(fd: usize, iov: usize, count: usize) -> isize {
         let Some(bytes) = task.copy_in_bytes(v.base, v.len) else {
             return EFAULT;
         };
-        for b in &bytes {
-            #[allow(deprecated)]
-            sbi_rt::legacy::console_putchar(*b as usize);
+        if to_console {
+            for b in &bytes {
+                #[allow(deprecated)]
+                sbi_rt::legacy::console_putchar(*b as usize);
+            }
         }
         total += bytes.len() as isize;
     }
@@ -344,8 +344,25 @@ fn cstr_to_str(bytes: &[u8]) -> Option<&str> {
     core::str::from_utf8(&bytes[..end]).ok()
 }
 
-fn sys_openat(_dfd: i32, _path: usize, _flags: i32, _mode: i32) -> isize {
-    ENOENT
+// Hand out fake fds for special devices. Any fd >= 3 we hand out is treated
+// as "/dev/null-ish": read = EOF, write = discard. Real FS is M5+.
+static NEXT_FD: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(3);
+
+fn alloc_fd() -> isize {
+    NEXT_FD.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as isize
+}
+
+fn sys_openat(_dfd: i32, path: usize, _flags: i32, _mode: i32) -> isize {
+    let task = current_task();
+    let Some(path_bytes) = task.copy_in_bytes(path, 256) else {
+        return EFAULT;
+    };
+    let path_str = cstr_to_str(&path_bytes).unwrap_or("");
+    match path_str {
+        "/dev/null" | "/dev/zero" | "/dev/full" => alloc_fd(),
+        "/dev/tty" | "/dev/console" => 1,
+        _ => ENOENT,
+    }
 }
 
 fn sys_close(_fd: i32) -> isize {

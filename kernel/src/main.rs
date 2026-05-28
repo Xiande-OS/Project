@@ -24,6 +24,8 @@ static MUSL_HELLO_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("MUSL_HELLO_ELF_PATH")));
 static GIT_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("GIT_ELF_PATH")));
+static REAL_GIT_ALIGNED: &AlignedElf<[u8]> =
+    &AlignedElf(*include_bytes!(env!("REAL_GIT_ELF_PATH")));
 
 fn hello_elf() -> &'static [u8] {
     &HELLO_ALIGNED.0
@@ -33,6 +35,9 @@ fn musl_hello_elf() -> &'static [u8] {
 }
 fn git_elf() -> &'static [u8] {
     &GIT_ALIGNED.0
+}
+fn real_git_elf() -> &'static [u8] {
+    &REAL_GIT_ALIGNED.0
 }
 
 #[no_mangle]
@@ -48,13 +53,18 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         ("hello", hello_elf(), alloc::vec!["hello"])
     } else if cfg!(feature = "musl_hello") {
         ("musl_hello", musl_hello_elf(), alloc::vec!["musl_hello"])
-    } else {
-        // Pick command via env var; defaults to "self-test".
+    } else if cfg!(feature = "rust_git") {
         let cmd = option_env!("GIT_CMD").unwrap_or("self-test");
         let split: alloc::vec::Vec<&str> = cmd.split_whitespace().collect();
         let mut a = alloc::vec!["git"];
         a.extend_from_slice(&split);
         ("git", git_elf(), a)
+    } else {
+        let cmd = option_env!("GIT_CMD").unwrap_or("--version");
+        let split: alloc::vec::Vec<&str> = cmd.split_whitespace().collect();
+        let mut a = alloc::vec!["git"];
+        a.extend_from_slice(&split);
+        ("real_git", real_git_elf(), a)
     };
     println!("[user] loading {} ({} bytes)", name, elf.len());
     println!("[user] argv = {:?}", argv);

@@ -94,4 +94,11 @@ fn main() {
     let git_dst = out_dir.join("git.elf");
     std::fs::copy(&git_src, &git_dst).expect("copy git.elf");
     println!("cargo:rustc-env=GIT_ELF_PATH={}", git_dst.display());
+
+    // real upstream git 2.42.0, cross-compiled with riscv64-unknown-linux-musl.
+    let real_git_src = workspace_root.join("user/real_git.elf");
+    let real_git_dst = out_dir.join("real_git.elf");
+    std::fs::copy(&real_git_src, &real_git_dst).expect("copy real_git.elf");
+    println!("cargo:rerun-if-changed=../user/real_git.elf");
+    println!("cargo:rustc-env=REAL_GIT_ELF_PATH={}", real_git_dst.display());
 }

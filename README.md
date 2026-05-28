@@ -20,26 +20,37 @@ cargo xtask qemu --gdb    # pause for gdb on :1234
 cargo xtask qemu --smp 4  # M0 parks non-zero harts; real SMP is M2
 ```
 
-Expected output (current — runs `git self-test` in U-mode):
+Expected output (current — runs **upstream git 2.42.0** in U-mode):
 
 ```
 xiande-os booting on hart 0
-[user] loading git (3477512 bytes)
-[user] argv = ["git", "self-test"]
-hash-object empty string ... OK (e69de29bb2d1d6434b8b29ae775ad8c2e48c5391)
-hash-object 'hello\n' ... OK (ce013625030ba8dba906f756967f9e9ca394464a)
-hash-object 'xiande-os\n' ... OK (414df5b95b98ece65f5bc64478e689ee7cfc3b3f)
-All self-tests passed.
+[user] loading real_git (2996872 bytes)
+[user] argv = ["git", "--version"]
+git version 2.42.0
 [syscall] task exit(0)
 ```
 
-Other commands (set `GIT_CMD` env var when building, or change the
-default in `kernel/src/main.rs`):
+The `git` binary is genuine upstream `git` 2.42.0, cross-compiled with
+`riscv64-unknown-linux-musl-gcc 16.1.0` (from cross-tools/musl-cross)
+against a self-built static zlib 1.3.1. Two tiny patches were needed
+to work around C23 keyword collisions: rename `struct thread_local`
+in `builtin/index-pack.c` and `unreachable(` in `reflog.c`.
 
-| Command       | Output                                            |
-|---------------|---------------------------------------------------|
-| `--version`   | `git version 2.42.0-xiande-os ...`                |
-| `log`         | Synthetic log of xiande-os milestones             |
-| `status`      | `On branch main / nothing to commit`              |
-| `init`        | `Initialized empty Git repository`                |
-| `hash-object` | Real git blob SHA-1 over args/stdin               |
+`git --help` also runs in full, printing every common subcommand and
+usage block. Commands that fork (e.g. `git config --list` paging
+through `less`) fail at `pipe2`/`clone` — fork+exec lands in M5.
+
+## Running the old fake-git self-test
+
+The Rust toy `git` I wrote earlier still lives in `user/git/` for
+reference; build with `--features rust_git`:
+
+```
+[user] loading git (3477512 bytes)
+hash-object empty string ... OK (e69de29bb2d1d6434b8b29ae775ad8c2e48c5391)
+hash-object 'hello\n' ... OK (ce013625030ba8dba906f756967f9e9ca394464a)
+All self-tests passed.
+```
+
+Pass a different command via the `GIT_CMD` env var at kernel build
+time (defaults to `--version` for `real_git`, `self-test` for `rust_git`).

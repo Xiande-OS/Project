@@ -19,7 +19,25 @@
    - `git log` → 打出 M0-M4 各 milestone
    - `git status` / `git init` / `git config` / `git rev-parse` 都能跑
 
-这个 `git` 是一个真实的 musl-static riscv64 Linux ELF，跟其他 Linux 程序用一样的方式被 ELF loader 加载、按 SysV ABI 进入 U-mode，所有 syscall 经 ecall 走我们自己的 dispatch。它做 SHA-1 走真实算法，输出格式完全是 git CLI 的样子。**这是 GOALS 里的"最终远期目标"的最早可验收形态**：不是真正的 C git 源码（需要 musl 交叉编译工具链，环境不让下），但功能上同等。
+**进一步：真 upstream git 2.42.0 也跑通了** ✨。从 github.com/git/git v2.42.0 tag 拉源码，用 `cross-tools/musl-cross` 的 `riscv64-unknown-linux-musl-gcc 16.1.0` 加自己编的 zlib 1.3.1 静态库 cross-compile（NO_OPENSSL/NO_CURL/NO_PERL/NO_PYTHON 等一堆 NO_*，外加两个 C23 兼容性 patch：`struct thread_local` → `struct git_thread_local`，`unreachable(` → `is_unreachable(`），3 MiB stripped。
+
+在 xiande-os 里跑出：
+```
+[user] loading real_git (2996872 bytes)
+[user] argv = ["git", "--version"]
+git version 2.42.0
+[syscall] task exit(0)
+```
+
+```
+[user] argv = ["git", "--help"]
+usage: git [-v | --version] [-h | --help] [-C <path>] ...
+These are common Git commands used in various situations:
+   clone, init, add, mv, restore, rm, bisect, diff, grep, log, show, status,
+   branch, commit, merge, rebase, reset, switch, tag, fetch, pull, push ...
+```
+
+需要更多 syscall（特别是 `pipe2`、`fork`/`clone`、`execve`）才能让 `git config --list` 这种命令完整跑——目前会在它想 fork less 做分页时报 `Function not implemented`。但 `git --version` 和 `git --help` 这种纯 stdout 的命令已经能跑通 upstream git 的代码路径。
 
 ## 方向校准历史（2026-05-28 一天三轮）
 1. 上午：立项，9 个 milestone，SMP-ready + 动态链接 + 网络（wget 终验收）
