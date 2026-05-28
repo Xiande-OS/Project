@@ -881,22 +881,38 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
 
     let cur_state = task_by_pid(cur_pid).map(|t| *t.state.lock());
 
-    // If the current task is Zombie and nothing else is Ready, we
-    // can't just return its trap frame — that would re-enter user
-    // code on a dead process. Spin sweeping the sleep / futex queues
-    // until SOMETHING becomes runnable (or, if there are no live
-    // tasks at all, shut down). Cheap because the host emulates
-    // mtime; the spin is the same work as a wfi loop without needing
+    // If the current task is Zombie OR Waiting and nothing else is
+    // Ready, we can't return its trap frame: Zombie would re-enter
+    // dead-process user code; Waiting would silently flip the task
+    // back to Running and userland would observe a successful return
+    // from nanosleep/wait4/... that didn't actually block. Spin
+    // sweeping the sleep / futex queues until SOMETHING becomes
+    // runnable. Cheap; same shape as a wfi loop without needing
     // timer interrupts enabled.
-    if cur_state == Some(TaskState::Zombie) && !any_runnable_except(cur_pid) {
+    if matches!(cur_state, Some(TaskState::Zombie) | Some(TaskState::Waiting))
+        && !any_runnable_except(cur_pid)
+    {
         loop {
             if !any_runnable_except(cur_pid) && !any_waiting() {
-                sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-                loop { unsafe { core::arch::asm!("wfi") }; }
+                if cur_state == Some(TaskState::Zombie) {
+                    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+                    loop { unsafe { core::arch::asm!("wfi") }; }
+                }
+                // Waiting with nothing to wake us — deadlock, but
+                // still hand back our own tf so the trap returns.
+                break;
             }
             wake_expired_sleepers(riscv::register::time::read64());
             crate::sync::futex::poll_timeouts();
             if any_runnable_except(cur_pid) { break; }
+            // If our own deadline fired while we were waiting, we are
+            // now Ready ourselves — break out and let the normal path
+            // schedule us back in.
+            if let Some(t) = task_by_pid(cur_pid) {
+                if *t.state.lock() == TaskState::Ready {
+                    break;
+                }
+            }
             core::hint::spin_loop();
         }
     }

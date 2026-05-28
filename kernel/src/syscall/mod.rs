@@ -1952,6 +1952,12 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     // scheduler resumes us the trap return uses our value (the dispatch
     // loop skips the post-syscall a0 write for Waiting tasks). sepc
     // already points past ecall, so we do NOT rewind.
+    if syscall_trace_enabled() {
+        crate::println!(
+            "[nanosleep pid={}] sec={} nsec={} ticks={} now={} target={}",
+            task.pid, sec, nsec, total_ticks, now, target,
+        );
+    }
     crate::task::sleep_until(task.pid, target);
     unsafe {
         (*task.tf_ptr()).x[9] = 0;
