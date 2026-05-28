@@ -223,6 +223,19 @@ pub fn any_waiting() -> bool {
     t.tasks.values().any(|task| *task.state.lock() == TaskState::Waiting)
 }
 
+/// Promote every Waiting task to Ready so it gets re-scheduled and can
+/// re-attempt its blocking syscall (`accept`, `connect`, `recv`, `wait4`,
+/// ...). Cheap given our tiny task counts.
+pub fn wake_socket_waiters() {
+    let t = TABLE.lock();
+    for task in t.tasks.values() {
+        let mut s = task.state.lock();
+        if *s == TaskState::Waiting {
+            *s = TaskState::Ready;
+        }
+    }
+}
+
 // ----- Initial task creation -----
 
 pub fn create_task_from_elf(
@@ -480,6 +493,12 @@ pub fn run_user_loop(task: &Arc<Task>) -> ! {
 /// Called by the trap handler. Decides which task to return through and
 /// switches satp + current_pid accordingly. Returns the TF to load.
 pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
+    // Push/pull whatever the network stack has been doing while user-mode
+    // ran. Cheap no-op if the stack isn't up.
+    crate::net::poll();
+    // Wake any tasks that were blocked on sockets and now have progress.
+    wake_socket_waiters();
+
     let cur_pid = current_pid();
     let cur_state = task_by_pid(cur_pid).map(|t| *t.state.lock());
 

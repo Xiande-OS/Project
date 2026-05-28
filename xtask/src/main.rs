@@ -152,6 +152,14 @@ fn cmd_qemu(args: &[String]) -> Result<(), String> {
             .args(["-device", "virtio-blk-device,drive=vd0"]);
     }
 
+    // QEMU user-mode networking: host=10.0.2.2, DNS=10.0.2.3, guest=10.0.2.15.
+    // Forward host TCP 15555 to guest 5555 so a guest server on :5555 can
+    // accept inbound from the host via 127.0.0.1:15555. Outbound from the
+    // kernel to host services on 10.0.2.2:5555 works without any extra
+    // hostfwd thanks to SLIRP.
+    qemu.args(["-netdev", "user,id=net0,hostfwd=tcp::15555-:5555"])
+        .args(["-device", "virtio-net-device,netdev=net0"]);
+
     if gdb {
         qemu.args(["-s", "-S"]);
         eprintln!("qemu: paused for gdb on :1234 (use `target remote :1234`)");

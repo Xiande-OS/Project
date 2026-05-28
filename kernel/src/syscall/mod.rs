@@ -1,6 +1,7 @@
 //! Syscall dispatch.
 
 pub mod nr;
+pub mod socket;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -120,6 +121,52 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_CLONE => sys_clone(a0, a1, a2, a3, a4),
         nr::SYS_EXECVE => sys_execve(a0, a1, a2),
         nr::SYS_WAIT4 => sys_wait4(a0 as i32, a1, a2 as i32),
+        nr::SYS_SOCKET => {
+            crate::net::poll();
+            socket::sys_socket(a0 as i32, a1 as i32, a2 as i32)
+        }
+        nr::SYS_BIND => {
+            crate::net::poll();
+            socket::sys_bind(a0 as i32, a1, a2)
+        }
+        nr::SYS_LISTEN => {
+            crate::net::poll();
+            socket::sys_listen(a0 as i32, a1 as i32)
+        }
+        nr::SYS_ACCEPT4 => {
+            crate::net::poll();
+            socket::sys_accept4(a0 as i32, a1, a2, a3 as i32)
+        }
+        nr::SYS_CONNECT => {
+            crate::net::poll();
+            socket::sys_connect(a0 as i32, a1, a2)
+        }
+        nr::SYS_GETSOCKNAME => socket::sys_getsockname(a0 as i32, a1, a2),
+        nr::SYS_GETPEERNAME => socket::sys_getpeername(a0 as i32, a1, a2),
+        nr::SYS_SENDTO => {
+            crate::net::poll();
+            socket::sys_sendto(a0 as i32, a1, a2, a3 as i32, a4, a5)
+        }
+        nr::SYS_RECVFROM => {
+            crate::net::poll();
+            socket::sys_recvfrom(a0 as i32, a1, a2, a3 as i32, a4, a5)
+        }
+        nr::SYS_SETSOCKOPT => {
+            socket::sys_setsockopt(a0 as i32, a1 as i32, a2 as i32, a3, a4 as i32)
+        }
+        nr::SYS_GETSOCKOPT => socket::sys_getsockopt(a0 as i32, a1 as i32, a2 as i32, a3, a4),
+        nr::SYS_SHUTDOWN => {
+            crate::net::poll();
+            socket::sys_shutdown(a0 as i32, a1 as i32)
+        }
+        nr::SYS_SENDMSG => {
+            crate::net::poll();
+            socket::sys_sendmsg(a0 as i32, a1, a2 as i32)
+        }
+        nr::SYS_RECVMSG => {
+            crate::net::poll();
+            socket::sys_recvmsg(a0 as i32, a1, a2 as i32)
+        }
         _ => {
             println!("[syscall] unimplemented #{} a0={:#x} a1={:#x}", id, a0, a1);
             ENOSYS
@@ -129,7 +176,18 @@ pub fn dispatch(tf: &mut TrapFrame) {
     if syscall_trace_enabled() {
         crate::println!("[sys] #{} -> {:#x}", id, ret as usize);
     }
-    tf.x[9] = ret as usize;
+    // If the syscall handler put the task into Waiting + rewound sepc to
+    // retry on wakeup, the user's a0 must NOT be clobbered by our
+    // intermediate return value — otherwise the retry sees a different
+    // first argument (e.g. fd=-11 instead of fd=3). Detect by checking
+    // task state.
+    let is_blocked = matches!(
+        *current_task().state.lock(),
+        crate::task::TaskState::Waiting
+    );
+    if !is_blocked {
+        tf.x[9] = ret as usize;
+    }
 }
 
 static SYSCALL_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
