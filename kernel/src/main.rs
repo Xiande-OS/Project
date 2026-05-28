@@ -20,9 +20,14 @@ struct AlignedElf<T: ?Sized>(T);
 
 static HELLO_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("HELLO_ELF_PATH")));
+static MUSL_HELLO_ALIGNED: &AlignedElf<[u8]> =
+    &AlignedElf(*include_bytes!(env!("MUSL_HELLO_ELF_PATH")));
 
 fn hello_elf() -> &'static [u8] {
     &HELLO_ALIGNED.0
+}
+fn musl_hello_elf() -> &'static [u8] {
+    &MUSL_HELLO_ALIGNED.0
 }
 
 #[no_mangle]
@@ -34,9 +39,15 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     arch::riscv64::trap::init();
     println!("[ok] heap + frame allocator + trap vector");
 
-    let elf = hello_elf();
-    println!("[user] loading hello.elf ({} bytes)", elf.len());
-    let task = task::create_task_from_elf(elf, &["hello"], &["PATH=/bin", "HOME=/"]);
+    // Pick which user binary to run.  Bare-metal `hello` is the M3 smoke
+    // test; switch to musl_hello for M4.
+    let (name, elf) = if cfg!(feature = "bare_hello") {
+        ("hello", hello_elf())
+    } else {
+        ("musl_hello", musl_hello_elf())
+    };
+    println!("[user] loading {} ({} bytes)", name, elf.len());
+    let task = task::create_task_from_elf(elf, &[name], &["PATH=/bin", "HOME=/"]);
     println!("[user] task installed, entering user mode...");
     task::run_user_loop(&task);
 }

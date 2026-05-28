@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["hello"]
+members = ["hello", "musl_hello"]
+exclude = []
 
 [profile.release]
 opt-level = "z"

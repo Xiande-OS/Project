@@ -28,6 +28,7 @@ pub const SYS_WRITEV: usize = 66;
 pub const SYS_PREAD64: usize = 67;
 pub const SYS_PWRITE64: usize = 68;
 pub const SYS_PPOLL: usize = 73;
+pub const SYS_TKILL: usize = 130;
 pub const SYS_READLINKAT: usize = 78;
 pub const SYS_NEWFSTATAT: usize = 79;
 pub const SYS_FSTAT: usize = 80;

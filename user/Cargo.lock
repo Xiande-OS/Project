@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "hello"
 version = "0.0.1"
+
+[[package]]
+name = "musl_hello"
+version = "0.0.1"

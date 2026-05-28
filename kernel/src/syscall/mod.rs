@@ -24,6 +24,13 @@ pub fn dispatch(tf: &mut TrapFrame) {
     let a4 = tf.x[13];
     let a5 = tf.x[14];
 
+    if syscall_trace_enabled() {
+        crate::println!(
+            "[sys] #{} sp={:#x} a0={:#x} a1={:#x} a2={:#x}",
+            id, tf.x[1], a0, a1, a2
+        );
+    }
+
     let ret = match id {
         nr::SYS_WRITE => sys_write(a0, a1, a2),
         nr::SYS_WRITEV => sys_writev(a0, a1, a2),
@@ -49,7 +56,18 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         nr::SYS_SCHED_YIELD => 0,
         nr::SYS_TGKILL => 0,
+        nr::SYS_TKILL => 0,
         nr::SYS_FUTEX => 0,
+        nr::SYS_PPOLL => 0, // 0 fds ready (timeout)
+        nr::SYS_FCNTL => 0,
+        nr::SYS_SIGALTSTACK => 0,
+        nr::SYS_RT_SIGTIMEDWAIT => 0,
+        nr::SYS_RT_SIGSUSPEND => 0,
+        nr::SYS_GETTIMEOFDAY => sys_gettimeofday(a0),
+        nr::SYS_SYSINFO => 0,
+        nr::SYS_GETRUSAGE => 0,
+        nr::SYS_MEMBARRIER => 0,
+        nr::SYS_TIMES => 0,
         nr::SYS_READLINKAT => sys_readlinkat(a0 as i32, a1, a2, a3),
         nr::SYS_OPENAT => sys_openat(a0 as i32, a1, a2 as i32, a3 as i32),
         nr::SYS_CLOSE => sys_close(a0 as i32),
@@ -62,7 +80,21 @@ pub fn dispatch(tf: &mut TrapFrame) {
         }
     };
 
+    if syscall_trace_enabled() {
+        crate::println!("[sys] #{} -> {:#x}", id, ret as usize);
+    }
     tf.x[9] = ret as usize;
+}
+
+use core::sync::atomic::{AtomicBool, Ordering};
+static SYSCALL_TRACE: AtomicBool = AtomicBool::new(false);
+
+fn syscall_trace_enabled() -> bool {
+    SYSCALL_TRACE.load(Ordering::Relaxed)
+}
+
+pub fn set_syscall_trace(on: bool) {
+    SYSCALL_TRACE.store(on, Ordering::Relaxed);
 }
 
 fn sys_write(fd: usize, buf: usize, len: usize) -> isize {
@@ -214,6 +246,31 @@ fn sys_getrandom(buf: usize, len: usize, _flags: usize) -> isize {
 struct Timespec {
     sec: i64,
     nsec: i64,
+}
+
+#[repr(C)]
+struct Timeval {
+    sec: i64,
+    usec: i64,
+}
+
+fn sys_gettimeofday(tv: usize) -> isize {
+    let mtime = riscv::register::time::read64();
+    let tv_val = Timeval {
+        sec: (mtime / 10_000_000) as i64,
+        usec: ((mtime % 10_000_000) / 10) as i64,
+    };
+    let task = current_task();
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &tv_val as *const _ as *const u8,
+            core::mem::size_of::<Timeval>(),
+        )
+    };
+    if task.copy_out_bytes(tv, bytes).is_none() {
+        return EFAULT;
+    }
+    0
 }
 
 fn sys_clock_gettime(_clk: usize, ts: usize) -> isize {

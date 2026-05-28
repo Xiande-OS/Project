@@ -1,9 +1,14 @@
-[build]
-target = "riscv64gc-unknown-none-elf"
-
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
     "-C", "link-arg=-Thello/linker.ld",
     "-C", "link-arg=-no-pie",
     "-C", "relocation-model=static",
+]
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-no-pie",
 ]

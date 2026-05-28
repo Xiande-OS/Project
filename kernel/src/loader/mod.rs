@@ -1,11 +1,7 @@
 //! Static ELF loader.
-//!
-//! Parses an ELF64 (riscv) image and produces a `MemorySet` populated
-//! with the PT_LOAD segments, plus a user stack.  For M3 we only handle
-//! statically-linked ELFs; M6 adds PT_INTERP for ld-musl.
 
 use alloc::vec::Vec;
-use xmas_elf::program::{Flags, ProgramHeader, Type};
+use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::ElfFile;
 
 use crate::mm::address::{VirtAddr, PAGE_SIZE};
@@ -15,17 +11,14 @@ use crate::mm::memory_set::{MemorySet, VmArea, VmPerm};
 pub struct LoadedElf {
     pub entry: usize,
     pub user_sp_top: usize,
-    /// Top of mapped image; brk starts here (rounded up to a page).
     pub program_break: usize,
-    /// Auxv-relevant: number and size of program headers, plus their VA.
     pub phdr_va: usize,
     pub phent: usize,
     pub phnum: usize,
 }
 
-/// Initial user-stack top. 2 MiB stack just under 0x4000_0000.
 const USER_STACK_TOP: usize = 0x4000_0000;
-const USER_STACK_SIZE: usize = 2 * 1024 * 1024;
+const USER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static str> {
     let elf = ElfFile::new(image).map_err(|_| "bad ELF")?;
@@ -47,10 +40,9 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
         let ph = elf.program_header(i as u16).map_err(|_| "bad phdr")?;
         match ph.get_type().map_err(|_| "bad phdr type")? {
             Type::Load => {
-                load_segment(&elf, &ph, image, ms, &mut max_end_va, ph_off, &mut phdr_va)?;
+                load_segment(&ph, image, ms, &mut max_end_va, ph_off, &mut phdr_va)?;
             }
             Type::Phdr => {
-                // PT_PHDR vaddr (if present) tells us where the phdr table is mapped.
                 if ph.virtual_addr() != 0 {
                     phdr_va = ph.virtual_addr() as usize;
                 }
@@ -59,7 +51,6 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
         }
     }
 
-    // User stack.
     let sp_top = USER_STACK_TOP;
     let sp_bot = USER_STACK_TOP - USER_STACK_SIZE;
     let stack = VmArea::new(
@@ -69,7 +60,6 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
     );
     ms.push_user_area(stack, None);
 
-    // Program break starts one page above the loaded image (page-aligned).
     let brk_base = (max_end_va + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     ms.brk_base = VirtAddr(brk_base);
     ms.brk_cur = VirtAddr(brk_base);
@@ -85,7 +75,6 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
 }
 
 fn load_segment(
-    elf: &ElfFile,
     ph: &ProgramHeader,
     image: &[u8],
     ms: &mut MemorySet,
@@ -93,11 +82,10 @@ fn load_segment(
     ph_off: usize,
     phdr_va: &mut usize,
 ) -> Result<(), &'static str> {
-    let _ = elf;
     let va = ph.virtual_addr() as usize;
     let file_sz = ph.file_size() as usize;
     let mem_sz = ph.mem_size() as usize;
-    let offset = ph.offset() as usize;
+    let file_off = ph.offset() as usize;
     let flags = ph.flags();
 
     if mem_sz == 0 {
@@ -115,34 +103,34 @@ fn load_segment(
         perm |= VmPerm::X;
     }
 
-    let va_start = VirtAddr(va);
-    let va_end = VirtAddr(va + mem_sz);
+    // For a segment with non-page-aligned VA, the first page's
+    // contents are: [zeros up to (va & 0xfff)] then [file bytes].
+    // mem_sz extends with .bss zeros after file_sz.
+    let page_offset = va & (PAGE_SIZE - 1);
+    let va_start = VirtAddr(va & !(PAGE_SIZE - 1));
+    let va_end_raw = va + mem_sz;
+    let va_end = VirtAddr((va_end_raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
 
-    // Copy file_sz bytes from the image, the rest is zero (BSS).
-    let mut data = Vec::with_capacity(mem_sz);
-    let copy = core::cmp::min(file_sz, image.len().saturating_sub(offset));
-    data.extend_from_slice(&image[offset..offset + copy]);
-    data.resize(mem_sz, 0);
+    // Build the buffer that, when placed at va_start, reproduces the
+    // segment's expected memory image.
+    let total = va_end.0 - va_start.0;
+    let mut buf = Vec::with_capacity(total);
+    buf.resize(total, 0);
+    let file_avail = core::cmp::min(file_sz, image.len().saturating_sub(file_off));
+    buf[page_offset..page_offset + file_avail]
+        .copy_from_slice(&image[file_off..file_off + file_avail]);
+    // BSS portion stays zero (already from resize above).
 
     let area = VmArea::new(va_start, va_end, perm);
-    ms.push_user_area(area, Some(&data));
+    ms.push_user_area(area, Some(&buf));
 
     if va + mem_sz > *max_end_va {
         *max_end_va = va + mem_sz;
     }
 
-    // Track where the phdr table is loaded (in the first segment that
-    // contains ph_offset).
-    if *phdr_va == 0 && offset <= ph_off && ph_off < offset + file_sz {
-        *phdr_va = va + (ph_off - offset);
+    if *phdr_va == 0 && file_off <= ph_off && ph_off < file_off + file_sz {
+        *phdr_va = va + (ph_off - file_off);
     }
 
-    // Mark unused to silence the borrow checker on `_`.
-    let _ = perm;
     Ok(())
-}
-
-#[allow(dead_code)]
-fn write_flags(f: Flags) -> bool {
-    f.is_write()
 }

@@ -55,9 +55,25 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) {
         }
         Trap::Exception(e) if from_user => {
             crate::println!(
-                "[user fault] {:?}\n  sepc  = {:#x}\n  stval = {:#x}\n  killing task",
-                e, tf.sepc, stval,
+                "[user fault] {:?}\n  sepc  = {:#x}\n  stval = {:#x}\n  sstatus = {:#x}",
+                e, tf.sepc, stval, tf.sstatus
             );
+            for i in 0..31 {
+                let reg = i + 1;
+                let name = match reg {
+                    1 => "ra ", 2 => "sp ", 3 => "gp ", 4 => "tp ",
+                    5 => "t0 ", 6 => "t1 ", 7 => "t2 ",
+                    8 => "s0 ", 9 => "s1 ",
+                    10 => "a0 ", 11 => "a1 ", 12 => "a2 ", 13 => "a3 ",
+                    14 => "a4 ", 15 => "a5 ", 16 => "a6 ", 17 => "a7 ",
+                    18 => "s2 ", 19 => "s3 ", 20 => "s4 ", 21 => "s5 ",
+                    22 => "s6 ", 23 => "s7 ", 24 => "s8 ", 25 => "s9 ",
+                    26 => "s10", 27 => "s11",
+                    28 => "t3 ", 29 => "t4 ", 30 => "t5 ", 31 => "t6 ",
+                    _ => "???",
+                };
+                crate::println!("  x{:2}({}) = {:#018x}", reg, name, tf.x[i]);
+            }
             crate::syscall::request_exit(139);
         }
         Trap::Exception(e) => {

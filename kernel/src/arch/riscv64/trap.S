@@ -55,8 +55,8 @@ __trap_entry:
 
     csrr    t0, sstatus
     sd      t0, 31*8(sp)
-    csrr    t0, sepc
-    sd      t0, 32*8(sp)
+    csrr    t3, sepc           # keep sstatus in t0 for the SPP check below
+    sd      t3, 32*8(sp)
 
     # SPP bit 8: 1 = from S-mode, 0 = from U-mode.
     andi    t1, t0, 0x100
