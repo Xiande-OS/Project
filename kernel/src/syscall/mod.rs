@@ -147,7 +147,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_READLINKAT => sys_readlinkat(a0 as i32, a1, a2, a3),
         nr::SYS_RENAMEAT2 => sys_renameat2(a0 as i32, a1, a2 as i32, a3, a4 as u32),
         nr::SYS_LINKAT => sys_linkat(a0 as i32, a1, a2 as i32, a3, a4 as i32),
-        nr::SYS_SYMLINKAT => 0, // best-effort stub
+        nr::SYS_SYMLINKAT => sys_symlinkat(a0, a1 as i32, a2),
         nr::SYS_CLONE => sys_clone(a0, a1, a2, a3, a4),
         nr::SYS_EXECVE => sys_execve(a0, a1, a2),
         nr::SYS_WAIT4 => sys_wait4(a0 as i32, a1, a2 as i32),
@@ -1529,6 +1529,7 @@ fn sys_getdents64(fd: i32, buf: usize, len: usize) -> isize {
             FileType::Directory => 4u8,
             FileType::CharDevice => 2u8,
             FileType::Pipe => 1u8,
+            FileType::Symlink => 10u8,
         };
         let mut dent = alloc::vec![0u8; reclen];
         dent[0..8].copy_from_slice(&(idx as u64 + 1).to_le_bytes());
@@ -1583,6 +1584,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
         FileType::Directory => 0o040000,
         FileType::CharDevice => 0o020000,
         FileType::Pipe => 0o010000,
+        FileType::Symlink => 0o120000,
     };
     let (mode_bits, uid, gid, atime, mtime, ctime) = if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
         let m = *f.meta.lock();
@@ -1596,6 +1598,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
             FileType::Directory => 0o755,
             FileType::CharDevice => 0o666,
             FileType::Pipe => 0o600,
+            FileType::Symlink => 0o777,
         };
         (mode_default, 0, 0, (0, 0), (0, 0), (0, 0))
     };
@@ -1636,24 +1639,32 @@ fn sys_fstat(fd: i32, buf: usize) -> isize {
     write_struct(buf, &st)
 }
 
-fn sys_newfstatat(dfd: i32, path: usize, buf: usize, _flags: i32) -> isize {
-    let Some(path_str) = copy_path(path) else {
-        return EFAULT;
-    };
+fn sys_newfstatat(dfd: i32, path: usize, buf: usize, flags: i32) -> isize {
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    let Some(path_str) = copy_path(path) else { return EFAULT; };
     let inode = if path_str.is_empty() {
-        // AT_EMPTY_PATH semantics: use dfd directly.
-        let Some(file) = current_task().fd_table.lock().get(dfd) else {
-            return EBADF;
-        };
+        let Some(file) = current_task().fd_table.lock().get(dfd) else { return EBADF; };
         file.inode.clone()
+    } else if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        let Some(i) = resolve_at_nofollow(dfd, &path_str) else { return ENOENT; };
+        i
     } else {
-        let Some(i) = resolve_at(dfd, &path_str) else {
-            return ENOENT;
-        };
+        let Some(i) = resolve_at(dfd, &path_str) else { return ENOENT; };
         i
     };
     let st = fill_stat(&inode);
     write_struct(buf, &st)
+}
+
+fn resolve_at_nofollow(dfd: i32, path: &str) -> Option<Arc<dyn Inode>> {
+    let task = current_task();
+    let start = if dfd == AT_FDCWD || path.starts_with('/') {
+        let cwd = task.cwd.lock().clone();
+        fs::lookup_path(fs::root(), &cwd).ok()?
+    } else {
+        task.fd_table.lock().get(dfd)?.inode.clone()
+    };
+    fs::lookup_path_nofollow(start, path).ok()
 }
 
 #[repr(C)]
@@ -1709,6 +1720,7 @@ fn sys_statx(dfd: i32, path: usize, _flags: i32, _mask: u32, buf: usize) -> isiz
         FileType::Directory => 0o040755,
         FileType::CharDevice => 0o020666,
         FileType::Pipe => 0o010600,
+        FileType::Symlink => 0o120777,
     };
     st.stx_size = inode.size();
     st.stx_blocks = (inode.size() + 511) / 512;
@@ -2169,6 +2181,16 @@ fn sys_linkat(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _fla
     }
 }
 
+fn sys_symlinkat(target: usize, new_dfd: i32, linkpath: usize) -> isize {
+    let Some(target_s) = copy_path(target) else { return EFAULT };
+    let Some(link_s) = copy_path(linkpath) else { return EFAULT };
+    let Some((parent, name)) = resolve_at_parent(new_dfd, &link_s) else { return ENOENT };
+    match parent.symlink(&name, &target_s) {
+        Ok(()) => 0,
+        Err(e) => err_to_isize(e),
+    }
+}
+
 fn sys_readlinkat(_dfd: i32, path: usize, buf: usize, len: usize) -> isize {
     let task = current_task();
     let Some(path_bytes) = task.copy_in_bytes(path, 256) else {
@@ -2183,7 +2205,6 @@ fn sys_readlinkat(_dfd: i32, path: usize, buf: usize, len: usize) -> isize {
     } else if path_str == "/proc/self/cwd" {
         task.cwd.lock().clone()
     } else if let Some(rest) = path_str.strip_prefix("/proc/") {
-        // Either /proc/<pid>/exe or /proc/<pid>/cwd.
         if let Some((pid_str, leaf)) = rest.split_once('/') {
             if let Ok(pid) = pid_str.parse::<i32>() {
                 if let Some(t) = crate::task::task_by_pid(pid) {
@@ -2192,17 +2213,19 @@ fn sys_readlinkat(_dfd: i32, path: usize, buf: usize, len: usize) -> isize {
                         "cwd" => t.cwd.lock().clone(),
                         _ => return ENOENT,
                     }
-                } else {
-                    return ENOENT;
-                }
-            } else {
-                return ENOENT;
-            }
-        } else {
-            return ENOENT;
-        }
+                } else { return ENOENT; }
+            } else { return ENOENT; }
+        } else { return ENOENT; }
     } else {
-        return ENOENT;
+        // General symlink: look up without following the final hop.
+        match crate::fs::lookup_path_nofollow(crate::fs::root(), path_str) {
+            Ok(i) if i.kind() == crate::fs::FileType::Symlink => match i.readlink() {
+                Ok(t) => t,
+                Err(_) => return EINVAL,
+            },
+            Ok(_) => return EINVAL,
+            Err(_) => return ENOENT,
+        }
     };
     if resolved.is_empty() {
         return ENOENT;

@@ -114,6 +114,7 @@ pub enum FileType {
     Directory,
     CharDevice,
     Pipe,
+    Symlink,
 }
 
 pub trait Inode: Send + Sync + core::any::Any {
@@ -137,12 +138,33 @@ pub trait Inode: Send + Sync + core::any::Any {
     fn create(&self, _name: &str, _kind: FileType) -> Result<Arc<dyn Inode>> {
         Err(ENOTDIR)
     }
+    /// Create a symlink named `name` pointing at `target`. Default: not
+    /// supported.
+    fn symlink(&self, _name: &str, _target: &str) -> Result<()> {
+        Err(EINVAL)
+    }
     fn unlink(&self, _name: &str) -> Result<()> {
         Err(ENOTDIR)
     }
     fn list(&self) -> Result<Vec<(String, FileType)>> {
         Err(ENOTDIR)
     }
+    /// If this Inode is a symlink, return its target path.
+    fn readlink(&self) -> Result<String> {
+        Err(EINVAL)
+    }
+}
+
+/// In-memory symlink: just stores the target path.
+pub struct Symlink {
+    pub target: String,
+}
+
+impl Inode for Symlink {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn kind(&self) -> FileType { FileType::Symlink }
+    fn size(&self) -> u64 { self.target.len() as u64 }
+    fn readlink(&self) -> Result<String> { Ok(self.target.clone()) }
 }
 
 pub struct File {
@@ -380,15 +402,47 @@ pub fn root() -> Arc<dyn Inode> {
 }
 
 /// Resolve an absolute or CWD-relative path. Returns the inode or an error.
+/// Follows symlinks (up to 8 nestings to avoid loops).
 pub fn lookup_path(cwd: Arc<dyn Inode>, path: &str) -> Result<Arc<dyn Inode>> {
-    let mut cur = if path.starts_with('/') { root() } else { cwd };
-    for part in path.split('/').filter(|p| !p.is_empty() && *p != ".") {
-        if part == ".." {
-            // Single-level parent climb is hard without dentries; for M5 we
-            // only support absolute paths from /, so "/.." just stays at /.
+    lookup_path_inner(cwd, path, true, 0)
+}
+
+/// Like `lookup_path` but does not follow the final-component symlink.
+pub fn lookup_path_nofollow(cwd: Arc<dyn Inode>, path: &str) -> Result<Arc<dyn Inode>> {
+    lookup_path_inner(cwd, path, false, 0)
+}
+
+fn lookup_path_inner(
+    cwd: Arc<dyn Inode>,
+    path: &str,
+    follow_last: bool,
+    depth: usize,
+) -> Result<Arc<dyn Inode>> {
+    if depth > 8 {
+        return Err(-40); // ELOOP
+    }
+    let mut cur = if path.starts_with('/') { root() } else { cwd.clone() };
+    let parts: alloc::vec::Vec<&str> = path
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    let last_idx = parts.len().wrapping_sub(1);
+    for (idx, part) in parts.iter().enumerate() {
+        if *part == ".." {
+            // Single-level VFS doesn't track parents.
             continue;
         }
-        cur = cur.lookup(part)?;
+        let next = cur.lookup(part)?;
+        // Follow symlinks for all but the final component when follow_last==false.
+        let is_last = idx == last_idx;
+        if next.kind() == FileType::Symlink && (!is_last || follow_last) {
+            let target = next.readlink()?;
+            // Resolve target relative to the current dir (not next's parent).
+            let resolved = lookup_path_inner(cur.clone(), &target, true, depth + 1)?;
+            cur = resolved;
+        } else {
+            cur = next;
+        }
     }
     Ok(cur)
 }
