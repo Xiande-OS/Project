@@ -7,6 +7,7 @@ extern crate alloc;
 mod arch;
 #[macro_use]
 mod console;
+mod drivers;
 mod fs;
 mod loader;
 mod mm;
@@ -83,6 +84,15 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     }
     fs::install_file("/lib", "ld-musl-riscv64.so.1", ld_musl_blob()).unwrap();
     println!("[ok] heap + frame allocator + trap vector + vfs + /bin + /lib");
+
+    if let Some(_blk) = drivers::virtio_blk::init() {
+        match fs::fat32::mount("/mnt") {
+            Ok(()) => println!("[ok] virtio-blk + FAT32 mounted at /mnt"),
+            Err(e) => println!("[fat32] mount failed: {}", e),
+        }
+    } else {
+        println!("[virtio-blk] no block device detected");
+    }
     if option_env!("SYSTRACE").is_some() {
         syscall::set_syscall_trace(true);
     }

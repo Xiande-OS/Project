@@ -132,6 +132,8 @@ fn cmd_qemu(args: &[String]) -> Result<(), String> {
         return Err(format!("kernel ELF not found at {}", elf.display()));
     }
 
+    let workspace = workspace_root();
+    let disk = workspace.join("user/disk.img");
     let mut qemu = Command::new("qemu-system-riscv64");
     qemu.args([
         "-machine",
@@ -144,6 +146,11 @@ fn cmd_qemu(args: &[String]) -> Result<(), String> {
     .arg(&elf)
     .args(["-smp", &smp.to_string()])
     .args(["-m", "1G"]);
+    if disk.exists() {
+        qemu.args(["-drive"])
+            .arg(format!("file={},format=raw,id=vd0,if=none", disk.display()))
+            .args(["-device", "virtio-blk-device,drive=vd0"]);
+    }
 
     if gdb {
         qemu.args(["-s", "-S"]);

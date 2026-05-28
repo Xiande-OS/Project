@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use spin::{Mutex, Once};
 
 pub mod devfs;
+pub mod fat32;
 pub mod pipe;
 pub mod tmpfs;
 pub use tmpfs::TmpfsDir;
