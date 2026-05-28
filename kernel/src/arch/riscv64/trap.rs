@@ -24,13 +24,30 @@ pub struct TrapFrame {
     pub _reserved: usize,
 }
 
+/// One scheduler tick. 10 MHz mtimer → 1ms preemption quantum. Short
+/// enough that a userspace tight loop (e.g. libctest's pthread_cancel)
+/// can't hold the hart for long; the trap-driven scheduler nudge runs
+/// often enough that the busybox `timeout` daemon's wall-clock kill
+/// fires on schedule.
+const TIMER_QUANTUM_TICKS: u64 = 10_000;
+
+fn arm_timer() {
+    let next = riscv::register::time::read64().saturating_add(TIMER_QUANTUM_TICKS);
+    unsafe { sbi_rt::set_timer(next); }
+}
+
 /// Install the trap vector. Call once during early boot.
 pub fn init() {
     unsafe {
         stvec::write(__trap_entry as usize, stvec::TrapMode::Direct);
         // sscratch == 0 means "we're in S-mode now". Trap entry uses this.
         riscv::register::sscratch::write(0);
+        // Enable supervisor timer interrupt + global S-mode interrupt
+        // gating. Without this enable mask, the trap handler never sees
+        // SupervisorTimer even if SBI fires the underlying interrupt.
+        riscv::register::sie::set_stimer();
     }
+    arm_timer();
 }
 
 #[no_mangle]
@@ -48,9 +65,9 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             tf.sepc += instr_len_at(tf.sepc);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
-            unsafe {
-                sbi_rt::set_timer(u64::MAX);
-            }
+            // Re-arm and let schedule_next_after_trap do its thing.
+            // No fault, no syscall to dispatch — just a quantum tick.
+            arm_timer();
         }
         Trap::Exception(e) if from_user => {
             crate::println!(
