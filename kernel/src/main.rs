@@ -75,6 +75,7 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir", "mv", "cp",
         "true", "false", "env", "pwd", "wc", "grep", "head", "tail", "sort",
         "uniq", "tr", "find", "touch", "test", "[", "[[", "stat",
+        "sleep", "kill",
     ] {
         fs::link_into("/bin", applet, bb.clone()).unwrap();
     }
