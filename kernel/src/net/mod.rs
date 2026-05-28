@@ -20,6 +20,8 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Add
 
 use crate::drivers::virtio_net::{self, NetDev};
 
+pub mod loopback;
+
 /// Number of microseconds since CPU boot. Used to feed smoltcp a
 /// monotonic Instant.
 fn now_ms() -> i64 {

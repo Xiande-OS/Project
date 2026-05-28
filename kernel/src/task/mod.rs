@@ -363,6 +363,61 @@ pub fn wake_expired_sleepers(now: u64) {
     }
 }
 
+/// ITIMER_REAL deadlines: per-pid (next_deadline_ticks, interval_ticks).
+/// `interval_ticks == 0` means single-shot (don't rearm).
+static IT_REAL_DEADLINES: spin::Mutex<alloc::collections::BTreeMap<i32, (u64, u64)>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+/// Install / replace this pid's ITIMER_REAL. `next == 0` disarms it.
+pub fn itimer_real_set(pid: i32, next_deadline_ticks: u64, interval_ticks: u64) {
+    let mut m = IT_REAL_DEADLINES.lock();
+    if next_deadline_ticks == 0 {
+        m.remove(&pid);
+    } else {
+        m.insert(pid, (next_deadline_ticks, interval_ticks));
+    }
+}
+
+/// Query current ITIMER_REAL (next_deadline_ticks, interval_ticks).
+pub fn itimer_real_get(pid: i32) -> Option<(u64, u64)> {
+    IT_REAL_DEADLINES.lock().get(&pid).copied()
+}
+
+/// Drop any timer state owned by `pid`. Called from reap.
+pub fn forget_itimer(pid: i32) {
+    IT_REAL_DEADLINES.lock().remove(&pid);
+}
+
+/// Raise SIGALRM on any task whose ITIMER_REAL deadline has elapsed.
+pub fn wake_expired_itimers(now: u64) {
+    let fired: Vec<(i32, u64, u64)> = {
+        let m = IT_REAL_DEADLINES.lock();
+        m.iter()
+            .filter_map(|(&pid, &(next, interval))| {
+                if now >= next { Some((pid, next, interval)) } else { None }
+            })
+            .collect()
+    };
+    if fired.is_empty() {
+        return;
+    }
+    {
+        let mut m = IT_REAL_DEADLINES.lock();
+        for (pid, _next, interval) in &fired {
+            if *interval > 0 {
+                m.insert(*pid, (now + *interval, *interval));
+            } else {
+                m.remove(pid);
+            }
+        }
+    }
+    for (pid, _next, _interval) in fired {
+        if let Some(t) = task_by_pid(pid) {
+            let _ = crate::signal::raise_signal(&t, crate::signal::SIGALRM);
+        }
+    }
+}
+
 /// CLONE_VFORK wakeup: the child has reached execve or exit. Any task whose
 /// `vfork_child` matches this pid is unblocked. Called from sys_execve (on
 /// success) and exit_one_thread.

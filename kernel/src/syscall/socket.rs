@@ -33,6 +33,13 @@ const ENOTCONN: isize = -107;
 const EAGAIN: isize = -11;
 const EOPNOTSUPP: isize = -95;
 
+/// True for 127.x.x.x or 0.0.0.0 — both of which the loopback shim should
+/// service. (Most apps connect to 127.0.0.1 but a few bind to ANY and
+/// reach themselves via localhost.)
+fn is_loopback(a: Ipv4Address) -> bool {
+    a.0[0] == 127 || a.0 == [0, 0, 0, 0]
+}
+
 /// Run `f` with a borrowed `&Socket` resolved from the fd table. Keeps the
 /// `Arc<File>` alive for the duration of the call.
 fn with_socket<R>(fd: i32, f: impl FnOnce(&Socket) -> R) -> Result<R, isize> {
@@ -122,7 +129,16 @@ pub fn sys_bind(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
     let res = with_socket(fd, |s| {
         s.state.lock().bound = Some(sa);
         match s.kind {
-            SocketKind::Udp => net::udp_bind(s.handle, sa.port),
+            SocketKind::Udp => {
+                // Register the in-kernel loopback UDP receiver too — most
+                // apps that bind to ANY (0.0.0.0) actually want to receive
+                // from 127.0.0.1.
+                if is_loopback(sa.addr) || sa.addr.0 == [0, 0, 0, 0] {
+                    let ue = crate::net::loopback::register_udp(sa.port);
+                    s.state.lock().udp_end = Some(ue);
+                }
+                net::udp_bind(s.handle, sa.port)
+            }
             SocketKind::Tcp => Ok(()), // TCP bind is paired with listen; record only.
         }
     });
@@ -144,7 +160,13 @@ pub fn sys_listen(fd: i32, _backlog: i32) -> isize {
         if port == 0 {
             return Err(EINVAL);
         }
-        net::tcp_listen(s.handle, port).map_err(|e| e as isize)?;
+        // Loopback listener — answers connect() to 127.0.0.1:port without
+        // smoltcp. Always registered for TCP so 127.0.0.1 / 0.0.0.0 /
+        // 10.0.2.15 binds all work.
+        let listener = crate::net::loopback::register_listener(port);
+        s.state.lock().listener = Some(listener);
+        // smoltcp listen too, so external connects on 10.0.2.15 still work.
+        let _ = net::tcp_listen(s.handle, port);
         s.state.lock().listening = true;
         Ok(())
     });
@@ -159,6 +181,53 @@ pub fn sys_listen(fd: i32, _backlog: i32) -> isize {
 
 pub fn sys_accept4(fd: i32, sa_ptr: usize, sa_len_ptr: usize, flags: i32) -> isize {
     net::poll();
+    // Loopback fast path first: if our listener has a pending server-end,
+    // build a fresh socket around it and return.
+    let listener = match with_socket(fd, |s| s.state.lock().listener.clone()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Some(listener) = listener {
+        let pending = listener.pending.lock().pop_front();
+        if let Some(server_end) = pending {
+            let peer_port = server_end.remote_port;
+            // Build the accepted socket. We still need a smoltcp handle for
+            // the Socket struct shape; tcp_abort/remove on drop will clean
+            // it up (it'll be in `Closed`).
+            let new_handle = match net::add_tcp_socket() {
+                Some(h) => h,
+                None => return ENETUNREACH,
+            };
+            let new_sock = Socket::new_tcp(new_handle);
+            {
+                let mut st = new_sock.state.lock();
+                st.loopback = Some(server_end);
+                st.peer = Some(SockAddrIn {
+                    addr: Ipv4Address::new(127, 0, 0, 1),
+                    port: peer_port,
+                });
+                st.bound = Some(SockAddrIn {
+                    addr: Ipv4Address::new(127, 0, 0, 1),
+                    port: listener.port,
+                });
+            }
+            if sa_ptr != 0 {
+                let sa = SockAddrIn { addr: Ipv4Address::new(127, 0, 0, 1), port: peer_port };
+                let bytes = write_sockaddr_in(sa);
+                let _ = current_task().copy_out_bytes(sa_ptr, &bytes);
+                if sa_len_ptr != 0 {
+                    let _ = current_task().copy_out_bytes(sa_len_ptr, &(SOCKADDR_IN_SIZE as u32).to_le_bytes());
+                }
+            }
+            let new_file = Arc::new(File::from_inode(new_sock, true, true, false));
+            let cloexec = (flags & SOCK_CLOEXEC) != 0;
+            let task = current_task();
+            return match task.fd_table.lock().alloc(new_file, cloexec) {
+                Ok(nfd) => nfd as isize,
+                Err(e) => e as isize,
+            };
+        }
+    }
     // Look up the listening socket's handle + port.
     let listen_info = match with_socket(fd, |s| {
         if s.kind != SocketKind::Tcp || !s.state.lock().listening {

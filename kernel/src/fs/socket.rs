@@ -14,6 +14,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::wire::Ipv4Address;
 
 use crate::net;
+use crate::net::loopback::{LoopbackEnd, TcpListener, UdpEnd};
 
 use super::{FileType, Inode, Result, EINVAL};
 
@@ -53,6 +54,17 @@ pub struct SocketState {
     pub peer: Option<SockAddrIn>,
     pub listening: bool,
     pub nonblock: bool,
+    /// Set when this socket has been wired through the in-kernel loopback
+    /// shim (sys_connect to 127.0.0.1 with a matching listener, or
+    /// sys_accept handing back a server end). All TCP I/O bypasses smoltcp
+    /// once this is `Some`.
+    pub loopback: Option<Arc<LoopbackEnd>>,
+    /// Set on the listening side. Accept pulls pending server-ends from
+    /// the listener's backlog.
+    pub listener: Option<Arc<TcpListener>>,
+    /// Set on UDP sockets bound to 127.0.0.1 / 0.0.0.0 so datagram delivery
+    /// works without going through smoltcp.
+    pub udp_end: Option<Arc<UdpEnd>>,
 }
 
 pub struct Socket {
@@ -73,6 +85,9 @@ impl Socket {
                 peer: None,
                 listening: false,
                 nonblock: false,
+                loopback: None,
+                listener: None,
+                udp_end: None,
             }),
         })
     }
@@ -87,6 +102,9 @@ impl Socket {
                 peer: None,
                 listening: false,
                 nonblock: false,
+                loopback: None,
+                listener: None,
+                udp_end: None,
             }),
         })
     }
@@ -94,6 +112,21 @@ impl Socket {
 
 impl Drop for Socket {
     fn drop(&mut self) {
+        // If this was a loopback listener/binding, unregister so a later
+        // socket can rebind the same port (iperf3 starts a fresh server
+        // for each sub-test).
+        let st = self.state.lock();
+        if let Some(l) = st.listener.as_ref() {
+            crate::net::loopback::unregister_listener(l.port);
+        }
+        if let Some(u) = st.udp_end.as_ref() {
+            crate::net::loopback::unregister_udp(u.port);
+        }
+        if let Some(lb) = st.loopback.as_ref() {
+            // Mark our outgoing pipe closed so the peer's recv returns EOF.
+            lb.close();
+        }
+        drop(st);
         // Close + remove from smoltcp.
         match self.kind {
             SocketKind::Tcp => {
@@ -121,6 +154,14 @@ impl Inode for Socket {
         // Best-effort non-blocking read. The syscall layer (recvfrom) is
         // responsible for the blocking dance — direct file `read()` is
         // for the SYS_READ shim path.
+        // Loopback fast path (set by sys_connect / sys_accept).
+        if let Some(lb) = self.state.lock().loopback.clone() {
+            let n = lb.recv(buf);
+            if n == 0 && lb.peer_eof() {
+                return Ok(0);
+            }
+            return Ok(n);
+        }
         net::poll();
         match self.kind {
             SocketKind::Tcp => net::tcp_recv(self.handle, buf),
@@ -131,6 +172,10 @@ impl Inode for Socket {
         }
     }
     fn write_at(&self, _off: u64, buf: &[u8]) -> Result<usize> {
+        // Loopback fast path.
+        if let Some(lb) = self.state.lock().loopback.clone() {
+            return Ok(lb.send(buf));
+        }
         match self.kind {
             SocketKind::Tcp => {
                 let r = net::tcp_send(self.handle, buf);
