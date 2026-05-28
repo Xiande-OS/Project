@@ -318,8 +318,27 @@ pub fn sys_connect(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
     match kind {
         SocketKind::Udp => {
             // UDP "connect" = just remember the remote endpoint.
+            // For loopback destinations, ensure we have a local UdpEnd so
+            // the peer can route reply datagrams back to us. iperf3 -u/-c
+            // doesn't call bind() on the data socket; without this step the
+            // server's reply lands in the void.
             let _ = with_socket(fd, |s| {
-                s.state.lock().peer = Some(sa);
+                let mut st = s.state.lock();
+                st.peer = Some(sa);
+                if is_loopback(sa.addr) && st.udp_end.is_none() {
+                    let port = st
+                        .bound
+                        .map(|b| b.port)
+                        .unwrap_or_else(crate::net::loopback::alloc_ephemeral);
+                    let ue = crate::net::loopback::register_udp(port);
+                    // Reflect the bound port back so subsequent getsockname
+                    // works (iperf3 inspects this).
+                    st.bound = Some(SockAddrIn {
+                        addr: Ipv4Address::new(127, 0, 0, 1),
+                        port,
+                    });
+                    st.udp_end = Some(ue);
+                }
             });
             return 0;
         }
@@ -394,14 +413,37 @@ pub fn sys_sendto(
     let Some(data) = task.copy_in_bytes(buf_ptr, len) else {
         return EFAULT;
     };
-    let info = match with_socket(fd, |s| (s.handle, s.kind, s.state.lock().peer)) {
+    let info = match with_socket(fd, |s| {
+        let st = s.state.lock();
+        (
+            s.handle,
+            s.kind,
+            st.peer,
+            st.loopback.clone(),
+            st.udp_end.clone(),
+            st.bound,
+        )
+    }) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (handle, kind, peer) = info;
+    let (handle, kind, peer, lb, udp_end, bound) = info;
 
     match kind {
         SocketKind::Tcp => {
+            // Loopback TCP fast path: avoid smoltcp entirely.
+            if let Some(lb) = lb {
+                let n = lb.send(&data);
+                if n == 0 && !lb.can_send() {
+                    // Peer gone / pipe closed -> ECONNRESET.
+                    return ECONNRESET;
+                }
+                if n == 0 {
+                    block_and_retry();
+                    return EAGAIN;
+                }
+                return n as isize;
+            }
             // TCP ignores sockaddr.
             net::poll();
             match net::tcp_send(handle, &data) {
@@ -437,6 +479,37 @@ pub fn sys_sendto(
             } else {
                 return EINVAL;
             };
+            // Loopback fast path: route datagrams to 127.0.0.1 through the
+            // in-kernel UDP registry instead of smoltcp.
+            if is_loopback(dst.addr) {
+                let src_port = match (udp_end.as_ref(), bound) {
+                    (Some(ue), _) => ue.port,
+                    (None, Some(b)) if b.port != 0 => b.port,
+                    _ => {
+                        // Allocate a fresh port and register so replies have
+                        // somewhere to land (iperf3 -u sendto without bind).
+                        let p = crate::net::loopback::alloc_ephemeral();
+                        let _ = with_socket(fd, |s| {
+                            let mut st = s.state.lock();
+                            if st.udp_end.is_none() {
+                                let ue = crate::net::loopback::register_udp(p);
+                                st.udp_end = Some(ue);
+                                st.bound = Some(SockAddrIn {
+                                    addr: Ipv4Address::new(127, 0, 0, 1),
+                                    port: p,
+                                });
+                            }
+                        });
+                        p
+                    }
+                };
+                if crate::net::loopback::udp_deliver(dst.port, src_port, &data) {
+                    return data.len() as isize;
+                }
+                // No listener bound on that port — match Linux SOCK_DGRAM
+                // semantics by silently succeeding (UDP is best-effort).
+                return data.len() as isize;
+            }
             match net::udp_send(handle, &data, dst.addr, dst.port) {
                 Ok(n) => {
                     net::poll();
@@ -458,11 +531,20 @@ pub fn sys_recvfrom(
     sa_ptr: usize,
     sa_len_ptr: usize,
 ) -> isize {
-    let info = match with_socket(fd, |s| (s.handle, s.kind, s.state.lock().nonblock)) {
+    let info = match with_socket(fd, |s| {
+        let st = s.state.lock();
+        (
+            s.handle,
+            s.kind,
+            st.nonblock,
+            st.loopback.clone(),
+            st.udp_end.clone(),
+        )
+    }) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (handle, kind, nonblock) = info;
+    let (handle, kind, nonblock, lb, udp_end) = info;
     net::poll();
 
     let task = current_task();
@@ -470,6 +552,36 @@ pub fn sys_recvfrom(
 
     match kind {
         SocketKind::Tcp => {
+            // Loopback TCP fast path: pull from the in-kernel pipe.
+            if let Some(lb) = lb {
+                let n = lb.recv(&mut buf);
+                if n == 0 {
+                    if lb.peer_eof() {
+                        return 0;
+                    }
+                    if nonblock {
+                        return EAGAIN;
+                    }
+                    block_and_retry();
+                    return EAGAIN;
+                }
+                if task.copy_out_bytes(buf_ptr, &buf[..n]).is_none() {
+                    return EFAULT;
+                }
+                if sa_ptr != 0 {
+                    let peer_sa = with_socket(fd, |s| s.state.lock().peer).ok().flatten()
+                        .unwrap_or(SockAddrIn::ANY);
+                    let bytes = write_sockaddr_in(peer_sa);
+                    let _ = task.copy_out_bytes(sa_ptr, &bytes);
+                    if sa_len_ptr != 0 {
+                        let _ = task.copy_out_bytes(
+                            sa_len_ptr,
+                            &(SOCKADDR_IN_SIZE as u32).to_le_bytes(),
+                        );
+                    }
+                }
+                return n as isize;
+            }
             // If we got bytes, return them. If we got 0 and the connection
             // is still alive, block. If the connection is dead, return 0
             // (EOF) per POSIX.
@@ -507,6 +619,36 @@ pub fn sys_recvfrom(
             }
         }
         SocketKind::Udp => {
+            // Loopback fast path: pull from our UdpEnd's incoming queue.
+            if let Some(ue) = udp_end {
+                let dg = ue.incoming.lock().pop_front();
+                if let Some(dg) = dg {
+                    let n = core::cmp::min(buf.len(), dg.data.len());
+                    if task.copy_out_bytes(buf_ptr, &dg.data[..n]).is_none() {
+                        return EFAULT;
+                    }
+                    if sa_ptr != 0 {
+                        let sa = SockAddrIn {
+                            addr: Ipv4Address::new(127, 0, 0, 1),
+                            port: dg.src_port,
+                        };
+                        let bytes = write_sockaddr_in(sa);
+                        let _ = task.copy_out_bytes(sa_ptr, &bytes);
+                        if sa_len_ptr != 0 {
+                            let _ = task.copy_out_bytes(
+                                sa_len_ptr,
+                                &(SOCKADDR_IN_SIZE as u32).to_le_bytes(),
+                            );
+                        }
+                    }
+                    return n as isize;
+                }
+                if nonblock {
+                    return EAGAIN;
+                }
+                block_and_retry();
+                return EAGAIN;
+            }
             match net::udp_recv(handle, &mut buf) {
                 Ok((n, src, port)) => {
                     if task.copy_out_bytes(buf_ptr, &buf[..n]).is_none() {

@@ -112,6 +112,7 @@ impl Inode for ProcPidDir {
             "cmdline" => Ok(ProcGenFile::new(move || gen_cmdline(pid))),
             "exe" => Ok(ProcGenFile::new(move || gen_exe(pid))),
             "maps" => Ok(ProcGenFile::new(move || gen_maps(pid))),
+            "smaps" => Ok(ProcGenFile::new(move || gen_smaps(pid))),
             "status" => Ok(ProcGenFile::new(move || gen_status(pid))),
             "stat" => Ok(ProcGenFile::new(move || gen_stat(pid))),
             "cwd" => Ok(ProcGenFile::new(move || gen_cwd(pid))),
@@ -128,6 +129,7 @@ impl Inode for ProcPidDir {
             ("cmdline".into(), FileType::Regular),
             ("exe".into(), FileType::Regular),
             ("maps".into(), FileType::Regular),
+            ("smaps".into(), FileType::Regular),
             ("status".into(), FileType::Regular),
             ("stat".into(), FileType::Regular),
             ("cwd".into(), FileType::Regular),
@@ -333,6 +335,60 @@ fn gen_maps(pid: i32) -> Vec<u8> {
             "{:08x}-{:08x} {}{}{}p 00000000 00:00 0          {}\n",
             start, end, r, w, x, name
         ));
+    }
+    out.into_bytes()
+}
+
+fn gen_smaps(pid: i32) -> Vec<u8> {
+    let Some(task) = crate::task::task_by_pid(pid) else {
+        return Vec::new();
+    };
+    let ms = task.memory_set.lock();
+    let brk_base_vpn = ms.brk_base.0 >> crate::mm::address::PAGE_SIZE_BITS;
+    let mut areas: Vec<(usize, usize, crate::mm::memory_set::VmPerm, usize)> = ms
+        .areas
+        .iter()
+        .filter(|a| a.perm.contains(crate::mm::memory_set::VmPerm::U))
+        .map(|a| (a.vpn_start.0, a.vpn_end.0, a.perm, a.frames.len()))
+        .collect();
+    areas.sort_by_key(|&(s, _, _, _)| s);
+    let stack_start = areas.iter().map(|&(s, _, _, _)| s).max().unwrap_or(0);
+
+    let mut out = String::new();
+    for (s, e, p, frames) in &areas {
+        let start = s << crate::mm::address::PAGE_SIZE_BITS;
+        let end = e << crate::mm::address::PAGE_SIZE_BITS;
+        let r = if p.contains(crate::mm::memory_set::VmPerm::R) { 'r' } else { '-' };
+        let w = if p.contains(crate::mm::memory_set::VmPerm::W) { 'w' } else { '-' };
+        let x = if p.contains(crate::mm::memory_set::VmPerm::X) { 'x' } else { '-' };
+        let name = if *s == brk_base_vpn {
+            "[heap]"
+        } else if *s == stack_start {
+            "[stack]"
+        } else {
+            ""
+        };
+        let size_kb = ((e - s) << crate::mm::address::PAGE_SIZE_BITS) / 1024;
+        let rss_kb = (frames << crate::mm::address::PAGE_SIZE_BITS) / 1024;
+        out.push_str(&format!(
+            "{:08x}-{:08x} {}{}{}p 00000000 00:00 0          {}\n",
+            start, end, r, w, x, name
+        ));
+        out.push_str(&format!("Size:           {:>8} kB\n", size_kb));
+        out.push_str(&format!("Rss:            {:>8} kB\n", rss_kb));
+        out.push_str(&format!("Pss:            {:>8} kB\n", rss_kb));
+        out.push_str(&format!("Shared_Clean:   {:>8} kB\n", 0));
+        out.push_str(&format!("Shared_Dirty:   {:>8} kB\n", 0));
+        out.push_str(&format!("Private_Clean:  {:>8} kB\n", 0));
+        out.push_str(&format!("Private_Dirty:  {:>8} kB\n", rss_kb));
+        out.push_str(&format!("Referenced:     {:>8} kB\n", rss_kb));
+        out.push_str(&format!("Anonymous:      {:>8} kB\n", rss_kb));
+        out.push_str(&format!("AnonHugePages:  {:>8} kB\n", 0));
+        out.push_str(&format!("Swap:           {:>8} kB\n", 0));
+        out.push_str(&format!("KernelPageSize: {:>8} kB\n", 4));
+        out.push_str(&format!("MMUPageSize:    {:>8} kB\n", 4));
+        out.push_str(&format!("Locked:         {:>8} kB\n", 0));
+        out.push_str("VmFlags: rd wr mr mw me ac \n");
     }
     out.into_bytes()
 }

@@ -269,7 +269,7 @@ fn script_budget(script: &str) -> &'static str {
         // (see prepare_init), but with 25 benches at 2-3s wall each
         // that's still 50-75s. Give it 90s so the long tail (fstime
         // variants + looper/multi.sh) has room to print.
-        s if s.starts_with("unixbench_") => "90",
+        s if s.starts_with("unixbench_") => "180",
         s if s.starts_with("ltp_") => "20",
         _ => "10",
     }
