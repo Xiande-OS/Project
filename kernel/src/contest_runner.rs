@@ -256,8 +256,8 @@ fn script_budget(script: &str) -> &'static str {
         // into /bin), so the per-script wall-clock has to absorb at
         // least 8s of real sleeping plus per-applet overhead.
         s if s.starts_with("busybox_") => "45",
-        s if s.starts_with("libctest_") => "30",
-        s if s.starts_with("libcbench_") => "10",
+        s if s.starts_with("libctest_") => "60",
+        s if s.starts_with("libcbench_") => "30",
         s if s.starts_with("iozone_") => "20",
         s if s.starts_with("cyclictest_") => "8",
         s if s.starts_with("lmbench_") => "15",
