@@ -71,7 +71,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_FACCESSAT | nr::SYS_FACCESSAT2 => sys_faccessat(a0 as i32, a1, a2 as i32),
         nr::SYS_FCHMOD | nr::SYS_FCHMODAT | nr::SYS_FCHOWN | nr::SYS_FCHOWNAT => 0,
         nr::SYS_UMASK => 0o022,
-        nr::SYS_FCNTL => 0,
+        nr::SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2 as i32),
         nr::SYS_FSYNC => 0,
         nr::SYS_UTIMENSAT => 0,
         nr::SYS_EXIT | nr::SYS_EXIT_GROUP => sys_exit(a0 as i32),
@@ -462,6 +462,75 @@ fn sys_mkdirat(dfd: i32, path: usize, _mode: u32) -> isize {
     match parent.create(&name, FileType::Directory) {
         Ok(_) => 0,
         Err(e) => err_to_isize(e),
+    }
+}
+
+fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
+    const F_DUPFD: i32 = 0;
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const F_DUPFD_CLOEXEC: i32 = 1030;
+
+    let task = current_task();
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let file = match task.fd_table.lock().get(fd) {
+                Some(f) => f,
+                None => return EBADF,
+            };
+            let cloexec = cmd == F_DUPFD_CLOEXEC;
+            let min_fd = arg as usize;
+            // Find the smallest free fd >= min_fd and place the file there.
+            let mut t = task.fd_table.lock();
+            let mut tab = t.table.lock();
+            let mut c = t.cloexec.lock();
+            while tab.len() <= min_fd {
+                tab.push(None);
+                c.push(false);
+            }
+            let mut chosen = None;
+            for i in min_fd..tab.len() {
+                if tab[i].is_none() {
+                    chosen = Some(i);
+                    break;
+                }
+            }
+            let chosen = chosen.unwrap_or_else(|| {
+                let i = tab.len();
+                tab.push(None);
+                c.push(false);
+                i
+            });
+            tab[chosen] = Some(file);
+            if c.len() <= chosen {
+                c.resize(chosen + 1, false);
+            }
+            c[chosen] = cloexec;
+            chosen as isize
+        }
+        F_GETFD => {
+            let t = task.fd_table.lock();
+            let c = t.cloexec.lock();
+            if c.get(fd as usize).copied().unwrap_or(false) {
+                1
+            } else {
+                0
+            }
+        }
+        F_SETFD => {
+            let t = task.fd_table.lock();
+            let mut c = t.cloexec.lock();
+            while c.len() <= fd as usize {
+                c.push(false);
+            }
+            c[fd as usize] = arg & 1 != 0;
+            0
+        }
+        F_GETFL => 0,
+        F_SETFL => 0,
+        _ => 0,
     }
 }
 
