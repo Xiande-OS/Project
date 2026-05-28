@@ -2895,10 +2895,13 @@ fn sys_renameat2(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _
     if let Err(e) = old_parent.unlink(&old_name) {
         return err_to_isize(e);
     }
-    // Re-place under new location; works only on TmpfsDir.
+    // Re-place under new location. Works on TmpfsDir or Ext4Dir
+    // (the two dir flavours that back our writable overlay).
     if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
-        // If new name already exists, replace it.
         let _ = td.place_inode(&new_name, inode);
+        0
+    } else if let Some(ed) = crate::fs::ext4::downcast_dir(&new_parent) {
+        let _ = ed.place_inode(&new_name, inode);
         0
     } else {
         ENOENT
@@ -2920,6 +2923,11 @@ fn sys_linkat(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _fla
     };
     if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
         match td.place_inode(&new_name, src_inode) {
+            Ok(()) => 0,
+            Err(e) => err_to_isize(e),
+        }
+    } else if let Some(ed) = crate::fs::ext4::downcast_dir(&new_parent) {
+        match ed.place_inode(&new_name, src_inode) {
             Ok(()) => 0,
             Err(e) => err_to_isize(e),
         }

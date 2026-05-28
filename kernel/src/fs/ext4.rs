@@ -315,6 +315,17 @@ pub struct Ext4File {
 }
 
 impl Ext4Dir {
+    /// Insert (or replace) an inode under `name` in this directory's overlay.
+    /// Used by rename/link to attach an existing inode to a new parent that
+    /// lives in the ext4 overlay (rather than a tmpfs dir).
+    pub fn place_inode(&self, name: &str, inode: Arc<dyn Inode>) -> Result<()> {
+        let mut added = self.overlay_added.lock();
+        let mut deleted = self.overlay_deleted.lock();
+        deleted.remove(name);
+        added.insert(name.to_string(), inode);
+        Ok(())
+    }
+
     fn build_children(&self) -> Result<()> {
         let mut slot = self.children.lock();
         if slot.is_some() {
@@ -522,6 +533,22 @@ impl Inode for Ext4File {
         }
         slot.as_mut().unwrap().resize(len as usize, 0);
         Ok(())
+    }
+}
+
+/// Downcast `Arc<dyn Inode>` to `Arc<Ext4Dir>` if applicable. Used by
+/// rename/link to detect that the new parent is an ext4 overlay dir.
+pub fn downcast_dir(inode: &Arc<dyn Inode>) -> Option<Arc<Ext4Dir>> {
+    let any: &dyn Any = inode.as_any();
+    if any.is::<Ext4Dir>() {
+        // SAFETY: we just type-checked.
+        let raw = Arc::into_raw(inode.clone());
+        unsafe {
+            let typed = Arc::from_raw(raw as *const Ext4Dir);
+            Some(typed)
+        }
+    } else {
+        None
     }
 }
 
