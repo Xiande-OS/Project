@@ -2662,8 +2662,13 @@ fn sys_exit_group(status: i32) -> isize {
             .store((status & 0xff) << 8, core::sync::atomic::Ordering::Relaxed);
         crate::sync::futex::forget_task(s.pid);
         clear_child_tid(&s);
+        // The whole address space is being torn down (group exit); no need to
+        // queue stack reclaim here — dropping the MemorySet frees everything.
+        s.thread_stack_top.store(0, core::sync::atomic::Ordering::Relaxed);
         *s.state.lock() = crate::task::TaskState::Zombie;
-        println!("[exit_group] pid={} status={}", s.pid, status);
+        if syscall_trace_enabled() {
+            println!("[exit_group] pid={} status={}", s.pid, status);
+        }
     }
     // Now exit ourselves (group-exit: this is the leader's exit so the
     // parent gets SIGCHLD).
@@ -2685,8 +2690,30 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
     // Drop ourselves from any futex queue.
     crate::sync::futex::forget_task(task.pid);
 
+    // Defer reclamation of this thread's user stack. For genuine pthreads we
+    // recorded the stack pointer handed to clone; queue it on the (shared)
+    // address space so it is freed at the *next* thread creation in this
+    // address space. Deferring past exit is essential: a joining thread reads
+    // the exiting thread's descriptor (which lives in the same mapping as the
+    // stack) AFTER being woken, so we must not unmap it at exit time. By the
+    // time another thread is created, any pending join has completed (and
+    // musl has already munmap'd a joined stack itself, making our reclaim a
+    // no-op). The remaining never-joined stacks (e.g. b_pthread_create_serial1
+    // spawns 2500) are then reclaimed instead of piling up as thousands of
+    // VmAreas that make /proc/self/smaps reads quadratic.
+    let stk = task
+        .thread_stack_top
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if stk != 0 {
+        task.memory_set.lock().queue_stack_reclaim(stk);
+        task.thread_stack_top
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+
     *task.state.lock() = crate::task::TaskState::Zombie;
-    println!("[exit] pid={} status={}", task.pid, status);
+    if syscall_trace_enabled() {
+        println!("[exit] pid={} status={}", task.pid, status);
+    }
 
     // CLONE_VFORK: if our parent was vfork-waiting for us, unblock them.
     // (Both execve and exit are valid termination points for the wait.)
