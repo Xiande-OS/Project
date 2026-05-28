@@ -116,6 +116,19 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_MLOCK | nr::SYS_MUNLOCK | nr::SYS_MLOCKALL | nr::SYS_MUNLOCKALL => 0,
         nr::SYS_MREMAP => sys_mremap(a0, a1, a2, a3 as i32, a4),
         nr::SYS_CLOSE_RANGE => sys_close_range(a0 as u32, a1 as u32, a2 as u32),
+        nr::SYS_STATFS => sys_statfs(a0, a1),
+        nr::SYS_FSTATFS => sys_fstatfs(a0 as i32, a1),
+        nr::SYS_PREADV => sys_preadv(a0 as i32, a1, a2, a3 as u64),
+        nr::SYS_PWRITEV => sys_pwritev(a0 as i32, a1, a2, a3 as u64),
+        nr::SYS_TIMERFD_CREATE => sys_timerfd_create(a0 as i32, a1 as i32),
+        nr::SYS_TIMERFD_SETTIME => sys_timerfd_settime(a0 as i32, a1 as i32, a2, a3),
+        nr::SYS_TIMERFD_GETTIME => sys_timerfd_gettime(a0 as i32, a1),
+        nr::SYS_PRCTL => sys_prctl(a0 as i32, a1, a2, a3, a4),
+        nr::SYS_CAPGET | nr::SYS_CAPSET => 0,
+        nr::SYS_SCHED_GETAFFINITY => sys_sched_getaffinity(a0 as i32, a1, a2),
+        nr::SYS_SCHED_SETAFFINITY => 0,
+        nr::SYS_SCHED_GETPARAM | nr::SYS_SCHED_GETSCHEDULER => 0,
+        nr::SYS_SCHED_SETSCHEDULER => 0,
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         nr::SYS_GETTIMEOFDAY => sys_gettimeofday(a0),
         nr::SYS_SCHED_YIELD => 0,
@@ -779,6 +792,225 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
         F_SETFL => 0,
         _ => 0,
     }
+}
+
+// ---------- statfs / preadv-pwritev / timerfd / prctl / sched_getaffinity ----------
+
+#[repr(C)]
+#[derive(Default)]
+struct Statfs {
+    f_type: u64,
+    f_bsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: u64,
+    f_frsize: u64,
+    f_flags: u64,
+    f_spare: [u64; 4],
+}
+
+fn statfs_for(_inode: &Arc<dyn Inode>) -> Statfs {
+    let mut s = Statfs::default();
+    s.f_type = 0x01021994; // TMPFS_MAGIC
+    s.f_bsize = 4096;
+    let (total, free) = crate::mm::frame_stats();
+    s.f_blocks = total as u64;
+    s.f_bfree = free as u64;
+    s.f_bavail = free as u64;
+    s.f_files = 1_000_000;
+    s.f_ffree = 1_000_000;
+    s.f_namelen = 255;
+    s.f_frsize = 4096;
+    s
+}
+
+fn sys_statfs(path: usize, buf: usize) -> isize {
+    let Some(p) = copy_path(path) else { return EFAULT };
+    let Some(i) = resolve_at(AT_FDCWD, &p) else { return ENOENT };
+    let s = statfs_for(&i);
+    write_struct(buf, &s)
+}
+
+fn sys_fstatfs(fd: i32, buf: usize) -> isize {
+    let task = current_task();
+    let Some(f) = task.fd_table.lock().get(fd) else { return EBADF };
+    let s = statfs_for(&f.inode);
+    write_struct(buf, &s)
+}
+
+fn sys_preadv(fd: i32, iov: usize, count: usize, off: u64) -> isize {
+    if count == 0 { return 0; }
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    let Some(iovs_bytes) = task.copy_in_bytes(iov, count * core::mem::size_of::<IoVec>()) else { return EFAULT };
+    let iovs = unsafe { core::slice::from_raw_parts(iovs_bytes.as_ptr() as *const IoVec, count) };
+    let mut total = 0isize;
+    let mut cur_off = off;
+    for v in iovs {
+        if v.len == 0 { continue; }
+        let mut tmp = alloc::vec![0u8; v.len];
+        match file.inode.read_at(cur_off, &mut tmp) {
+            Ok(n) => {
+                if n == 0 { break; }
+                if task.copy_out_bytes(v.base, &tmp[..n]).is_none() { return EFAULT; }
+                total += n as isize;
+                cur_off += n as u64;
+                if n < v.len { break; }
+            }
+            Err(e) => { if total == 0 { return err_to_isize(e); } else { break; } }
+        }
+    }
+    total
+}
+
+fn sys_pwritev(fd: i32, iov: usize, count: usize, off: u64) -> isize {
+    if count == 0 { return 0; }
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    let Some(iovs_bytes) = task.copy_in_bytes(iov, count * core::mem::size_of::<IoVec>()) else { return EFAULT };
+    let iovs = unsafe { core::slice::from_raw_parts(iovs_bytes.as_ptr() as *const IoVec, count) };
+    let mut total = 0isize;
+    let mut cur_off = off;
+    for v in iovs {
+        if v.len == 0 { continue; }
+        let Some(bytes) = task.copy_in_bytes(v.base, v.len) else { return EFAULT };
+        match file.inode.write_at(cur_off, &bytes) {
+            Ok(n) => { total += n as isize; cur_off += n as u64; if n < v.len { break; } }
+            Err(e) => { if total == 0 { return err_to_isize(e); } else { break; } }
+        }
+    }
+    total
+}
+
+struct TimerFd {
+    expiry: SpinMutex<u64>,
+    interval_ticks: SpinMutex<u64>,
+}
+
+impl crate::fs::Inode for TimerFd {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn kind(&self) -> crate::fs::FileType { crate::fs::FileType::Pipe }
+    fn size(&self) -> u64 { 8 }
+    fn read_at(&self, _off: u64, buf: &mut [u8]) -> crate::fs::Result<usize> {
+        if buf.len() < 8 { return Err(crate::fs::EINVAL); }
+        let exp_at = *self.expiry.lock();
+        if exp_at == 0 { return Ok(0); }
+        while riscv::register::time::read64() < exp_at {
+            core::hint::spin_loop();
+        }
+        let interval = *self.interval_ticks.lock();
+        let count: u64 = if interval == 0 {
+            *self.expiry.lock() = 0;
+            1
+        } else {
+            let now = riscv::register::time::read64();
+            let n = ((now - exp_at) / interval) + 1;
+            *self.expiry.lock() = exp_at + n * interval;
+            n
+        };
+        buf[..8].copy_from_slice(&count.to_le_bytes());
+        Ok(8)
+    }
+}
+
+fn sys_timerfd_create(_clockid: i32, flags: i32) -> isize {
+    const TFD_CLOEXEC: i32 = 0o2000000;
+    let tf = Arc::new(TimerFd {
+        expiry: SpinMutex::new(0),
+        interval_ticks: SpinMutex::new(0),
+    });
+    let file = Arc::new(crate::fs::File::from_inode(tf, true, false, false));
+    match current_task().fd_table.lock().alloc(file, flags & TFD_CLOEXEC != 0) {
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+fn parse_timespec(buf: &[u8]) -> (u64, u64) {
+    let sec = i64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8])) as u64;
+    let ns = i64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8])) as u64;
+    (sec, ns)
+}
+
+fn ts_to_ticks(sec: u64, ns: u64) -> u64 {
+    sec.saturating_mul(10_000_000) + ns / 100
+}
+
+fn sys_timerfd_settime(fd: i32, _flags: i32, new_value: usize, old_value: usize) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    let tf = match file.inode.as_any().downcast_ref::<TimerFd>() { Some(t) => t, None => return EINVAL };
+    let Some(buf) = task.copy_in_bytes(new_value, 32) else { return EFAULT };
+    let (interval_s, interval_ns) = parse_timespec(&buf[0..16]);
+    let (value_s, value_ns) = parse_timespec(&buf[16..32]);
+
+    if old_value != 0 {
+        let zero = [0u8; 32];
+        let _ = task.copy_out_bytes(old_value, &zero);
+    }
+
+    let interval = ts_to_ticks(interval_s, interval_ns);
+    let value = ts_to_ticks(value_s, value_ns);
+    let now = riscv::register::time::read64();
+    *tf.expiry.lock() = if value == 0 { 0 } else { now + value };
+    *tf.interval_ticks.lock() = interval;
+    0
+}
+
+fn sys_timerfd_gettime(fd: i32, cur: usize) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    let Some(_) = file.inode.as_any().downcast_ref::<TimerFd>() else { return EINVAL };
+    let zero = [0u8; 32];
+    if task.copy_out_bytes(cur, &zero).is_none() { return EFAULT; }
+    0
+}
+
+fn sys_prctl(option: i32, a2: usize, _a3: usize, _a4: usize, _a5: usize) -> isize {
+    const PR_SET_NAME: i32 = 15;
+    const PR_GET_NAME: i32 = 16;
+    let task = current_task();
+    match option {
+        PR_SET_NAME => {
+            if let Some(bytes) = task.copy_in_bytes(a2, 16) {
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                let mut cmd = task.cmdline.lock();
+                let mut parts: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+                    cmd.split(|&b| b == 0).map(|s| s.to_vec()).collect();
+                if parts.is_empty() { parts.push(alloc::vec::Vec::new()); }
+                parts[0] = bytes[..end].to_vec();
+                let mut new = alloc::vec::Vec::new();
+                for (i, p) in parts.iter().enumerate() {
+                    if i > 0 { new.push(0); }
+                    new.extend_from_slice(p);
+                }
+                *cmd = new;
+            }
+            0
+        }
+        PR_GET_NAME => {
+            let cmd = task.cmdline.lock();
+            let name: alloc::vec::Vec<u8> = cmd.iter().take_while(|&&b| b != 0).cloned().collect();
+            let mut buf = [0u8; 16];
+            let n = core::cmp::min(15, name.len());
+            buf[..n].copy_from_slice(&name[..n]);
+            if task.copy_out_bytes(a2, &buf).is_none() { return EFAULT; }
+            0
+        }
+        _ => 0,
+    }
+}
+
+fn sys_sched_getaffinity(_pid: i32, _cpusetsize: usize, mask: usize) -> isize {
+    let task = current_task();
+    let mut buf = alloc::vec![0u8; 128];
+    buf[0] = 0x1;
+    if task.copy_out_bytes(mask, &buf).is_none() { return EFAULT; }
+    128
 }
 
 // ---------- sendfile / copy_file_range / memfd_create / close_range / mremap ----------
