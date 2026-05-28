@@ -214,6 +214,9 @@ pub fn try_connect(dst_port: u16, src_port_hint: u16) -> Option<Arc<LoopbackEnd>
     };
     let (client, server) = LoopbackEnd::pair(local, dst_port);
     listener.pending.lock().push_back(server);
+    // A server parked in accept()/select() on this listener needs to wake
+    // so it can pick up the freshly-queued connection.
+    crate::task::wake_socket_waiters();
     Some(client)
 }
 

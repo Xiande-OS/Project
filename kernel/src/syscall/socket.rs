@@ -696,9 +696,31 @@ fn write_endpoint(addr_ptr: usize, len_ptr: usize, sa: SockAddrIn) -> isize {
 }
 
 pub fn sys_getsockname(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
-    let res = with_socket(fd, |s| match s.kind {
-        SocketKind::Tcp => net::tcp_local_endpoint(s.handle),
-        SocketKind::Udp => net::udp_local_endpoint(s.handle),
+    let res = with_socket(fd, |s| {
+        // Loopback sockets bypass smoltcp, so the smoltcp handle has no
+        // local endpoint. Use the recorded bound/local address instead —
+        // iperf3 calls getsockname on the data socket and aborts on a
+        // bogus result.
+        {
+            let st = s.state.lock();
+            if st.loopback.is_some() || st.udp_end.is_some() {
+                if let Some(b) = st.bound {
+                    let addr = if b.addr.0 == [0, 0, 0, 0] {
+                        Ipv4Address::new(127, 0, 0, 1)
+                    } else {
+                        b.addr
+                    };
+                    return Some((addr, b.port));
+                }
+                if let Some(lb) = st.loopback.as_ref() {
+                    return Some((Ipv4Address::new(127, 0, 0, 1), lb.local_port));
+                }
+            }
+        }
+        match s.kind {
+            SocketKind::Tcp => net::tcp_local_endpoint(s.handle),
+            SocketKind::Udp => net::udp_local_endpoint(s.handle),
+        }
     });
     match res {
         Ok(Some((a, p))) => write_endpoint(addr_ptr, len_ptr, SockAddrIn { addr: a, port: p }),
@@ -708,9 +730,26 @@ pub fn sys_getsockname(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
 }
 
 pub fn sys_getpeername(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
-    let res = with_socket(fd, |s| match s.kind {
-        SocketKind::Tcp => net::tcp_remote_endpoint(s.handle),
-        SocketKind::Udp => s.state.lock().peer.map(|p| (p.addr, p.port)),
+    let res = with_socket(fd, |s| {
+        // For loopback (and UDP) sockets the peer lives in our recorded
+        // state, not in smoltcp. iperf3's data plane calls getpeername
+        // right after connect(127.0.0.1) and treats ENOTCONN as a fatal
+        // "Socket not connected".
+        {
+            let st = s.state.lock();
+            if st.loopback.is_some() {
+                if let Some(p) = st.peer {
+                    return Some((p.addr, p.port));
+                }
+                if let Some(lb) = st.loopback.as_ref() {
+                    return Some((Ipv4Address::new(127, 0, 0, 1), lb.remote_port));
+                }
+            }
+        }
+        match s.kind {
+            SocketKind::Tcp => net::tcp_remote_endpoint(s.handle),
+            SocketKind::Udp => s.state.lock().peer.map(|p| (p.addr, p.port)),
+        }
     });
     match res {
         Ok(Some((a, p))) => write_endpoint(addr_ptr, len_ptr, SockAddrIn { addr: a, port: p }),

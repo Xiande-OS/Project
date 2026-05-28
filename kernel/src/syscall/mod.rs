@@ -714,6 +714,21 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         return 0;
     }
     let task = current_task();
+    // A non-NULL timeout pointer to {0,0} means "poll, don't block".
+    // Honor it so callers (iperf3) that poll for instant readiness aren't
+    // parked forever waiting on a peer that is itself polling.
+    let zero_timeout = if timeout != 0 {
+        match task.copy_in_bytes(timeout, 16) {
+            Some(b) => {
+                let secs = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
+                let nsecs = u64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
+                secs == 0 && nsecs == 0
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
     let size = nfds * core::mem::size_of::<PollFd>();
     let Some(raw) = task.copy_in_bytes(fds, size) else {
         return EFAULT;
@@ -777,8 +792,12 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
     }
     // If nothing was ready, yield so peers can produce data. The poll
     // (selectish) caller will see EAGAIN-via-zero and rerun us via the
-    // scheduler's socket-waiter wake path.
-    if ready == 0 && !other_indices.is_empty() && console_indices.is_empty() {
+    // scheduler's socket-waiter wake path. A zero timeout (poll) must
+    // return immediately with 0 instead of parking.
+    if ready == 0 && !other_indices.is_empty() && console_indices.is_empty() && !zero_timeout {
+        // Nudge any peer parked on the loopback pipes before sleeping so
+        // we don't deadlock against a peer that's also blocked.
+        crate::task::wake_socket_waiters();
         crate::task::mark_socket_waiter(task.pid);
         *task.state.lock() = crate::task::TaskState::Waiting;
         unsafe {
@@ -1739,15 +1758,17 @@ fn fd_is_readable(file: &Arc<crate::fs::File>) -> bool {
         if let Some(lb) = st.loopback.as_ref() {
             return lb.can_recv() || lb.peer_eof();
         }
-        if let Some(ue) = st.udp_end.as_ref() {
-            if !ue.incoming.lock().is_empty() {
-                return true;
-            }
-        }
         if let Some(l) = st.listener.as_ref() {
-            if !l.pending.lock().is_empty() {
-                return true;
-            }
+            // A loopback listener is "readable" (acceptable) iff a peer has
+            // queued a pending connection. It must NOT fall through to the
+            // smoltcp check below: a Listen-state smoltcp socket reports
+            // !may_recv == readable, which would make iperf3's server spin
+            // in accept() and never read the data socket.
+            return !l.pending.lock().is_empty();
+        }
+        if let Some(ue) = st.udp_end.as_ref() {
+            // A loopback-bound UDP socket only sees datagrams via its queue.
+            return !ue.incoming.lock().is_empty();
         }
         drop(st);
         match sock.kind {
@@ -1790,6 +1811,23 @@ fn sys_pselect6(
         return 0;
     }
     let task = current_task();
+    // A zero timeout means "poll, never block" (iperf3's server loop uses
+    // this). Detect it so we return the immediate readiness count rather
+    // than parking the task forever (which deadlocks the loopback flow:
+    // the server polls with {sec:0,nsec:0} expecting an instant 0 so its
+    // state machine can advance to TEST_START).
+    let zero_timeout = if _timeout != 0 {
+        match task.copy_in_bytes(_timeout, 16) {
+            Some(b) => {
+                let secs = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
+                let nsecs = u64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
+                secs == 0 && nsecs == 0
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
     let bytes = (nfds + 7) / 8;
     let read_set = |addr: usize| -> alloc::vec::Vec<u8> {
         if addr == 0 { alloc::vec![0u8; bytes] }
@@ -1836,7 +1874,8 @@ fn sys_pselect6(
     // Block if nothing is ready and we were asked to wait. The console
     // path uses its dedicated peek+block; for socket-only select we mark
     // ourselves Waiting + rewind sepc so the scheduler can advance peers.
-    if ready == 0 && !readers.is_empty() {
+    // A zero timeout (poll) must never block: return the immediate count.
+    if ready == 0 && !readers.is_empty() && !zero_timeout {
         let mut console_in_set = false;
         for (_, f) in &readers {
             if f.is_console {
@@ -1854,6 +1893,11 @@ fn sys_pselect6(
                 }
             }
         } else {
+            // Wake any peer parked on the loopback pipes before we sleep:
+            // the iperf3 control flow has the server poll (zero timeout)
+            // and the client block here on NULL timeout; nudging peers
+            // prevents a lost-wakeup deadlock where neither side runs.
+            crate::task::wake_socket_waiters();
             // Park briefly: the same block_and_retry pattern used by
             // socket reads. The scheduler picks another runnable task
             // (often the peer that needs to send) and reattempts.
