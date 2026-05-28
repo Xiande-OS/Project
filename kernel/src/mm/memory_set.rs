@@ -332,9 +332,18 @@ impl MemorySet {
         Some(new_ms)
     }
 
-    /// Find the area that contains `vpn` (for fault handlers, brk).
-    pub fn find_area_mut(&mut self, vpn: VirtPageNum) -> Option<&mut VmArea> {
-        self.areas.iter_mut().find(|a| a.contains(vpn))
+    /// Release every user frame (areas) back to the physical allocator,
+    /// keeping the page-table root intact. Called when a task exits so a
+    /// zombie no longer pins ~hundreds of frames until it's wait4'd.
+    /// Without this, a fork-storm (unixbench SHELL16) piles up zombies
+    /// faster than the parent reaps them and the frame pool is exhausted,
+    /// panicking some later alloc_frame().expect(). The page table root
+    /// stays allocated (satp may still point here until the scheduler
+    /// switches away); its stale PTEs are harmless because the dead task
+    /// never re-enters user mode.
+    pub fn free_user_frames(&mut self) {
+        // Dropping the Frame values returns them to the allocator.
+        self.areas.clear();
     }
 
     /// Grow the brk segment to `new_brk`. Returns the new program-break.

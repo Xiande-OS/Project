@@ -2697,6 +2697,18 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
         task.fd_table.lock().close_all();
     }
 
+    // Free the user address space now (not at reap) so a zombie stops
+    // pinning hundreds of frames while it waits to be wait4'd. Under a
+    // fork-storm (unixbench SHELL16) the parent reaps slower than
+    // children pile up; without eager teardown the frame pool drains
+    // and a later alloc_frame() panics. Only free when no live CLONE_VM
+    // thread shares this address space (strong_count == 1). The page
+    // table root stays (satp is still ours until the scheduler switches)
+    // — only the user data frames are released.
+    if alloc::sync::Arc::strong_count(&task.memory_set) == 1 {
+        task.memory_set.lock().free_user_frames();
+    }
+
     // CLONE_VFORK: if our parent was vfork-waiting for us, unblock them.
     // (Both execve and exit are valid termination points for the wait.)
     crate::task::wake_vfork_parent_of(task.pid);
