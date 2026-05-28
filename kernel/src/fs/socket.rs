@@ -154,13 +154,25 @@ impl Inode for Socket {
         // Best-effort non-blocking read. The syscall layer (recvfrom) is
         // responsible for the blocking dance — direct file `read()` is
         // for the SYS_READ shim path.
-        // Loopback fast path (set by sys_connect / sys_accept).
+        // Loopback TCP fast path (set by sys_connect / sys_accept).
         if let Some(lb) = self.state.lock().loopback.clone() {
             let n = lb.recv(buf);
             if n == 0 && lb.peer_eof() {
                 return Ok(0);
             }
             return Ok(n);
+        }
+        // Loopback UDP fast path: pop from our incoming queue.
+        if let Some(ue) = self.state.lock().udp_end.clone() {
+            let dg = ue.incoming.lock().pop_front();
+            if let Some(dg) = dg {
+                let n = core::cmp::min(buf.len(), dg.data.len());
+                buf[..n].copy_from_slice(&dg.data[..n]);
+                return Ok(n);
+            }
+            // No datagram available; return EAGAIN-equivalent through the
+            // VFS error path the same way smoltcp would.
+            return Err(super::EAGAIN);
         }
         net::poll();
         match self.kind {
@@ -172,7 +184,7 @@ impl Inode for Socket {
         }
     }
     fn write_at(&self, _off: u64, buf: &[u8]) -> Result<usize> {
-        // Loopback fast path.
+        // Loopback TCP fast path.
         if let Some(lb) = self.state.lock().loopback.clone() {
             return Ok(lb.send(buf));
         }
@@ -184,13 +196,37 @@ impl Inode for Socket {
             }
             SocketKind::Udp => {
                 let peer = self.state.lock().peer;
-                if let Some(p) = peer {
-                    let r = net::udp_send(self.handle, buf, p.addr, p.port);
-                    net::poll();
-                    r
-                } else {
-                    Err(EINVAL)
+                let Some(p) = peer else {
+                    return Err(EINVAL);
+                };
+                // Loopback UDP fast path: deliver into the in-kernel registry
+                // instead of letting smoltcp drop the packet (no 127.0.0.1
+                // route on the smoltcp interface).
+                if p.addr.0[0] == 127 || p.addr.0 == [0, 0, 0, 0] {
+                    let mut st = self.state.lock();
+                    let src_port = if let Some(ue) = st.udp_end.as_ref() {
+                        ue.port
+                    } else {
+                        let port = st
+                            .bound
+                            .map(|b| b.port)
+                            .filter(|p| *p != 0)
+                            .unwrap_or_else(crate::net::loopback::alloc_ephemeral);
+                        let ue = crate::net::loopback::register_udp(port);
+                        st.udp_end = Some(ue);
+                        st.bound = Some(SockAddrIn {
+                            addr: Ipv4Address::new(127, 0, 0, 1),
+                            port,
+                        });
+                        port
+                    };
+                    drop(st);
+                    let _ = crate::net::loopback::udp_deliver(p.port, src_port, buf);
+                    return Ok(buf.len());
                 }
+                let r = net::udp_send(self.handle, buf, p.addr, p.port);
+                net::poll();
+                r
             }
         }
     }
