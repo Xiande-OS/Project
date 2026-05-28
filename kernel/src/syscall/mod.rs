@@ -401,15 +401,27 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             let lp = sock.state.lock().loopback.clone();
             if let Some(lp) = lp {
                 if !lp.peer_eof() && !lp.can_recv() {
-                    let nonblock = sock.state.lock().nonblock;
+                    let st = sock.state.lock();
+                    let nonblock = st.nonblock || st.recv_timeout;
+                    drop(st);
                     if nonblock {
                         return -11;
                     }
+                    crate::task::wake_socket_waiters();
                     crate::task::mark_socket_waiter(task.pid);
                     *task.state.lock() = crate::task::TaskState::Waiting;
                     unsafe {
                         let tf = task.tf_ptr();
                         (*tf).sepc -= 4;
+                    }
+                    // Re-check after parking: a peer send() between our
+                    // can_recv() test and the Waiting store would otherwise
+                    // fire wake_socket_waiters() while we were still Running
+                    // (a no-op), leaving us asleep forever. Since send()
+                    // writes the pipe before waking, re-reading here closes
+                    // that lost-wakeup window.
+                    if lp.can_recv() || lp.peer_eof() {
+                        *task.state.lock() = crate::task::TaskState::Ready;
                     }
                     return -11;
                 }
@@ -714,6 +726,21 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         return 0;
     }
     let task = current_task();
+    // A non-NULL timeout pointer to {0,0} means "poll, don't block".
+    // Honor it so callers (iperf3) that poll for instant readiness aren't
+    // parked forever waiting on a peer that is itself polling.
+    let zero_timeout = if timeout != 0 {
+        match task.copy_in_bytes(timeout, 16) {
+            Some(b) => {
+                let secs = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
+                let nsecs = u64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
+                secs == 0 && nsecs == 0
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
     let size = nfds * core::mem::size_of::<PollFd>();
     let Some(raw) = task.copy_in_bytes(fds, size) else {
         return EFAULT;
@@ -777,13 +804,25 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
     }
     // If nothing was ready, yield so peers can produce data. The poll
     // (selectish) caller will see EAGAIN-via-zero and rerun us via the
-    // scheduler's socket-waiter wake path.
-    if ready == 0 && !other_indices.is_empty() && console_indices.is_empty() {
+    // scheduler's socket-waiter wake path. A zero timeout (poll) must
+    // return immediately with 0 instead of parking.
+    if ready == 0 && !other_indices.is_empty() && console_indices.is_empty() && !zero_timeout {
+        // Nudge any peer parked on the loopback pipes before sleeping so
+        // we don't deadlock against a peer that's also blocked.
+        crate::task::wake_socket_waiters();
         crate::task::mark_socket_waiter(task.pid);
         *task.state.lock() = crate::task::TaskState::Waiting;
         unsafe {
             let tf = task.tf_ptr();
             (*tf).sepc -= 4;
+        }
+        // Lost-wakeup guard (see sys_pselect6): re-scan after parking so a
+        // datagram/byte that landed during the park isn't missed.
+        for (_, f) in &other_indices {
+            if fd_is_readable(f) {
+                *task.state.lock() = crate::task::TaskState::Ready;
+                break;
+            }
         }
         // Don't write polls back; the retry will redo the computation.
         return -11;
@@ -1293,8 +1332,28 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
             c[fd as usize] = arg & 1 != 0;
             0
         }
-        F_GETFL => 0,
-        F_SETFL => 0,
+        F_GETFL => {
+            // Report O_NONBLOCK so userland (iperf3) sees the flag it set.
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            if let Some(sock) = file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>() {
+                if sock.state.lock().nonblock {
+                    return O_NONBLOCK as isize;
+                }
+            }
+            0
+        }
+        F_SETFL => {
+            // Honor O_NONBLOCK on sockets: iperf3/netperf flip their data
+            // sockets non-blocking via fcntl and then rely on read()/write()
+            // returning EAGAIN instead of blocking. Ignoring it made the
+            // loopback read path park the task forever after a test's data
+            // phase ended.
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            if let Some(sock) = file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>() {
+                sock.state.lock().nonblock = (arg & O_NONBLOCK) != 0;
+            }
+            0
+        }
         // F_GETLK=5, F_SETLK=6, F_SETLKW=7. arg is `struct flock *`.
         5 | 6 | 7 => {
             let task = current_task();
@@ -1739,15 +1798,17 @@ fn fd_is_readable(file: &Arc<crate::fs::File>) -> bool {
         if let Some(lb) = st.loopback.as_ref() {
             return lb.can_recv() || lb.peer_eof();
         }
-        if let Some(ue) = st.udp_end.as_ref() {
-            if !ue.incoming.lock().is_empty() {
-                return true;
-            }
-        }
         if let Some(l) = st.listener.as_ref() {
-            if !l.pending.lock().is_empty() {
-                return true;
-            }
+            // A loopback listener is "readable" (acceptable) iff a peer has
+            // queued a pending connection. It must NOT fall through to the
+            // smoltcp check below: a Listen-state smoltcp socket reports
+            // !may_recv == readable, which would make iperf3's server spin
+            // in accept() and never read the data socket.
+            return !l.pending.lock().is_empty();
+        }
+        if let Some(ue) = st.udp_end.as_ref() {
+            // A loopback-bound UDP socket only sees datagrams via its queue.
+            return !ue.incoming.lock().is_empty();
         }
         drop(st);
         match sock.kind {
@@ -1790,6 +1851,23 @@ fn sys_pselect6(
         return 0;
     }
     let task = current_task();
+    // A zero timeout means "poll, never block" (iperf3's server loop uses
+    // this). Detect it so we return the immediate readiness count rather
+    // than parking the task forever (which deadlocks the loopback flow:
+    // the server polls with {sec:0,nsec:0} expecting an instant 0 so its
+    // state machine can advance to TEST_START).
+    let zero_timeout = if _timeout != 0 {
+        match task.copy_in_bytes(_timeout, 16) {
+            Some(b) => {
+                let secs = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
+                let nsecs = u64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
+                secs == 0 && nsecs == 0
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
     let bytes = (nfds + 7) / 8;
     let read_set = |addr: usize| -> alloc::vec::Vec<u8> {
         if addr == 0 { alloc::vec![0u8; bytes] }
@@ -1836,7 +1914,8 @@ fn sys_pselect6(
     // Block if nothing is ready and we were asked to wait. The console
     // path uses its dedicated peek+block; for socket-only select we mark
     // ourselves Waiting + rewind sepc so the scheduler can advance peers.
-    if ready == 0 && !readers.is_empty() {
+    // A zero timeout (poll) must never block: return the immediate count.
+    if ready == 0 && !readers.is_empty() && !zero_timeout {
         let mut console_in_set = false;
         for (_, f) in &readers {
             if f.is_console {
@@ -1854,6 +1933,11 @@ fn sys_pselect6(
                 }
             }
         } else {
+            // Wake any peer parked on the loopback pipes before we sleep:
+            // the iperf3 control flow has the server poll (zero timeout)
+            // and the client block here on NULL timeout; nudging peers
+            // prevents a lost-wakeup deadlock where neither side runs.
+            crate::task::wake_socket_waiters();
             // Park briefly: the same block_and_retry pattern used by
             // socket reads. The scheduler picks another runnable task
             // (often the peer that needs to send) and reattempts.
@@ -1862,6 +1946,20 @@ fn sys_pselect6(
             unsafe {
                 let tf = task.tf_ptr();
                 (*tf).sepc -= 4;
+            }
+            // Lost-wakeup guard: a peer that makes one of our read fds
+            // ready between the scan above and the Waiting store would fire
+            // wake_socket_waiters() while we were still Running (a no-op).
+            // Re-scan after parking; flip back to Ready if anything is now
+            // readable. This is what the UDP server (which selects on its
+            // datagram fd with no write set) relies on. Only reached when
+            // ready==0, so it never affects a caller whose write set kept
+            // it runnable.
+            for (_, f) in &readers {
+                if fd_is_readable(f) {
+                    *task.state.lock() = crate::task::TaskState::Ready;
+                    break;
+                }
             }
             return -11; // EAGAIN — caller will be retried by scheduler.
         }

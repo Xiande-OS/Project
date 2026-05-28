@@ -104,6 +104,13 @@ impl LoopbackEnd {
         for slot in buf.iter_mut().take(n) {
             *slot = q.pop_front().unwrap();
         }
+        let drained = !q.is_empty() || n > 0;
+        drop(q);
+        // Draining our incoming queue frees space in the peer's outgoing
+        // queue; a peer blocked in send() on a full pipe must be woken.
+        if drained && n > 0 {
+            crate::task::wake_socket_waiters();
+        }
         n
     }
 
@@ -164,7 +171,12 @@ pub struct UdpDatagram {
 /// Global registries. A single mutex per kind keeps the bookkeeping
 /// simple — the critical sections are short.
 static TCP_LISTENERS: Mutex<BTreeMap<u16, Weak<TcpListener>>> = Mutex::new(BTreeMap::new());
-static UDP_BINDS: Mutex<BTreeMap<u16, Weak<UdpEnd>>> = Mutex::new(BTreeMap::new());
+/// Multiple UDP sockets can bind the same port (iperf3's UDP server keeps a
+/// wildcard listener *and* a per-flow socket on the test port). We deliver a
+/// datagram to every live end on that port so whichever socket the app reads
+/// from receives it — keeping only the last would silently drop data into the
+/// wrong queue.
+static UDP_BINDS: Mutex<BTreeMap<u16, Vec<Weak<UdpEnd>>>> = Mutex::new(BTreeMap::new());
 
 /// Source-port allocator for connect/sendto when the socket isn't bound.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(40000);
@@ -214,6 +226,9 @@ pub fn try_connect(dst_port: u16, src_port_hint: u16) -> Option<Arc<LoopbackEnd>
     };
     let (client, server) = LoopbackEnd::pair(local, dst_port);
     listener.pending.lock().push_back(server);
+    // A server parked in accept()/select() on this listener needs to wake
+    // so it can pick up the freshly-queued connection.
+    crate::task::wake_socket_waiters();
     Some(client)
 }
 
@@ -224,37 +239,65 @@ pub fn register_udp(port: u16) -> Arc<UdpEnd> {
         port,
         incoming: Mutex::new(VecDeque::new()),
     });
-    UDP_BINDS.lock().insert(port, Arc::downgrade(&e));
+    let mut m = UDP_BINDS.lock();
+    let v = m.entry(port).or_default();
+    // Drop any dead weak refs while we're here.
+    v.retain(|w| w.strong_count() > 0);
+    v.push(Arc::downgrade(&e));
     e
 }
 
+/// Any one live end bound to `port` (used for getsockname-style lookups).
 pub fn find_udp(port: u16) -> Option<Arc<UdpEnd>> {
     let mut m = UDP_BINDS.lock();
-    let entry = m.get(&port)?.upgrade();
-    if entry.is_none() {
+    let v = m.get_mut(&port)?;
+    v.retain(|w| w.strong_count() > 0);
+    if v.is_empty() {
         m.remove(&port);
+        return None;
     }
-    entry
+    v.iter().find_map(|w| w.upgrade())
 }
 
 pub fn unregister_udp(port: u16) {
-    UDP_BINDS.lock().remove(&port);
+    let mut m = UDP_BINDS.lock();
+    if let Some(v) = m.get_mut(&port) {
+        v.retain(|w| w.strong_count() > 0);
+        if v.is_empty() {
+            m.remove(&port);
+        }
+    }
 }
 
-/// Deliver a datagram from `src_port` to `dst_port`. Returns true if a
-/// receiver existed (so the sender can decide whether to error).
+/// Deliver a datagram from `src_port` to `dst_port`. Returns true if at
+/// least one receiver existed. Delivers to *every* live socket bound to
+/// the port: iperf3's UDP server keeps two ends on the test port and reads
+/// from whichever it picked, so a single-target delivery races into the
+/// wrong queue and the data vanishes.
 pub fn udp_deliver(dst_port: u16, src_port: u16, data: &[u8]) -> bool {
-    let Some(dst) = find_udp(dst_port) else {
-        // Auto-bind on first deliver: we treat 127.0.0.1 like a single host
-        // where any port can sink datagrams (matches the way iperf3 -u runs
-        // its server on a fixed port). Returning false would make sendto
-        // fail and break unbound `iperf3 -c -u`.
-        return false;
+    let ends: Vec<Arc<UdpEnd>> = {
+        let mut m = UDP_BINDS.lock();
+        let Some(v) = m.get_mut(&dst_port) else {
+            // No receiver bound. We treat 127.0.0.1 as a single host where
+            // unbound ports silently sink datagrams (UDP is best-effort).
+            return false;
+        };
+        v.retain(|w| w.strong_count() > 0);
+        if v.is_empty() {
+            m.remove(&dst_port);
+            return false;
+        }
+        v.iter().filter_map(|w| w.upgrade()).collect()
     };
-    dst.incoming.lock().push_back(UdpDatagram {
-        src_port,
-        data: data.to_vec(),
-    });
+    if ends.is_empty() {
+        return false;
+    }
+    for dst in &ends {
+        dst.incoming.lock().push_back(UdpDatagram {
+            src_port,
+            data: data.to_vec(),
+        });
+    }
     // Wake any task blocked in recv/select on this UDP socket so the
     // scheduler can promote it back to Ready before the next time slice
     // expires.

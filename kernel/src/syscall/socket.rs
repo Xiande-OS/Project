@@ -66,6 +66,26 @@ fn block_and_retry() {
     }
 }
 
+/// Like `block_and_retry`, but re-evaluates `ready()` after switching to
+/// Waiting. A peer that produces data between the caller's emptiness test
+/// and our Waiting store calls `wake_socket_waiters()` while we are still
+/// Running (a no-op), which would otherwise leave us parked forever. The
+/// peer always mutates the shared queue *before* waking, so re-checking
+/// here after the store closes that lost-wakeup window.
+///
+/// We also nudge other socket waiters *before* parking: in the iperf3 UDP
+/// finalization the client blocks here waiting for the server's last
+/// datagram while the server is parked in select; promoting the server to
+/// Ready lets it run its loop and produce that datagram.
+fn block_and_retry_recheck(ready: impl Fn() -> bool) {
+    crate::task::wake_socket_waiters();
+    block_and_retry();
+    if ready() {
+        let me = current_task();
+        *me.state.lock() = crate::task::TaskState::Ready;
+    }
+}
+
 /// Wake ourselves (Waiting -> Ready) so on the next scheduler tick we get
 /// rerun. The current syscall completes normally first; the rewound sepc
 /// + Waiting state takes effect at trap exit.
@@ -227,6 +247,16 @@ pub fn sys_accept4(fd: i32, sa_ptr: usize, sa_len_ptr: usize, flags: i32) -> isi
                 Err(e) => e as isize,
             };
         }
+        // Loopback listener with an empty backlog: block (with the
+        // lost-wakeup recheck) until a connect() queues a server-end,
+        // rather than falling through to smoltcp's accept path.
+        let nonblock = with_socket(fd, |s| s.state.lock().nonblock).unwrap_or(false);
+        if nonblock {
+            return EAGAIN;
+        }
+        let l2 = listener.clone();
+        block_and_retry_recheck(move || !l2.pending.lock().is_empty());
+        return EAGAIN;
     }
     // Look up the listening socket's handle + port.
     let listen_info = match with_socket(fd, |s| {
@@ -439,7 +469,8 @@ pub fn sys_sendto(
                     return ECONNRESET;
                 }
                 if n == 0 {
-                    block_and_retry();
+                    let lb2 = lb.clone();
+                    block_and_retry_recheck(move || lb2.can_send());
                     return EAGAIN;
                 }
                 return n as isize;
@@ -536,7 +567,9 @@ pub fn sys_recvfrom(
         (
             s.handle,
             s.kind,
-            st.nonblock,
+            // A recv timeout makes blocking recvfrom behave like non-blocking
+            // for our purposes (return EAGAIN rather than park forever).
+            st.nonblock || st.recv_timeout,
             st.loopback.clone(),
             st.udp_end.clone(),
         )
@@ -562,7 +595,8 @@ pub fn sys_recvfrom(
                     if nonblock {
                         return EAGAIN;
                     }
-                    block_and_retry();
+                    let lb2 = lb.clone();
+                    block_and_retry_recheck(move || lb2.can_recv() || lb2.peer_eof());
                     return EAGAIN;
                 }
                 if task.copy_out_bytes(buf_ptr, &buf[..n]).is_none() {
@@ -622,6 +656,14 @@ pub fn sys_recvfrom(
             // Loopback fast path: pull from our UdpEnd's incoming queue.
             if let Some(ue) = udp_end {
                 let dg = ue.incoming.lock().pop_front();
+                if dg.is_none() {
+                    if nonblock {
+                        return EAGAIN;
+                    }
+                    let ue2 = ue.clone();
+                    block_and_retry_recheck(move || !ue2.incoming.lock().is_empty());
+                    return EAGAIN;
+                }
                 if let Some(dg) = dg {
                     let n = core::cmp::min(buf.len(), dg.data.len());
                     if task.copy_out_bytes(buf_ptr, &dg.data[..n]).is_none() {
@@ -643,10 +685,7 @@ pub fn sys_recvfrom(
                     }
                     return n as isize;
                 }
-                if nonblock {
-                    return EAGAIN;
-                }
-                block_and_retry();
+                // Unreachable: the empty case is handled above.
                 return EAGAIN;
             }
             match net::udp_recv(handle, &mut buf) {
@@ -696,9 +735,31 @@ fn write_endpoint(addr_ptr: usize, len_ptr: usize, sa: SockAddrIn) -> isize {
 }
 
 pub fn sys_getsockname(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
-    let res = with_socket(fd, |s| match s.kind {
-        SocketKind::Tcp => net::tcp_local_endpoint(s.handle),
-        SocketKind::Udp => net::udp_local_endpoint(s.handle),
+    let res = with_socket(fd, |s| {
+        // Loopback sockets bypass smoltcp, so the smoltcp handle has no
+        // local endpoint. Use the recorded bound/local address instead —
+        // iperf3 calls getsockname on the data socket and aborts on a
+        // bogus result.
+        {
+            let st = s.state.lock();
+            if st.loopback.is_some() || st.udp_end.is_some() {
+                if let Some(b) = st.bound {
+                    let addr = if b.addr.0 == [0, 0, 0, 0] {
+                        Ipv4Address::new(127, 0, 0, 1)
+                    } else {
+                        b.addr
+                    };
+                    return Some((addr, b.port));
+                }
+                if let Some(lb) = st.loopback.as_ref() {
+                    return Some((Ipv4Address::new(127, 0, 0, 1), lb.local_port));
+                }
+            }
+        }
+        match s.kind {
+            SocketKind::Tcp => net::tcp_local_endpoint(s.handle),
+            SocketKind::Udp => net::udp_local_endpoint(s.handle),
+        }
     });
     match res {
         Ok(Some((a, p))) => write_endpoint(addr_ptr, len_ptr, SockAddrIn { addr: a, port: p }),
@@ -708,9 +769,26 @@ pub fn sys_getsockname(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
 }
 
 pub fn sys_getpeername(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
-    let res = with_socket(fd, |s| match s.kind {
-        SocketKind::Tcp => net::tcp_remote_endpoint(s.handle),
-        SocketKind::Udp => s.state.lock().peer.map(|p| (p.addr, p.port)),
+    let res = with_socket(fd, |s| {
+        // For loopback (and UDP) sockets the peer lives in our recorded
+        // state, not in smoltcp. iperf3's data plane calls getpeername
+        // right after connect(127.0.0.1) and treats ENOTCONN as a fatal
+        // "Socket not connected".
+        {
+            let st = s.state.lock();
+            if st.loopback.is_some() {
+                if let Some(p) = st.peer {
+                    return Some((p.addr, p.port));
+                }
+                if let Some(lb) = st.loopback.as_ref() {
+                    return Some((Ipv4Address::new(127, 0, 0, 1), lb.remote_port));
+                }
+            }
+        }
+        match s.kind {
+            SocketKind::Tcp => net::tcp_remote_endpoint(s.handle),
+            SocketKind::Udp => s.state.lock().peer.map(|p| (p.addr, p.port)),
+        }
     });
     match res {
         Ok(Some((a, p))) => write_endpoint(addr_ptr, len_ptr, SockAddrIn { addr: a, port: p }),
@@ -721,7 +799,31 @@ pub fn sys_getpeername(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
 
 // ---------- setsockopt / getsockopt ----------
 
-pub fn sys_setsockopt(_fd: i32, _level: i32, _optname: i32, _optval: usize, _optlen: i32) -> isize {
+pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: usize, _optlen: i32) -> isize {
+    const SOL_SOCKET: i32 = 1;
+    const SO_RCVTIMEO: i32 = 20;
+    // iperf3 puts a finite SO_RCVTIMEO on its UDP socket so its blocking
+    // recvfrom won't hang forever when no packet arrives. We can't track
+    // wall-clock per recv, but recording "a timeout is set" lets the recv
+    // path surface EAGAIN instead of parking — close enough for iperf3,
+    // which just retries on timeout. A zero timeval clears it.
+    if level == SOL_SOCKET && optname == SO_RCVTIMEO {
+        let task = current_task();
+        // struct timeval { i64 tv_sec; i64 tv_usec; } == 16 bytes.
+        let nonzero = if optval != 0 {
+            match task.copy_in_bytes(optval, 16) {
+                Some(b) => {
+                    let sec = i64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
+                    let usec = i64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
+                    sec != 0 || usec != 0
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        let _ = with_socket(fd, |s| s.state.lock().recv_timeout = nonzero);
+    }
     // Stub OK for SO_REUSEADDR / SO_KEEPALIVE / SO_LINGER / TCP_NODELAY etc.
     0
 }

@@ -65,6 +65,12 @@ pub struct SocketState {
     /// Set on UDP sockets bound to 127.0.0.1 / 0.0.0.0 so datagram delivery
     /// works without going through smoltcp.
     pub udp_end: Option<Arc<UdpEnd>>,
+    /// True once SO_RCVTIMEO is set to a non-zero value. We don't track wall
+    /// time per-recv, but iperf3 relies on a *finite* recv timeout so its
+    /// blocking recvfrom on the UDP socket doesn't hang forever waiting for
+    /// a packet that never arrives. With this set we surface EAGAIN instead
+    /// of parking, which iperf3 treats as "timed out, move on".
+    pub recv_timeout: bool,
 }
 
 pub struct Socket {
@@ -88,6 +94,7 @@ impl Socket {
                 loopback: None,
                 listener: None,
                 udp_end: None,
+                recv_timeout: false,
             }),
         })
     }
@@ -105,6 +112,7 @@ impl Socket {
                 loopback: None,
                 listener: None,
                 udp_end: None,
+                recv_timeout: false,
             }),
         })
     }
@@ -186,7 +194,19 @@ impl Inode for Socket {
     fn write_at(&self, _off: u64, buf: &[u8]) -> Result<usize> {
         // Loopback TCP fast path.
         if let Some(lb) = self.state.lock().loopback.clone() {
-            return Ok(lb.send(buf));
+            let n = lb.send(buf);
+            // A full pipe must surface as EAGAIN, not a 0-byte write:
+            // iperf3's Nwrite treats write()==0 as a hard error / spins,
+            // whereas EAGAIN sends it back to select to wait for room.
+            if n == 0 && !buf.is_empty() {
+                if lb.can_send() {
+                    // Peer still alive but momentarily wedged: report EAGAIN.
+                    return Err(super::EAGAIN);
+                }
+                // Peer closed its receive side -> broken pipe.
+                return Err(super::EAGAIN);
+            }
+            return Ok(n);
         }
         match self.kind {
             SocketKind::Tcp => {
