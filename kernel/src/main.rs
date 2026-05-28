@@ -107,6 +107,10 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         let mut a = alloc::vec!["git"];
         a.extend_from_slice(&split);
         ("git", git_elf(), a)
+    } else if cfg!(feature = "console") {
+        // Interactive shell. busybox ash with no args == read-eval-print
+        // loop on stdin. Compile-time SHELL_CMD can preload an `-i` script.
+        ("sh", busybox_elf(), alloc::vec!["sh", "-i"])
     } else if cfg!(feature = "shell") {
         let cmd = option_env!("SHELL_CMD").unwrap_or("echo hello from busybox");
         let applet = option_env!("APPLET").unwrap_or("sh");

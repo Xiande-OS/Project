@@ -80,10 +80,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SET_ROBUST_LIST => 0,
         nr::SYS_RT_SIGACTION => 0,
         nr::SYS_RT_SIGPROCMASK => 0,
-        nr::SYS_IOCTL => 0,
+        nr::SYS_IOCTL => sys_ioctl(a0 as i32, a1 as u32, a2),
         nr::SYS_GETUID | nr::SYS_GETEUID | nr::SYS_GETGID | nr::SYS_GETEGID => 0,
         nr::SYS_GETPID | nr::SYS_GETTID => 1,
         nr::SYS_GETPPID => 0,
+        nr::SYS_GETPGID | nr::SYS_GETSID | nr::SYS_GETPGRP => 1,
+        nr::SYS_SETPGID | nr::SYS_SETSID => 1,
         nr::SYS_UNAME => sys_uname(a0),
         nr::SYS_GETRANDOM => sys_getrandom(a0, a1, a2),
         nr::SYS_MMAP => sys_mmap(a0, a1, a2 as i32, a3 as i32, a4 as i32, a5),
@@ -98,7 +100,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_TKILL => 0,
         nr::SYS_KILL => 0,
         nr::SYS_FUTEX => 0,
-        nr::SYS_PPOLL => 0,
+        nr::SYS_PPOLL => sys_ppoll(a0, a1, a2),
         nr::SYS_SIGALTSTACK => 0,
         nr::SYS_RT_SIGTIMEDWAIT => 0,
         nr::SYS_RT_SIGSUSPEND => 0,
@@ -462,6 +464,159 @@ fn sys_mkdirat(dfd: i32, path: usize, _mode: u32) -> isize {
     match parent.create(&name, FileType::Directory) {
         Ok(_) => 0,
         Err(e) => err_to_isize(e),
+    }
+}
+
+/// Linux `struct termios` on RISC-V (60 bytes). Just enough that
+/// `isatty(stdin)` returns true and the shell treats us as a terminal.
+#[repr(C)]
+#[derive(Default)]
+struct Termios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: u8,
+    c_cc: [u8; 19],
+    c_ispeed: u32,
+    c_ospeed: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
+    if nfds == 0 || fds == 0 {
+        return 0;
+    }
+    let task = current_task();
+    let size = nfds * core::mem::size_of::<PollFd>();
+    let Some(raw) = task.copy_in_bytes(fds, size) else {
+        return EFAULT;
+    };
+    let mut polls: alloc::vec::Vec<PollFd> = alloc::vec![PollFd::default(); nfds];
+    for i in 0..nfds {
+        let off = i * core::mem::size_of::<PollFd>();
+        polls[i] = unsafe {
+            core::ptr::read(raw[off..].as_ptr() as *const PollFd)
+        };
+        polls[i].revents = 0;
+    }
+
+    // Identify any console-backed fd in the set.
+    let mut console_indices: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    for (i, p) in polls.iter().enumerate() {
+        if let Some(f) = task.fd_table.lock().get(p.fd) {
+            if f.is_console && p.events & 0x1 != 0 {
+                console_indices.push(i);
+            }
+        }
+    }
+
+    let mut ready = 0;
+    if !console_indices.is_empty() {
+        if timeout == 0 {
+            // NULL timeout = block until something readable.
+            crate::fs::console_wait_readable();
+            for &i in &console_indices {
+                polls[i].revents = 0x1; // POLLIN
+            }
+            ready = console_indices.len() as isize;
+        } else if crate::fs::console_has_readable() {
+            for &i in &console_indices {
+                polls[i].revents = 0x1;
+            }
+            ready = console_indices.len() as isize;
+        }
+    }
+
+    // Write revents back.
+    let mut out = alloc::vec::Vec::with_capacity(size);
+    for p in &polls {
+        out.extend_from_slice(unsafe {
+            core::slice::from_raw_parts(
+                p as *const _ as *const u8,
+                core::mem::size_of::<PollFd>(),
+            )
+        });
+    }
+    if task.copy_out_bytes(fds, &out).is_none() {
+        return EFAULT;
+    }
+    ready
+}
+
+fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
+    const TCGETS: u32 = 0x5401;
+    const TCSETS: u32 = 0x5402;
+    const TCSETSW: u32 = 0x5403;
+    const TCSETSF: u32 = 0x5404;
+    const TIOCGWINSZ: u32 = 0x5413;
+    const TIOCGPGRP: u32 = 0x540f;
+    const TIOCSPGRP: u32 = 0x5410;
+
+    let task = current_task();
+    let is_console = task
+        .fd_table
+        .lock()
+        .get(fd)
+        .map(|f| f.is_console)
+        .unwrap_or(false);
+
+    match req {
+        TCGETS if is_console => {
+            // The host's TTY is already in cooked mode echoing the user's
+            // typing, and our `printf | qemu` pipeline doesn't echo either
+            // way. Tell the shell ECHO is *off* so it doesn't expect a
+            // kernel-side echo (busybox would otherwise read the first
+            // char and decide the input device dropped a byte).
+            let mut t = Termios::default();
+            t.c_iflag = 0o0000400 | 0o0000004; // ICRNL | IGNBRK
+            t.c_oflag = 0o0000001 | 0o0000004; // OPOST | ONLCR
+            t.c_cflag = 0o0000060 | 0o0000200; // CS8 | CREAD
+            t.c_lflag = 0o0000002 | 0o0000100 | 0o0000020; // ICANON | ISIG | ECHOE  (ECHO cleared)
+            t.c_cc[0] = 3;   // VINTR  ^C
+            t.c_cc[1] = 28;  // VQUIT  ^\
+            t.c_cc[2] = 127; // VERASE DEL
+            t.c_cc[3] = 21;  // VKILL  ^U
+            t.c_cc[4] = 4;   // VEOF   ^D
+            t.c_cc[8] = 17;  // VSTART ^Q
+            t.c_cc[9] = 19;  // VSTOP  ^S
+            t.c_cc[10] = 26; // VSUSP  ^Z
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &t as *const _ as *const u8,
+                    core::mem::size_of::<Termios>(),
+                )
+            };
+            if task.copy_out_bytes(arg, bytes).is_none() {
+                return EFAULT;
+            }
+            0
+        }
+        TCSETS | TCSETSW | TCSETSF => 0,
+        TIOCGWINSZ if is_console => {
+            let ws: [u16; 4] = [24, 80, 0, 0];
+            let bytes = unsafe { core::slice::from_raw_parts(ws.as_ptr() as *const u8, 8) };
+            if task.copy_out_bytes(arg, bytes).is_none() {
+                return EFAULT;
+            }
+            0
+        }
+        TIOCGPGRP => {
+            let pg: i32 = 1;
+            if task.copy_out_bytes(arg, &pg.to_le_bytes()).is_none() {
+                return EFAULT;
+            }
+            0
+        }
+        TIOCSPGRP => 0,
+        _ => 0,
     }
 }
 

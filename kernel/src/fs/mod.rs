@@ -11,6 +11,88 @@ pub mod pipe;
 pub mod tmpfs;
 pub use tmpfs::TmpfsDir;
 
+/// One-byte ring of pushback: if `ppoll` peeked a char, the next
+/// `console_read` returns it first before going back to SBI.
+static CONSOLE_PEEK: Mutex<Option<u8>> = Mutex::new(None);
+
+fn get_console_byte_blocking() -> u8 {
+    loop {
+        let c = sbi_rt::legacy::console_getchar();
+        if c == usize::MAX || c == !0_usize {
+            core::hint::spin_loop();
+            continue;
+        }
+        let b = c as u8;
+        return if b == b'\r' { b'\n' } else { b };
+    }
+}
+
+fn get_console_byte_nonblock() -> Option<u8> {
+    let c = sbi_rt::legacy::console_getchar();
+    if c == usize::MAX || c == !0_usize {
+        None
+    } else {
+        let b = c as u8;
+        Some(if b == b'\r' { b'\n' } else { b })
+    }
+}
+
+/// Block until at least one byte is available on stdin, then drain the
+/// rest of what's queued without further blocking.
+fn console_read(buf: &mut [u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    let mut n = 0;
+    if let Some(b) = CONSOLE_PEEK.lock().take() {
+        buf[n] = b;
+        n += 1;
+        if n == buf.len() {
+            return n;
+        }
+    } else {
+        buf[n] = get_console_byte_blocking();
+        n += 1;
+        if n == buf.len() {
+            return n;
+        }
+    }
+    while n < buf.len() {
+        match get_console_byte_nonblock() {
+            Some(b) => {
+                buf[n] = b;
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    n
+}
+
+/// Block until the SBI console has a readable byte (which we stash into
+/// the peek buffer for the next read). Used to back ppoll(stdin).
+pub fn console_wait_readable() {
+    let mut peek = CONSOLE_PEEK.lock();
+    if peek.is_some() {
+        return;
+    }
+    drop(peek);
+    let b = get_console_byte_blocking();
+    *CONSOLE_PEEK.lock() = Some(b);
+}
+
+pub fn console_has_readable() -> bool {
+    if CONSOLE_PEEK.lock().is_some() {
+        return true;
+    }
+    if let Some(b) = get_console_byte_nonblock() {
+        *CONSOLE_PEEK.lock() = Some(b);
+        true
+    } else {
+        false
+    }
+}
+
 pub type Result<T> = core::result::Result<T, i32>;
 
 pub const ENOENT: i32 = -2;
@@ -100,8 +182,7 @@ impl File {
             return Err(EBADF);
         }
         if self.is_console {
-            // No real stdin; treat as EOF.
-            return Ok(0);
+            return Ok(console_read(buf));
         }
         let mut offset = self.offset.lock();
         let n = self.inode.read_at(*offset, buf)?;
