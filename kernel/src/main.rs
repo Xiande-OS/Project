@@ -84,7 +84,14 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         td.place_inode("lib", lib_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
     }
     fs::install_file("/lib", "ld-musl-riscv64.so.1", ld_musl_blob()).unwrap();
-    println!("[ok] heap + frame allocator + trap vector + vfs + /bin + /lib");
+    // POSIX shared-memory mount point at /dev/shm.
+    if let Ok(dev_dir) = fs::root().lookup("dev") {
+        if let Some(d) = fs::tmpfs::downcast_dir(&dev_dir) {
+            let shm = fs::tmpfs::TmpfsDir::new_root();
+            d.place_inode("shm", shm as alloc::sync::Arc<dyn fs::Inode>).ok();
+        }
+    }
+    println!("[ok] heap + frame allocator + trap vector + vfs + /bin + /lib + /dev/shm");
 
     if let Some(_blk) = drivers::virtio_blk::init() {
         match fs::fat32::mount("/mnt") {

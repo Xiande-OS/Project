@@ -157,6 +157,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_CLONE => sys_clone(a0, a1, a2, a3, a4),
         nr::SYS_EXECVE => sys_execve(a0, a1, a2),
         nr::SYS_WAIT4 => sys_wait4(a0 as i32, a1, a2 as i32),
+        nr::SYS_WAITID => sys_waitid(a0 as i32, a1 as i32, a2, a3 as i32),
         _ => {
             println!("[syscall] unimplemented #{} a0={:#x} a1={:#x}", id, a0, a1);
             ENOSYS
@@ -674,6 +675,133 @@ fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
     }
 }
 
+// ---------- waitid ----------
+
+fn sys_waitid(idtype: i32, id: i32, infop: usize, _options: i32) -> isize {
+    let pid_filter = match idtype {
+        0 => -1,
+        1 => id,
+        2 => -id,
+        _ => return EINVAL,
+    };
+    let r = sys_wait4(pid_filter, 0, 0);
+    if r < 0 { return r; }
+    if r == 0 { return 0; }
+    if infop != 0 {
+        let pid = r as i32;
+        let task = current_task();
+        let mut buf = [0u8; 128];
+        buf[0..4].copy_from_slice(&17i32.to_le_bytes());
+        buf[8..12].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&pid.to_le_bytes());
+        let _ = task.copy_out_bytes(infop, &buf);
+    }
+    0
+}
+
+// ---------- POSIX record locks (fcntl F_SETLK / F_GETLK) ----------
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+struct Flock {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+    _pad: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LockRange {
+    start: u64,
+    end: u64,
+    excl: bool,
+    pid: i32,
+}
+
+static FLOCK_RANGES: SpinMutex<alloc::collections::BTreeMap<usize, alloc::vec::Vec<LockRange>>> =
+    SpinMutex::new(alloc::collections::BTreeMap::new());
+
+fn resolve_lock_range(l: &Flock, size: u64) -> (u64, u64) {
+    let base = match l.l_whence {
+        0 => 0,
+        1 => 0,
+        2 => size as i64,
+        _ => 0,
+    };
+    let start = (base + l.l_start).max(0) as u64;
+    let end = if l.l_len == 0 {
+        u64::MAX
+    } else if l.l_len > 0 {
+        start + l.l_len as u64
+    } else {
+        let s = (start as i64 + l.l_len).max(0) as u64;
+        let e = start;
+        return (s, e);
+    };
+    (start, end)
+}
+
+fn ranges_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
+    a.0 < b.1 && b.0 < a.1
+}
+
+fn fcntl_setlk(file: &Arc<crate::fs::File>, flock: &Flock, wait: bool) -> isize {
+    let key = Arc::as_ptr(&file.inode) as *const () as usize;
+    let size = file.inode.size();
+    let (start, end) = resolve_lock_range(flock, size);
+    let me = current_task();
+    let pid = me.pid;
+
+    let mut table = FLOCK_RANGES.lock();
+    let v = table.entry(key).or_default();
+
+    if flock.l_type == 2 {
+        v.retain(|r| !(r.pid == pid && ranges_overlap((r.start, r.end), (start, end))));
+        if v.is_empty() { table.remove(&key); }
+        return 0;
+    }
+
+    let excl = flock.l_type == 1;
+    for r in v.iter() {
+        if r.pid == pid { continue; }
+        if !ranges_overlap((r.start, r.end), (start, end)) { continue; }
+        if excl || r.excl {
+            if wait { return -4; }
+            return -11;
+        }
+    }
+    v.push(LockRange { start, end, excl, pid });
+    0
+}
+
+fn fcntl_getlk(file: &Arc<crate::fs::File>, flock_in: &Flock) -> Flock {
+    let key = Arc::as_ptr(&file.inode) as *const () as usize;
+    let size = file.inode.size();
+    let (start, end) = resolve_lock_range(flock_in, size);
+    let me_pid = current_task().pid;
+    let mut out = *flock_in;
+    let table = FLOCK_RANGES.lock();
+    let want_excl = flock_in.l_type == 1;
+    if let Some(v) = table.get(&key) {
+        for r in v {
+            if r.pid == me_pid { continue; }
+            if !ranges_overlap((r.start, r.end), (start, end)) { continue; }
+            if want_excl || r.excl {
+                out.l_type = if r.excl { 1 } else { 0 };
+                out.l_whence = 0;
+                out.l_start = r.start as i64;
+                out.l_len = if r.end == u64::MAX { 0 } else { (r.end - r.start) as i64 };
+                out.l_pid = r.pid;
+                return out;
+            }
+        }
+    }
+    out.l_type = 2;
+    out
+}
+
 // ---------- flock (advisory, per-inode) ----------
 
 use spin::Mutex as SpinMutex;
@@ -796,6 +924,25 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
         }
         F_GETFL => 0,
         F_SETFL => 0,
+        // F_GETLK=5, F_SETLK=6, F_SETLKW=7. arg is `struct flock *`.
+        5 | 6 | 7 => {
+            let task = current_task();
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            let Some(buf) = task.copy_in_bytes(arg as usize, core::mem::size_of::<Flock>()) else { return EFAULT };
+            let mut flock = Flock::default();
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), &mut flock as *mut _ as *mut u8, core::mem::size_of::<Flock>()); }
+            match cmd {
+                5 => {
+                    let out = fcntl_getlk(&file, &flock);
+                    let bytes = unsafe { core::slice::from_raw_parts(&out as *const _ as *const u8, core::mem::size_of::<Flock>()) };
+                    let _ = task.copy_out_bytes(arg as usize, bytes);
+                    0
+                }
+                6 => fcntl_setlk(&file, &flock, false),
+                7 => fcntl_setlk(&file, &flock, true),
+                _ => unreachable!(),
+            }
+        }
         _ => 0,
     }
 }

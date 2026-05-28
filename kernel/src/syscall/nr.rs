@@ -99,6 +99,7 @@ pub const SYS_MMAP: usize = 222;
 pub const SYS_MPROTECT: usize = 226;
 pub const SYS_MADVISE: usize = 233;
 pub const SYS_WAIT4: usize = 260;
+pub const SYS_WAITID: usize = 95;
 pub const SYS_PRLIMIT64: usize = 261;
 pub const SYS_GETRLIMIT: usize = 163;
 pub const SYS_SETRLIMIT: usize = 164;
