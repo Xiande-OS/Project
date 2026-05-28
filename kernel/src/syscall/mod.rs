@@ -361,6 +361,23 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         Ok(n) => n,
         Err(e) => return err_to_isize(e),
     };
+    // Pipe with live writer: 0 bytes means "writer hasn't written yet",
+    // NOT EOF. Without this block-on-empty, `printf X | while read line`
+    // sees the read-end return 0 immediately, treats it as EOF, and
+    // never iterates the loop body.
+    if n == 0 && len != 0 {
+        if let Some(pipe) = file.inode.as_any().downcast_ref::<crate::fs::pipe::PipeEnd>() {
+            if !pipe.is_writer() && pipe.writer_alive() && pipe.buffered() == 0 {
+                pipe.add_read_waiter(task.pid);
+                *task.state.lock() = crate::task::TaskState::Waiting;
+                unsafe {
+                    let tf = task.tf_ptr();
+                    (*tf).sepc -= 4;
+                }
+                return 0;
+            }
+        }
+    }
     // TCP socket returning 0 may mean "no data yet" rather than EOF. Block
     // until either data arrives or the peer closes.
     if n == 0 {
@@ -680,30 +697,52 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         polls[i].revents = 0;
     }
 
-    // Identify any console-backed fd in the set.
+    // Classify fds: console (special blocking path) vs regular (we
+    // signal POLLIN immediately and let the subsequent read syscall
+    // do the actual blocking against the pipe / file).
     let mut console_indices: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    let mut other_indices: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
     for (i, p) in polls.iter().enumerate() {
+        if p.fd < 0 {
+            continue;
+        }
         if let Some(f) = task.fd_table.lock().get(p.fd) {
-            if f.is_console && p.events & 0x1 != 0 {
-                console_indices.push(i);
+            if p.events & 0x1 != 0 {
+                if f.is_console {
+                    console_indices.push(i);
+                } else {
+                    other_indices.push(i);
+                }
             }
         }
     }
 
     let mut ready = 0;
+    // Non-console fd asked about POLLIN: tell userland it's readable.
+    // Read will block correctly if the data hasn't arrived yet (pipes
+    // park in sys_read; sockets have their own block path). Without
+    // this, busybox sh's `read` builtin sees ppoll return 0, treats
+    // the fd as never-ready, and bails — `printf X | while read line`
+    // never iterates the body.
+    if !other_indices.is_empty() {
+        for &i in &other_indices {
+            polls[i].revents = 0x1; // POLLIN
+        }
+        ready += other_indices.len() as isize;
+    }
     if !console_indices.is_empty() {
-        if timeout == 0 {
+        if timeout == 0 && ready == 0 {
             // NULL timeout = block until something readable.
             crate::fs::console_wait_readable();
             for &i in &console_indices {
-                polls[i].revents = 0x1; // POLLIN
+                polls[i].revents = 0x1;
             }
-            ready = console_indices.len() as isize;
+            ready += console_indices.len() as isize;
         } else if crate::fs::console_has_readable() {
             for &i in &console_indices {
                 polls[i].revents = 0x1;
             }
-            ready = console_indices.len() as isize;
+            ready += console_indices.len() as isize;
         }
     }
 

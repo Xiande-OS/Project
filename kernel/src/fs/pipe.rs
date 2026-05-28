@@ -17,6 +17,10 @@ struct PipeBuffer {
     buf: VecDeque<u8>,
     closed_read: bool,
     closed_write: bool,
+    /// pids of tasks parked in sys_read on the read end, waiting for
+    /// data to arrive (or the writer to close). Woken by the writer's
+    /// write_at and by Drop on the writer end.
+    read_waiters: alloc::vec::Vec<i32>,
 }
 
 pub struct PipeEnd {
@@ -25,11 +29,40 @@ pub struct PipeEnd {
 }
 
 impl PipeEnd {
+    pub fn is_writer(&self) -> bool { self.is_writer }
+    pub fn writer_alive(&self) -> bool {
+        let p = self.inner.lock();
+        !p.closed_write
+    }
+    pub fn buffered(&self) -> usize {
+        self.inner.lock().buf.len()
+    }
+    pub fn add_read_waiter(&self, pid: i32) {
+        let mut p = self.inner.lock();
+        if !p.read_waiters.contains(&pid) {
+            p.read_waiters.push(pid);
+        }
+    }
+}
+
+fn wake_pipe_readers(waiters: &[i32]) {
+    for &pid in waiters {
+        if let Some(t) = crate::task::task_by_pid(pid) {
+            let mut s = t.state.lock();
+            if *s == crate::task::TaskState::Waiting {
+                *s = crate::task::TaskState::Ready;
+            }
+        }
+    }
+}
+
+impl PipeEnd {
     fn new_pair() -> (Arc<Self>, Arc<Self>) {
         let inner = Arc::new(Mutex::new(PipeBuffer {
             buf: VecDeque::with_capacity(PIPE_CAP),
             closed_read: false,
             closed_write: false,
+            read_waiters: alloc::vec::Vec::new(),
         }));
         let r = Arc::new(Self {
             inner: inner.clone(),
@@ -89,6 +122,10 @@ impl Inode for PipeEnd {
         if n == 0 && !buf.is_empty() {
             return Err(EINVAL); // full
         }
+        // Wake any reader that parked on an empty pipe.
+        let waiters = core::mem::take(&mut pipe.read_waiters);
+        drop(pipe);
+        wake_pipe_readers(&waiters);
         Ok(n)
     }
 }
@@ -98,6 +135,11 @@ impl Drop for PipeEnd {
         let mut pipe = self.inner.lock();
         if self.is_writer {
             pipe.closed_write = true;
+            // Wake parked readers so they observe EOF instead of
+            // blocking forever.
+            let waiters = core::mem::take(&mut pipe.read_waiters);
+            drop(pipe);
+            wake_pipe_readers(&waiters);
         } else {
             pipe.closed_read = true;
         }
