@@ -51,6 +51,7 @@ fn with_socket<R>(fd: i32, f: impl FnOnce(&Socket) -> R) -> Result<R, isize> {
 /// `schedule_next_after_trap` because the state moved out of Running.
 fn block_and_retry() {
     let me = current_task();
+    crate::task::mark_socket_waiter(me.pid);
     *me.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
         let tf = me.tf_ptr();

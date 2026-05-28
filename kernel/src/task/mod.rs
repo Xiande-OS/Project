@@ -246,17 +246,38 @@ pub fn all_tasks() -> Vec<Arc<Task>> {
     t.tasks.values().cloned().collect()
 }
 
-/// Promote every Waiting task to Ready so it gets re-scheduled and can
-/// re-attempt its blocking syscall (`accept`, `connect`, `recv`, `wait4`,
-/// ...). Used after net::poll() processes incoming packets.
+/// Mark this task as blocked on socket activity rather than wait4/futex.
+/// `wake_socket_waiters` only wakes tasks in this set, so a wait4 caller
+/// doesn't get spuriously bounced back to Ready every trap.
+static SOCKET_WAITERS: spin::Mutex<alloc::collections::BTreeSet<i32>> =
+    spin::Mutex::new(alloc::collections::BTreeSet::new());
+
+pub fn mark_socket_waiter(pid: i32) {
+    SOCKET_WAITERS.lock().insert(pid);
+}
+
+pub fn unmark_socket_waiter(pid: i32) {
+    SOCKET_WAITERS.lock().remove(&pid);
+}
+
+/// Promote every task that's blocked on a socket back to Ready so it
+/// can re-attempt its syscall. Does NOT touch tasks blocked on wait4
+/// (children-pending) or futex.
 pub fn wake_socket_waiters() {
+    let pending: Vec<i32> = SOCKET_WAITERS.lock().iter().copied().collect();
+    if pending.is_empty() { return; }
     let t = TABLE.lock();
-    for task in t.tasks.values() {
-        let mut s = task.state.lock();
-        if *s == TaskState::Waiting {
-            *s = TaskState::Ready;
+    for pid in pending {
+        if let Some(task) = t.tasks.get(&pid) {
+            let mut s = task.state.lock();
+            if *s == TaskState::Waiting {
+                *s = TaskState::Ready;
+            }
         }
     }
+    // The actual syscall handler is responsible for unmark when it
+    // finishes (success or error). Leaving them marked is fine: they
+    // just get promoted again on a subsequent trap.
 }
 
 // ----- Initial task creation -----

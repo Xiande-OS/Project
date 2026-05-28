@@ -317,10 +317,35 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         return EBADF;
     };
     let mut tmp = alloc::vec![0u8; len];
+    // Drive the network stack so RX queue is current before we attempt the
+    // read. Cheap when there's nothing to do.
+    crate::net::poll();
     let n = match file.read(&mut tmp) {
         Ok(n) => n,
         Err(e) => return err_to_isize(e),
     };
+    // TCP socket returning 0 may mean "no data yet" rather than EOF. Block
+    // until either data arrives or the peer closes.
+    if n == 0 {
+        if let Some(sock) = file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>() {
+            if sock.kind == crate::fs::socket::SocketKind::Tcp {
+                let nonblock = sock.state.lock().nonblock;
+                if crate::net::tcp_may_recv(sock.handle) {
+                    if nonblock {
+                        return -11; // EAGAIN
+                    }
+                    // Rewind sepc and park; we'll be re-run after a packet.
+                    crate::task::mark_socket_waiter(task.pid);
+                    *task.state.lock() = crate::task::TaskState::Waiting;
+                    unsafe {
+                        let tf = task.tf_ptr();
+                        (*tf).sepc -= 4;
+                    }
+                    return -11;
+                }
+            }
+        }
+    }
     if task.copy_out_bytes(buf, &tmp[..n]).is_none() {
         return EFAULT;
     }
@@ -341,6 +366,7 @@ fn sys_readv(fd: i32, iov: usize, count: usize) -> isize {
     let iovs = unsafe {
         core::slice::from_raw_parts(iovs_bytes.as_ptr() as *const IoVec, count)
     };
+    crate::net::poll();
     let mut total = 0isize;
     for v in iovs {
         if v.len == 0 {
@@ -350,6 +376,28 @@ fn sys_readv(fd: i32, iov: usize, count: usize) -> isize {
         match file.read(&mut tmp) {
             Ok(n) => {
                 if n == 0 {
+                    // Same socket-block treatment as sys_read when we've
+                    // gotten nothing so far.
+                    if total == 0 {
+                        if let Some(sock) = file.inode.as_any()
+                            .downcast_ref::<crate::fs::socket::Socket>()
+                        {
+                            if sock.kind == crate::fs::socket::SocketKind::Tcp {
+                                let nonblock = sock.state.lock().nonblock;
+                                if crate::net::tcp_may_recv(sock.handle) {
+                                    if nonblock { return -11; }
+                                    crate::task::mark_socket_waiter(task.pid);
+                                    *task.state.lock() =
+                                        crate::task::TaskState::Waiting;
+                                    unsafe {
+                                        let tf = task.tf_ptr();
+                                        (*tf).sepc -= 4;
+                                    }
+                                    return -11;
+                                }
+                            }
+                        }
+                    }
                     break;
                 }
                 if task.copy_out_bytes(v.base, &tmp[..n]).is_none() {

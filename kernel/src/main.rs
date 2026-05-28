@@ -77,7 +77,26 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     ] {
         fs::link_into("/bin", applet, bb.clone()).unwrap();
     }
-    fs::install_file("/bin", "git", real_git_elf()).unwrap();
+    let git_inode = fs::install_file("/bin", "git", real_git_elf()).unwrap();
+    // Real git is a multicall binary: when invoked as `git-<sub>` it
+    // dispatches to that sub-builtin via argv[0]. fetch-pack forks off
+    // `git-index-pack`, clone forks off helpers, etc. — link the
+    // common ones in.
+    for applet in [
+        "git-index-pack", "git-unpack-objects", "git-pack-objects",
+        "git-upload-pack", "git-receive-pack", "git-fetch-pack",
+        "git-send-pack", "git-http-backend", "git-http-fetch",
+        "git-http-push", "git-remote-http", "git-remote-https",
+        "git-remote-ftp", "git-remote-ftps", "git-shell", "git-clone",
+        "git-init", "git-init-db", "git-fetch", "git-pull", "git-push",
+        "git-checkout", "git-add", "git-commit", "git-status", "git-log",
+        "git-show", "git-diff", "git-merge", "git-config", "git-rev-list",
+        "git-rev-parse", "git-cat-file", "git-hash-object", "git-update-ref",
+        "git-update-index", "git-write-tree", "git-read-tree", "git-ls-files",
+        "git-ls-tree", "git-ls-remote", "git-symbolic-ref", "git-pack-refs",
+    ] {
+        fs::link_into("/bin", applet, git_inode.clone()).unwrap();
+    }
     fs::install_file("/bin", "dyn_hello", dyn_hello_elf()).unwrap();
     // Install the dynamic linker so PT_INTERP="/lib/ld-musl-riscv64.so.1" works.
     if let Some(td) = fs::tmpfs::downcast_dir(&fs::root()) {
