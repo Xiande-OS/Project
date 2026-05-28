@@ -3,6 +3,7 @@
 **/*.rs.bk
 **/*.swp
 .DS_Store
+.claude/worktrees/
 
 # Build artifacts produced by `make all`.
 /kernel-rv
