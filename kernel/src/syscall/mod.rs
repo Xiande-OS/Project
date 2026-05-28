@@ -82,10 +82,15 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_SIGPROCMASK => 0,
         nr::SYS_IOCTL => sys_ioctl(a0 as i32, a1 as u32, a2),
         nr::SYS_GETUID | nr::SYS_GETEUID | nr::SYS_GETGID | nr::SYS_GETEGID => 0,
-        nr::SYS_GETPID | nr::SYS_GETTID => 1,
-        nr::SYS_GETPPID => 0,
-        nr::SYS_GETPGID | nr::SYS_GETSID | nr::SYS_GETPGRP => 1,
-        nr::SYS_SETPGID | nr::SYS_SETSID => 1,
+        nr::SYS_GETPID | nr::SYS_GETTID => current_task().pid as isize,
+        nr::SYS_GETPPID => {
+            current_task().ppid.load(core::sync::atomic::Ordering::Relaxed) as isize
+        }
+        nr::SYS_GETPGID => sys_getpgid(a0 as i32),
+        nr::SYS_GETSID => sys_getsid(a0 as i32),
+        nr::SYS_GETPGRP => sys_getpgid(0),
+        nr::SYS_SETPGID => sys_setpgid(a0 as i32, a1 as i32),
+        nr::SYS_SETSID => sys_setsid(),
         nr::SYS_UNAME => sys_uname(a0),
         nr::SYS_GETRANDOM => sys_getrandom(a0, a1, a2),
         nr::SYS_MMAP => sys_mmap(a0, a1, a2 as i32, a3 as i32, a4 as i32, a5),
@@ -551,6 +556,11 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
     ready
 }
 
+/// Controlling terminal's foreground process group. Updated by
+/// TIOCSPGRP (when busybox sh installs itself as the foreground
+/// pgrp). Returned by TIOCGPGRP.
+static TTY_FG_PGID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(1);
+
 fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
     const TCGETS: u32 = 0x5401;
     const TCSETS: u32 = 0x5402;
@@ -609,13 +619,20 @@ fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
             0
         }
         TIOCGPGRP => {
-            let pg: i32 = 1;
+            let pg = TTY_FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
             if task.copy_out_bytes(arg, &pg.to_le_bytes()).is_none() {
                 return EFAULT;
             }
             0
         }
-        TIOCSPGRP => 0,
+        TIOCSPGRP => {
+            let Some(bytes) = task.copy_in_bytes(arg, 4) else {
+                return EFAULT;
+            };
+            let pg = i32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 4]));
+            TTY_FG_PGID.store(pg, core::sync::atomic::Ordering::Relaxed);
+            0
+        }
         _ => 0,
     }
 }
@@ -972,6 +989,69 @@ fn normalize_path(p: &str) -> String {
 }
 
 // ---------- Misc ----------
+
+fn sys_getpgid(pid: i32) -> isize {
+    let task = if pid == 0 {
+        current_task()
+    } else {
+        match crate::task::task_by_pid(pid) {
+            Some(t) => t,
+            None => return -3, // ESRCH
+        }
+    };
+    task.pgid.load(core::sync::atomic::Ordering::Relaxed) as isize
+}
+
+fn sys_getsid(pid: i32) -> isize {
+    let task = if pid == 0 {
+        current_task()
+    } else {
+        match crate::task::task_by_pid(pid) {
+            Some(t) => t,
+            None => return -3, // ESRCH
+        }
+    };
+    task.sid.load(core::sync::atomic::Ordering::Relaxed) as isize
+}
+
+fn sys_setpgid(pid: i32, pgid: i32) -> isize {
+    let me = current_task();
+    let target = if pid == 0 {
+        me.clone()
+    } else {
+        match crate::task::task_by_pid(pid) {
+            Some(t) => t,
+            None => return -3, // ESRCH
+        }
+    };
+    // POSIX: target must be the caller or one of its children, must not
+    // be a session leader, and must be in the same session as the caller.
+    // We only enforce the basics; everything else is permissive.
+    if target.sid.load(core::sync::atomic::Ordering::Relaxed)
+        != me.sid.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return -1; // EPERM
+    }
+    let new_pgid = if pgid == 0 { target.pid } else { pgid };
+    target
+        .pgid
+        .store(new_pgid, core::sync::atomic::Ordering::Relaxed);
+    0
+}
+
+fn sys_setsid() -> isize {
+    let me = current_task();
+    // Only a non-session-leader can create a new session.
+    let cur_sid = me.sid.load(core::sync::atomic::Ordering::Relaxed);
+    if cur_sid == me.pid {
+        return -1; // EPERM (already session leader)
+    }
+    me.sid
+        .store(me.pid, core::sync::atomic::Ordering::Relaxed);
+    me.pgid
+        .store(me.pid, core::sync::atomic::Ordering::Relaxed);
+    me.pid as isize
+}
 
 fn sys_exit(status: i32) -> isize {
     let task = current_task();

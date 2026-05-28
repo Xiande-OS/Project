@@ -55,6 +55,8 @@ pub enum TaskState {
 pub struct Task {
     pub pid: i32,
     pub ppid: AtomicI32,
+    pub pgid: AtomicI32,
+    pub sid: AtomicI32,
     storage: UnsafeCell<Box<TaskStorage>>,
     pub memory_set: Mutex<MemorySet>,
     pub fd_table: Mutex<crate::fs::FdTable>,
@@ -259,9 +261,26 @@ fn map_kernel_into(ms: &mut MemorySet) {
 
 fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
     let pid = alloc_pid();
+    // Inherit parent's process group + session if there is one; else
+    // become our own pgid+sid leader (this is the case for the very
+    // first task and for explicit setsid).
+    let (pgid, sid) = if ppid > 0 {
+        if let Some(p) = TABLE.lock().tasks.get(&ppid) {
+            (
+                p.pgid.load(Ordering::Relaxed),
+                p.sid.load(Ordering::Relaxed),
+            )
+        } else {
+            (pid, pid)
+        }
+    } else {
+        (pid, pid)
+    };
     let task = Arc::new(Task {
         pid,
         ppid: AtomicI32::new(ppid),
+        pgid: AtomicI32::new(pgid),
+        sid: AtomicI32::new(sid),
         storage: UnsafeCell::new(TaskStorage::boxed()),
         memory_set: Mutex::new(ms),
         fd_table: Mutex::new(crate::fs::FdTable::new()),
