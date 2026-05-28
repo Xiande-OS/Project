@@ -8,6 +8,7 @@ use spin::{Mutex, Once};
 pub mod devfs;
 pub mod fat32;
 pub mod pipe;
+pub mod procfs;
 pub mod tmpfs;
 pub use tmpfs::TmpfsDir;
 
@@ -341,12 +342,15 @@ pub fn init() {
     write_file(etc.as_ref(), "hosts", b"127.0.0.1 localhost\n");
     root.place_inode("etc", etc as Arc<dyn Inode>).unwrap();
 
-    for name in ["tmp", "bin", "proc", "sys", "root", "usr", "var", "home"] {
+    for name in ["tmp", "bin", "sys", "root", "usr", "var", "home"] {
         let d = tmpfs::TmpfsDir::new_root();
         root.place_inode(name, d as Arc<dyn Inode>).unwrap();
     }
 
     ROOT_INODE.call_once(|| root as Arc<dyn Inode>);
+
+    // Mount procfs at /proc with a real dynamic inode tree.
+    procfs::mount("/proc").expect("procfs mount");
 }
 
 fn write_file(dir: &dyn Inode, name: &str, data: &[u8]) {

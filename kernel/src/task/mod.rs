@@ -64,6 +64,10 @@ pub struct Task {
     pub state: Mutex<TaskState>,
     pub exit_code: AtomicI32,
     pub children: Mutex<Vec<i32>>,
+    /// argv joined with NUL separators, NUL terminated. Used by /proc/<pid>/cmdline.
+    pub cmdline: Mutex<Vec<u8>>,
+    /// Absolute path to the executable image. Used by /proc/<pid>/exe and /comm.
+    pub exe_path: Mutex<String>,
 }
 
 unsafe impl Send for Task {}
@@ -173,6 +177,17 @@ pub fn task_by_pid(pid: i32) -> Option<Arc<Task>> {
     TABLE.lock().tasks.get(&pid).cloned()
 }
 
+/// Snapshot list of live pids. Used by procfs to list /proc.
+pub fn all_pids() -> Vec<i32> {
+    TABLE.lock().tasks.keys().copied().collect()
+}
+
+/// Snapshot of the next pid the allocator would hand out — a stand-in for
+/// "processes ever created" used by /proc/stat.
+pub fn next_pid_snapshot() -> i32 {
+    NEXT_PID.load(Ordering::Relaxed)
+}
+
 /// Pick any task in Ready state (other than `exclude`) and mark it Running.
 pub fn pick_ready(exclude: i32) -> Option<Arc<Task>> {
     let table = TABLE.lock();
@@ -230,6 +245,15 @@ pub fn create_task_from_elf(
     argv: &[&str],
     envp: &[&str],
 ) -> Arc<Task> {
+    create_task_from_elf_with_path(elf_image, argv, envp, "")
+}
+
+pub fn create_task_from_elf_with_path(
+    elf_image: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    exe_path: &str,
+) -> Arc<Task> {
     let mut ms = MemorySet::new();
     map_kernel_into(&mut ms);
     let elf = crate::loader::load_elf(elf_image, &mut ms).expect("ELF load");
@@ -244,8 +268,19 @@ pub fn create_task_from_elf(
     tf.sstatus = sstatus;
 
     let task = make_task_with_ms(ms, tf, 0);
+    *task.cmdline.lock() = build_cmdline(argv);
+    *task.exe_path.lock() = exe_path.into();
     install_task(task.clone());
     task
+}
+
+fn build_cmdline(argv: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for s in argv {
+        out.extend_from_slice(s.as_bytes());
+        out.push(0);
+    }
+    out
 }
 
 fn map_kernel_into(ms: &mut MemorySet) {
@@ -288,6 +323,8 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
         state: Mutex::new(TaskState::Running),
         exit_code: AtomicI32::new(0),
         children: Mutex::new(Vec::new()),
+        cmdline: Mutex::new(Vec::new()),
+        exe_path: Mutex::new(String::new()),
     });
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
@@ -423,6 +460,15 @@ pub fn fork_current() -> Arc<Task> {
 
 /// Replace the current task's image with `elf_image`, argv, envp.
 pub fn execve_current(elf_image: &[u8], argv: &[&str], envp: &[&str]) -> Result<(), i32> {
+    execve_current_with_path(elf_image, argv, envp, "")
+}
+
+pub fn execve_current_with_path(
+    elf_image: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    exe_path: &str,
+) -> Result<(), i32> {
     let task = current_task();
     let mut ms = MemorySet::new();
     map_kernel_into(&mut ms);
@@ -455,6 +501,12 @@ pub fn execve_current(elf_image: &[u8], argv: &[&str], envp: &[&str]) -> Result<
 
     // close-on-exec
     task.fd_table.lock().close_cloexec();
+
+    // Record cmdline + exe_path for procfs.
+    *task.cmdline.lock() = build_cmdline(argv);
+    if !exe_path.is_empty() {
+        *task.exe_path.lock() = exe_path.into();
+    }
     Ok(())
 }
 

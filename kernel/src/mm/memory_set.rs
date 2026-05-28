@@ -66,7 +66,7 @@ impl VmArea {
 
 pub struct MemorySet {
     pub page_table: PageTable,
-    areas: Vec<VmArea>,
+    pub areas: Vec<VmArea>,
     /// Heap (brk) state.
     pub brk_base: VirtAddr,
     pub brk_cur: VirtAddr,

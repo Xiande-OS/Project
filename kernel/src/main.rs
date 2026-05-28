@@ -135,7 +135,22 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     };
     println!("[user] loading {} ({} bytes)", name, elf.len());
     println!("[user] argv = {:?}", argv);
-    let task = task::create_task_from_elf(elf, &argv, &["PATH=/bin", "HOME=/", "TERM=dumb"]);
+    // Best-effort exe path for /proc/<pid>/exe. busybox applets all resolve
+    // to /bin/busybox.
+    let exe_path: &str = match name {
+        "real_git" => "/bin/git",
+        "git" => "/bin/git",
+        "hello" => "/bin/hello",
+        "musl_hello" => "/bin/musl_hello",
+        "dyn_hello" => "/bin/dyn_hello",
+        _ => "/bin/busybox",
+    };
+    let task = task::create_task_from_elf_with_path(
+        elf,
+        &argv,
+        &["PATH=/bin", "HOME=/", "TERM=dumb"],
+        exe_path,
+    );
     println!("[user] task installed, entering user mode...");
     task::run_user_loop(&task);
 }
