@@ -97,11 +97,12 @@ fn parse_profile(args: &[String]) -> Profile {
 
 fn build_kernel(profile: Profile) -> Result<(), String> {
     let workspace = workspace_root();
+    let kernel_dir = workspace.join("kernel");
     let mut cmd = Command::new(cargo());
-    cmd.current_dir(&workspace)
+    // Run cargo from inside kernel/ so that kernel/.cargo/config.toml is
+    // picked up (its rustflags reference kernel/linker.ld relatively).
+    cmd.current_dir(&kernel_dir)
         .arg("build")
-        .arg("-p")
-        .arg(KERNEL_PKG)
         .arg("--target")
         .arg(KERNEL_TARGET);
     if let Some(flag) = profile.cargo_flag() {

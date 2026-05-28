@@ -4,6 +4,7 @@ version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [dependencies]
 sbi-rt = { version = "0.0.3", features = ["legacy"] }
@@ -12,6 +13,7 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex", "r
 bitflags = "2.6"
 buddy_system_allocator = "0.10"
 log = "0.4"
+xmas-elf = "0.9"
 
 [features]
 default = []

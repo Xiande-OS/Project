@@ -1,8 +1,4 @@
-//! S-mode trap dispatch.
-//!
-//! M1 handles kernel-mode exceptions (panic with details) and ignores
-//! the few interrupts we won't get yet. M3 will branch to syscall /
-//! user-fault paths.
+//! S-mode trap dispatch (both kernel and user traps).
 
 use core::arch::global_asm;
 
@@ -17,9 +13,9 @@ extern "C" {
     fn __trap_entry();
 }
 
-/// Layout matches `trap.S` above.
+/// Layout matches `trap.S`.
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TrapFrame {
     /// x1 (ra), x2 (sp), x3..x31. Index = register number - 1.
     pub x: [usize; 31],
@@ -28,11 +24,12 @@ pub struct TrapFrame {
     pub _reserved: usize,
 }
 
-/// Install the trap vector. Call once during early boot, before any
-/// instruction that might fault.
+/// Install the trap vector. Call once during early boot.
 pub fn init() {
     unsafe {
         stvec::write(__trap_entry as usize, stvec::TrapMode::Direct);
+        // sscratch == 0 means "we're in S-mode now". Trap entry uses this.
+        riscv::register::sscratch::write(0);
     }
 }
 
@@ -40,26 +37,37 @@ pub fn init() {
 pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) {
     let cause = scause::read();
     let stval = stval::read();
+    let from_user = (tf.sstatus & (1 << 8)) == 0;
+
     match cause.cause() {
+        Trap::Exception(Exception::UserEnvCall) => {
+            // Advance past the ecall instruction (4 bytes).
+            tf.sepc += 4;
+            crate::syscall::dispatch(tf);
+        }
         Trap::Exception(Exception::Breakpoint) => {
-            // Skip the `ebreak` instruction (2 or 4 bytes).
             tf.sepc += instr_len_at(tf.sepc);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
-            // Disarm; M1 has no scheduler yet.
             unsafe {
                 sbi_rt::set_timer(u64::MAX);
             }
         }
+        Trap::Exception(e) if from_user => {
+            crate::println!(
+                "[user fault] {:?}\n  sepc  = {:#x}\n  stval = {:#x}\n  killing task",
+                e, tf.sepc, stval,
+            );
+            crate::syscall::request_exit(139);
+        }
         Trap::Exception(e) => {
             panic!(
-                "kernel exception {:?}\n  sepc  = {:#x}\n  stval = {:#x}\n  sstatus = {:#x}\n  ra = {:#x}",
-                e, tf.sepc, stval, tf.sstatus, tf.x[0],
+                "kernel exception {:?}\n  sepc  = {:#x}\n  stval = {:#x}\n  sstatus = {:#x}",
+                e, tf.sepc, stval, tf.sstatus,
             );
         }
         Trap::Interrupt(i) => {
             crate::println!("[trap] unhandled interrupt {:?}; masking", i);
-            // For safety, disable interrupts in sstatus.
             unsafe {
                 sstatus::clear_sie();
             }
@@ -67,7 +75,6 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) {
     }
 }
 
-/// Length of the instruction at `pc` in bytes (2 for compressed, 4 otherwise).
 fn instr_len_at(pc: usize) -> usize {
     let first = unsafe { core::ptr::read_volatile(pc as *const u16) };
     if first & 0b11 == 0b11 {

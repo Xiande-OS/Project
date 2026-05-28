@@ -3,6 +3,7 @@
 pub mod address;
 pub mod frame;
 pub mod heap;
+pub mod memory_set;
 pub mod page_table;
 
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, PAGE_SIZE};
@@ -13,6 +14,10 @@ pub use page_table::{PageTable, Pte, PteFlags};
 /// We pick 0x88000000 as a conservative cap (128 MiB beyond kernel base);
 /// good enough for now and avoids walking the DTB at this stage.
 pub const MEMORY_END: usize = 0x8800_0000;
+
+pub const fn mm_end() -> usize {
+    MEMORY_END
+}
 
 /// Symbols exported by linker.ld.
 extern "C" {
