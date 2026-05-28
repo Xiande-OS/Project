@@ -80,12 +80,23 @@ impl VmArea {
     }
 }
 
+/// Base address from which anonymous mmap (and file mmap) hands out
+/// pages. Grows upward, kept page-aligned, and lives well below the
+/// user stack (USER_STACK_TOP = 0x4000_0000) so a typical malloc-heavy
+/// workload has hundreds of MiB to play with without colliding with
+/// brk or stack. Must NOT overlap brk (which lives just above the
+/// program image, typically around 0x12_0000).
+pub const MMAP_BASE: usize = 0x2000_0000;
+
 pub struct MemorySet {
     pub page_table: PageTable,
     pub areas: Vec<VmArea>,
     /// Heap (brk) state.
     pub brk_base: VirtAddr,
     pub brk_cur: VirtAddr,
+    /// Next free virtual address for anonymous/file mmap. Always
+    /// page-aligned. Grows upward.
+    pub mmap_top: VirtAddr,
 }
 
 impl MemorySet {
@@ -95,6 +106,7 @@ impl MemorySet {
             areas: Vec::new(),
             brk_base: VirtAddr(0),
             brk_cur: VirtAddr(0),
+            mmap_top: VirtAddr(MMAP_BASE),
         }
     }
 
@@ -309,6 +321,7 @@ impl MemorySet {
         }
         new_ms.brk_base = self.brk_base;
         new_ms.brk_cur = self.brk_cur;
+        new_ms.mmap_top = self.mmap_top;
         new_ms
     }
 
@@ -364,5 +377,23 @@ impl MemorySet {
         }
         self.brk_cur = new_brk;
         self.brk_cur
+    }
+
+    /// Allocate and map `len` bytes of anonymous user memory with the
+    /// given permissions. Returns the page-aligned start address. The
+    /// allocator carves out the region above the previous mmap_top so
+    /// it never collides with brk or with other mmap regions. The
+    /// returned address is always PAGE_SIZE aligned, which is what
+    /// musl's mallocng (and friends) require — it asserts on 16-byte
+    /// alignment of every malloc result, and a page-aligned region
+    /// trivially satisfies that.
+    pub fn mmap_anon(&mut self, len: usize, perm: VmPerm, init: Option<&[u8]>) -> VirtAddr {
+        let aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let start = self.mmap_top.0;
+        let end = start + aligned;
+        let area = VmArea::new(VirtAddr(start), VirtAddr(end), perm);
+        self.push_user_area(area, init);
+        self.mmap_top = VirtAddr(end);
+        VirtAddr(start)
     }
 }

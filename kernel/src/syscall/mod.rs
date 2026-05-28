@@ -2973,8 +2973,11 @@ fn sys_clock_getres(_clk: usize, ts: usize) -> isize {
     write_struct(ts, &ts_val)
 }
 
-fn sys_mmap(_addr: usize, len: usize, _prot: i32, flags: i32, fd: i32, off: usize) -> isize {
+fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize) -> isize {
     const MAP_ANONYMOUS: i32 = 0x20;
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const PROT_EXEC: i32 = 4;
     if len == 0 {
         return EINVAL;
     }
@@ -2995,18 +2998,33 @@ fn sys_mmap(_addr: usize, len: usize, _prot: i32, flags: i32, fd: i32, off: usiz
         None
     };
 
+    // Translate Linux PROT_* into our VmPerm. Always-U (user) since
+    // this syscall only ever serves user mappings. A zero-prot map
+    // ("guard pages") still needs U so the kernel can later flip its
+    // perms via mprotect; default to R|W if no flag bits at all to
+    // stay compatible with musl's `mmap(NULL, n, 0, ...)` which is
+    // immediately followed by mprotect for the live portion.
+    let mut perm = crate::mm::memory_set::VmPerm::U;
+    if (prot & PROT_READ) != 0 {
+        perm |= crate::mm::memory_set::VmPerm::R;
+    }
+    if (prot & PROT_WRITE) != 0 {
+        perm |= crate::mm::memory_set::VmPerm::W;
+    }
+    if (prot & PROT_EXEC) != 0 {
+        perm |= crate::mm::memory_set::VmPerm::X;
+    }
+    if prot == 0 {
+        perm |= crate::mm::memory_set::VmPerm::R | crate::mm::memory_set::VmPerm::W;
+    }
+
     let mut ms = task.memory_set_mut();
-    let start = ms.brk_cur.0;
-    let area = crate::mm::memory_set::VmArea::new(
-        crate::mm::VirtAddr(start),
-        crate::mm::VirtAddr(start + aligned),
-        crate::mm::memory_set::VmPerm::R
-            | crate::mm::memory_set::VmPerm::W
-            | crate::mm::memory_set::VmPerm::U,
-    );
-    ms.push_user_area(area, init.as_deref());
-    ms.brk_cur = crate::mm::VirtAddr(start + aligned);
-    start as isize
+    // Allocate from the dedicated mmap region so we never collide with
+    // brk (which the user can grow/shrink at byte granularity). The
+    // returned address is page-aligned, satisfying the 16-byte
+    // alignment that musl's mallocng asserts on every allocation.
+    let start = ms.mmap_anon(aligned, perm, init.as_deref());
+    start.0 as isize
 }
 
 fn sys_renameat2(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _flags: u32) -> isize {
