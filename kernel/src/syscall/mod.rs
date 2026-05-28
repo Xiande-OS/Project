@@ -3274,33 +3274,88 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize) -> i
     };
     let set = u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0u8; 8]));
     let set = set & !unblockable_mask();
-    let _ = timeout_ptr; // we don't sleep; polling once is what musl tolerates
+
+    // Helper to dequeue & return a signal hit.
+    let take_signal = |signo: i32| -> isize {
+        task.signals
+            .pending
+            .fetch_and(!(1u64 << (signo - 1)), core::sync::atomic::Ordering::SeqCst);
+        if info_ptr != 0 {
+            let mut info = crate::signal::KSigInfo::default();
+            info.si_signo = signo;
+            info.si_code = SI_USER;
+            let bs = unsafe {
+                core::slice::from_raw_parts(
+                    &info as *const _ as *const u8,
+                    core::mem::size_of::<crate::signal::KSigInfo>(),
+                )
+            };
+            if task.copy_out_bytes(info_ptr, bs).is_none() {
+                return EFAULT;
+            }
+        }
+        signo as isize
+    };
 
     // Check immediately: if any pending bit overlaps set, dequeue + return signo.
     let pending = task.signals.pending.load(core::sync::atomic::Ordering::SeqCst);
     let hit = pending & set;
-    if hit == 0 {
-        return -11; // EAGAIN -- no signal currently pending in set
+    if hit != 0 {
+        let signo = (hit.trailing_zeros() + 1) as i32;
+        crate::task::forget_sleeper(task.pid);
+        return take_signal(signo);
     }
-    let signo = (hit.trailing_zeros() + 1) as i32;
-    task.signals
-        .pending
-        .fetch_and(!(1u64 << (signo - 1)), core::sync::atomic::Ordering::SeqCst);
-    if info_ptr != 0 {
-        let mut info = crate::signal::KSigInfo::default();
-        info.si_signo = signo;
-        info.si_code = SI_USER;
-        let bs = unsafe {
-            core::slice::from_raw_parts(
-                &info as *const _ as *const u8,
-                core::mem::size_of::<crate::signal::KSigInfo>(),
-            )
-        };
-        if task.copy_out_bytes(info_ptr, bs).is_none() {
-            return EFAULT;
+
+    // No signal pending. Decide whether to block or return EAGAIN immediately.
+    // timeout_ptr == 0 means "wait forever" per POSIX. timeout_ptr != 0 with
+    // {0,0} means "poll, do not block".
+    if timeout_ptr == 0 {
+        // Wait forever — park and let a signal wake us. The reentered syscall
+        // will see the pending signal and return on the next round.
+        *task.state.lock() = crate::task::TaskState::Waiting;
+        unsafe {
+            (*task.tf_ptr()).sepc -= 4;
         }
+        return 0;
     }
-    signo as isize
+    let Some(b) = task.copy_in_bytes(timeout_ptr, 16) else {
+        return EFAULT;
+    };
+    let sec = u64::from_le_bytes(b[0..8].try_into().unwrap_or([0u8; 8]));
+    let nsec = u64::from_le_bytes(b[8..16].try_into().unwrap_or([0u8; 8]));
+    if nsec >= 1_000_000_000 {
+        return EINVAL;
+    }
+    let timeout_ticks = sec.saturating_mul(10_000_000).saturating_add(nsec / 100);
+    if timeout_ticks == 0 {
+        // {0,0} poll: caller asked for non-blocking; nothing pending.
+        return -11; // EAGAIN
+    }
+    let now = riscv::register::time::read64();
+    // Use existing SLEEPING_UNTIL entry if this is a re-entry (so the
+    // deadline doesn't extend each time we get a spurious wake from an
+    // out-of-set signal). Otherwise install a fresh deadline.
+    //
+    // This is the fix for libctest's `runtest.exe -w entry-static.exe <name>`:
+    // runtest.exe blocks on rt_sigtimedwait waiting for SIGCHLD from the
+    // forked test child. Previously we returned EAGAIN immediately and
+    // runtest.exe SIGKILL'd the child before it could print "Pass!".
+    let deadline = crate::task::sleeper_deadline(task.pid).unwrap_or_else(|| {
+        let d = now.saturating_add(timeout_ticks);
+        crate::task::sleep_until(task.pid, d);
+        d
+    });
+    if now >= deadline {
+        crate::task::forget_sleeper(task.pid);
+        return -11; // EAGAIN -- timed out
+    }
+    // Park and let either a signal raise wake us (which moves us Ready),
+    // or the scheduler's wake_expired_sleepers fire on the deadline.
+    *task.state.lock() = crate::task::TaskState::Waiting;
+    unsafe {
+        (*task.tf_ptr()).sepc -= 4;
+    }
+    0
 }
 
 fn sys_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {

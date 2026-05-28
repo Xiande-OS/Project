@@ -289,6 +289,13 @@ pub fn forget_sleeper(pid: i32) {
     SLEEPING_UNTIL.lock().remove(&pid);
 }
 
+/// Returns the current sleep deadline for `pid` if it is parked, else None.
+/// Used by sys_rt_sigtimedwait re-entry to avoid extending the deadline on
+/// every wake by an out-of-set signal.
+pub fn sleeper_deadline(pid: i32) -> Option<u64> {
+    SLEEPING_UNTIL.lock().get(&pid).copied()
+}
+
 /// Returns true if any task is parked on a sleep / futex deadline
 /// that hasn't expired yet. Used by the scheduler's deadlock check —
 /// a stalled kernel where nobody is ever going to wake should panic
