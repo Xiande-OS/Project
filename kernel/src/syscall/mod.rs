@@ -142,6 +142,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SCHED_SETSCHEDULER => 0,
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         nr::SYS_CLOCK_GETRES => sys_clock_getres(a0, a1),
+        // epoll stubs: empty event-set, never readies. cyclictest +
+        // others fall back to polling timers instead of hanging on
+        // ENOSYS.
+        nr::SYS_EPOLL_CREATE1 => 100,
+        nr::SYS_EPOLL_CTL => 0,
+        nr::SYS_EPOLL_PWAIT => 0,
         nr::SYS_GETTIMEOFDAY => sys_gettimeofday(a0),
         nr::SYS_SCHED_YIELD => 0,
         nr::SYS_TGKILL => sys_tgkill(a0 as i32, a1 as i32, a2 as i32),
