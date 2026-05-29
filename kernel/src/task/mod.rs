@@ -15,7 +15,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
 
-use crate::arch::riscv64::trap::TrapFrame;
+use crate::arch::TrapFrame;
 use crate::loader::LoadedElf;
 use crate::mm::memory_set::{MemorySet, VmArea, VmPerm};
 use crate::mm::{VirtAddr, PAGE_SIZE};
@@ -151,7 +151,8 @@ pub fn copy_in_via(ms: &MemorySet, va: usize, len: usize) -> Option<Vec<u8>> {
         let chunk = core::cmp::min(PAGE_SIZE - page_off, end - cursor);
         let pa = ms.translate(VirtAddr(page_va))?;
         let src = unsafe {
-            core::slice::from_raw_parts((pa.0 + page_off) as *const u8, chunk)
+            let ptr = crate::mm::PhysAddr(pa.0 + page_off).kernel_ptr::<u8>();
+            core::slice::from_raw_parts(ptr as *const u8, chunk)
         };
         out.extend_from_slice(src);
         cursor += chunk;
@@ -169,7 +170,8 @@ pub fn copy_out_via(ms: &MemorySet, va: usize, bytes: &[u8]) -> Option<()> {
         let chunk = core::cmp::min(PAGE_SIZE - page_off, end - cursor);
         let pa = ms.translate(VirtAddr(page_va))?;
         let dst = unsafe {
-            core::slice::from_raw_parts_mut((pa.0 + page_off) as *mut u8, chunk)
+            let ptr = crate::mm::PhysAddr(pa.0 + page_off).kernel_ptr::<u8>();
+            core::slice::from_raw_parts_mut(ptr, chunk)
         };
         dst.copy_from_slice(&bytes[written..written + chunk]);
         written += chunk;
@@ -332,7 +334,7 @@ fn panic_dead_locked(cur_pid: i32, reason: &str) -> ! {
     crate::println!("\n=== KERNEL DEADLOCK DETECTED ===");
     crate::println!("reason: {}", reason);
     crate::println!("current pid: {}", cur_pid);
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     crate::println!("mtime: {}", now);
     crate::println!("task table:");
     let snapshot: Vec<(i32, TaskState, i32, i32)> = {
@@ -520,12 +522,9 @@ pub fn create_task_from_elf_with_path(
     crate::vdso::install(&mut ms);
 
     let mut tf = TrapFrame::default();
-    tf.sepc = elf.entry;
-    tf.x[1] = user_sp_top;
-    // SPIE | SUM | FS=Initial (1<<13) so user-mode FP doesn't trap on first
-    // touch. busybox' setjmp saves fs0..fs11.
-    let sstatus: usize = (1 << 5) | (1 << 18) | (1 << 13);
-    tf.sstatus = sstatus;
+    tf.set_user_pc(elf.entry);
+    tf.set_user_sp(user_sp_top);
+    tf.init_user_state();
 
     let task = make_task_with_ms(ms, tf, 0);
     *task.cmdline.lock() = build_cmdline(argv);
@@ -543,6 +542,7 @@ fn build_cmdline(argv: &[&str]) -> Vec<u8> {
     out
 }
 
+#[cfg(target_arch = "riscv64")]
 fn map_kernel_into(ms: &mut MemorySet) {
     extern "C" {
         fn __kernel_start();
@@ -553,6 +553,16 @@ fn map_kernel_into(ms: &mut MemorySet) {
     ms.map_mmio(0x1000_0000, 0x1000_1000); // UART
     ms.map_mmio(0x1000_1000, 0x1000_9000); // virtio-mmio
 }
+
+/// loongarch64 reaches the whole kernel image + all MMIO through the DMW0
+/// (cached) and DMW1 (uncached) direct-map windows, which bypass the TLB
+/// entirely. The per-process page table therefore needs no kernel or MMIO
+/// identity mappings — only the user (low-half) regions installed by
+/// `push_user_area`. Mapping the high-half kernel VA here would also be
+/// actively wrong: the 3×9-bit walk only sees the low 27 VPN bits, so a
+/// DMW kernel address would alias an unrelated low user VPN.
+#[cfg(target_arch = "loongarch64")]
+fn map_kernel_into(_ms: &mut MemorySet) {}
 
 fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
     let pid = alloc_pid();
@@ -642,11 +652,16 @@ fn setup_initial_stack(
 
     sp &= !0xfusize;
 
-    let auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec![
-        // AT_SYSINFO_EHDR: base of the vDSO ELF. glibc parses its program
-        // headers + .eh_frame from here so pthread_cancel's forced unwind
-        // can step across the signal frame (see kernel/src/vdso.rs).
-        (33, crate::vdso::VDSO_BASE),
+    let mut auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    // AT_SYSINFO_EHDR: base of the vDSO ELF. glibc parses its program
+    // headers + .eh_frame from here so pthread_cancel's forced unwind can
+    // step across the signal frame (see kernel/src/vdso.rs). The embedded
+    // vDSO is a RISC-V image, so only advertise it on riscv64 — handing a
+    // foreign vDSO to a loongarch64 libc makes it parse a bogus ELF and
+    // chase near-null symbol pointers. LA libc just uses direct syscalls.
+    #[cfg(target_arch = "riscv64")]
+    auxv.push((33, crate::vdso::VDSO_BASE));
+    auxv.extend_from_slice(&[
         (3, elf.phdr_va),
         (4, elf.phent),
         (5, elf.phnum),
@@ -665,7 +680,7 @@ fn setup_initial_stack(
         (15, platform_va),
         (31, arg_addrs.first().copied().unwrap_or(0)),
         (0, 0),
-    ];
+    ]);
 
     let ptrs_bytes = 8
         + 8 * (arg_addrs.len() + 1 + env_addrs.len() + 1)
@@ -791,12 +806,12 @@ pub fn clone_current(
 
     // ---- TF: clone parent's, override sp/tp/a0 ----
     let mut new_tf = unsafe { (*parent.tf_ptr()).clone() };
-    new_tf.x[9] = 0; // child sees 0 from clone
+    new_tf.set_syscall_ret(0); // child sees 0 from clone
     if child_sp != 0 {
-        new_tf.x[1] = child_sp;
+        new_tf.set_user_sp(child_sp);
     }
     if flags & CLONE_SETTLS != 0 {
-        new_tf.x[3] = newtls; // x4 = tp (index 3 because x[0] is x1)
+        new_tf.set_user_tp(newtls);
     }
 
     // ---- Allocate the task with a fresh kstack/TF, then patch shared fields ----
@@ -910,7 +925,7 @@ pub fn clone_current(
     if flags & CLONE_VFORK != 0 {
         *parent.vfork_child.lock() = Some(task.pid);
         unsafe {
-            (*parent.tf_ptr()).x[9] = task.pid as usize;
+            (*parent.tf_ptr()).set_syscall_ret(task.pid as usize);
         }
         *parent.state.lock() = TaskState::Waiting;
     }
@@ -949,19 +964,13 @@ pub fn execve_current_with_path(
         *slot = ms;
         new_satp = slot.satp();
     }
-    unsafe {
-        core::arch::asm!(
-            "csrw satp, {satp}",
-            "sfence.vma",
-            satp = in(reg) new_satp,
-        );
-    }
+    crate::arch::activate_page_table(new_satp);
 
     // Replace trap frame with fresh entry state.
     let mut tf = TrapFrame::default();
-    tf.sepc = elf.entry;
-    tf.x[1] = user_sp_top;
-    tf.sstatus = (1 << 5) | (1 << 18) | (1 << 13); // SPIE | SUM | FS=Initial
+    tf.set_user_pc(elf.entry);
+    tf.set_user_sp(user_sp_top);
+    tf.init_user_state();
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
     }
@@ -1011,12 +1020,8 @@ pub fn run_user_loop(task: &Arc<Task>) -> ! {
     let satp = task.memory_set.lock().satp();
     let tf_ptr = task.tf_ptr();
 
+    crate::arch::activate_page_table(satp);
     unsafe {
-        core::arch::asm!(
-            "csrw satp, {satp}",
-            "sfence.vma",
-            satp = in(reg) satp,
-        );
         __trap_return(tf_ptr as *const _);
     }
 }
@@ -1042,7 +1047,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     // Wake any nanosleep'd tasks whose deadline has elapsed. Without
     // this a polling sleeper (busybox `timeout`) holds the CPU forever.
     {
-        let now = riscv::register::time::read64();
+        let now = crate::arch::now_ticks();
         wake_expired_sleepers(now);
         wake_expired_itimers(now);
     }
@@ -1092,7 +1097,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         //     visible instead of a silent hang.
         loop {
             {
-        let now = riscv::register::time::read64();
+        let now = crate::arch::now_ticks();
         wake_expired_sleepers(now);
         wake_expired_itimers(now);
     }
@@ -1104,12 +1109,11 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             // No-progress check: are there any other live tasks at
             // all, and do any of them have a deadline that could
             // eventually wake us? If neither, this is a real deadlock.
-            let now = riscv::register::time::read64();
+            let now = crate::arch::now_ticks();
             let alive_others = any_runnable_except(cur_pid) || any_waiting();
             if !alive_others {
                 if cur_state == Some(TaskState::Zombie) {
-                    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-                    loop { unsafe { core::arch::asm!("wfi") }; }
+                    crate::arch::shutdown();
                 }
                 panic_dead_locked(cur_pid, "no other live tasks");
             }
@@ -1143,13 +1147,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
                 CURRENT_PID.store(next.pid, Ordering::Relaxed);
                 let next_satp = next.memory_set.lock().satp();
                 if cur_satp != Some(next_satp) {
-                    unsafe {
-                        core::arch::asm!(
-                            "csrw satp, {satp}",
-                            "sfence.vma",
-                            satp = in(reg) next_satp,
-                        );
-                    }
+                    crate::arch::activate_page_table(next_satp);
                 }
                 let next_tf = next.tf_ptr();
                 unsafe { crate::signal::check_signals(&next, &mut *next_tf); }
@@ -1175,7 +1173,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             // Zombie path: spin until something Ready appears.
             loop {
                 {
-        let now = riscv::register::time::read64();
+        let now = crate::arch::now_ticks();
         wake_expired_sleepers(now);
         wake_expired_itimers(now);
     }
@@ -1185,8 +1183,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
                 }
                 if any_runnable_except(cur_pid) { break; }
                 if !any_waiting() {
-                    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-                    loop { unsafe { core::arch::asm!("wfi") }; }
+                    crate::arch::shutdown();
                 }
                 core::hint::spin_loop();
             }
@@ -1218,13 +1215,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         // user signal frame writes to the right page table. If next
         // becomes Zombie below, restore cur_satp before falling back.
         if cur_satp != Some(next_satp) {
-            unsafe {
-                core::arch::asm!(
-                    "csrw satp, {satp}",
-                    "sfence.vma",
-                    satp = in(reg) next_satp,
-                );
-            }
+            crate::arch::activate_page_table(next_satp);
         }
         let next_tf = next.tf_ptr();
         unsafe { crate::signal::check_signals(&next, &mut *next_tf); }
@@ -1232,13 +1223,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             // Restore the previous satp and try the next candidate.
             if let Some(s) = cur_satp {
                 if Some(next_satp) != cur_satp {
-                    unsafe {
-                        core::arch::asm!(
-                            "csrw satp, {satp}",
-                            "sfence.vma",
-                            satp = in(reg) s,
-                        );
-                    }
+                    crate::arch::activate_page_table(s);
                 }
             }
             continue;

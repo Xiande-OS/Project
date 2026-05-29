@@ -35,7 +35,7 @@ use spin::Mutex;
 
 pub type SigActions = [KSigAction; (NSIG + 1) as usize];
 
-use crate::arch::riscv64::trap::TrapFrame;
+use crate::arch::TrapFrame;
 use crate::mm::memory_set::MemorySet;
 use crate::mm::VirtAddr;
 use crate::task::{Task, TaskState};
@@ -45,13 +45,18 @@ use crate::task::{Task, TaskState};
 /// below the dynamic-linker base (0x10_0000_0000).
 pub const SIG_RESTORER_VA: usize = 0x5000_0000;
 
-/// Build a 4 KiB page whose first 8 bytes are `li a7, 139 ; ecall`.
-/// Repeating the instructions across the page is unnecessary but
-/// harmless.
+/// Build a 4 KiB page whose first 8 bytes are the `rt_sigreturn` (139)
+/// trampoline for the target ISA. The kernel points a returning signal
+/// handler's `ra` here; on return it issues rt_sigreturn. The two
+/// instructions are architecture-specific machine code.
 fn restorer_page_bytes() -> [u8; 4096] {
     let mut buf = [0u8; 4096];
-    // li a7, 139   -> 0x08b00893
+    // riscv64: `li a7, 139` (0x08b00893) ; `ecall` (0x00000073)
+    #[cfg(target_arch = "riscv64")]
     let insns: [u32; 2] = [0x08b00893, 0x00000073];
+    // loongarch64: `li.w $a7, 139` (0x03822c0b) ; `syscall 0` (0x002b0000)
+    #[cfg(target_arch = "loongarch64")]
+    let insns: [u32; 2] = [0x03822c0b, 0x002b0000];
     let bytes = unsafe {
         core::slice::from_raw_parts(insns.as_ptr() as *const u8, 8)
     };
@@ -542,58 +547,18 @@ pub const SIGFRAME_SIZE: usize = size_of::<RtSigFrame>();
 
 // ----- Building a sigframe + entering the user handler -----
 
+// Sigcontext save / restore is the riscv64 register-name dance, so it
+// lives on TrapFrame itself (in arch/riscv64/trap.rs). These two thin
+// wrappers preserve the old call sites.
+
 fn copy_tf_to_gregs(tf: &TrapFrame) -> KGRegs {
-    let x = &tf.x;
-    KGRegs {
-        pc: tf.sepc as u64,
-        ra: x[0] as u64,  // x1
-        sp: x[1] as u64,  // x2
-        gp: x[2] as u64,  // x3
-        tp: x[3] as u64,  // x4
-        t0: x[4] as u64,  t1: x[5] as u64,  t2: x[6] as u64,
-        s0: x[7] as u64,  s1: x[8] as u64,
-        a0: x[9] as u64,  a1: x[10] as u64, a2: x[11] as u64, a3: x[12] as u64,
-        a4: x[13] as u64, a5: x[14] as u64, a6: x[15] as u64, a7: x[16] as u64,
-        s2: x[17] as u64, s3: x[18] as u64, s4: x[19] as u64, s5: x[20] as u64,
-        s6: x[21] as u64, s7: x[22] as u64, s8: x[23] as u64, s9: x[24] as u64,
-        s10: x[25] as u64, s11: x[26] as u64,
-        t3: x[27] as u64, t4: x[28] as u64, t5: x[29] as u64, t6: x[30] as u64,
-    }
+    let mut g = KGRegs::default();
+    tf.save_to_sigcontext(&mut g);
+    g
 }
 
 fn restore_tf_from_gregs(tf: &mut TrapFrame, g: &KGRegs) {
-    tf.sepc = g.pc as usize;
-    tf.x[0] = g.ra as usize;
-    tf.x[1] = g.sp as usize;
-    tf.x[2] = g.gp as usize;
-    tf.x[3] = g.tp as usize;
-    tf.x[4] = g.t0 as usize;
-    tf.x[5] = g.t1 as usize;
-    tf.x[6] = g.t2 as usize;
-    tf.x[7] = g.s0 as usize;
-    tf.x[8] = g.s1 as usize;
-    tf.x[9] = g.a0 as usize;
-    tf.x[10] = g.a1 as usize;
-    tf.x[11] = g.a2 as usize;
-    tf.x[12] = g.a3 as usize;
-    tf.x[13] = g.a4 as usize;
-    tf.x[14] = g.a5 as usize;
-    tf.x[15] = g.a6 as usize;
-    tf.x[16] = g.a7 as usize;
-    tf.x[17] = g.s2 as usize;
-    tf.x[18] = g.s3 as usize;
-    tf.x[19] = g.s4 as usize;
-    tf.x[20] = g.s5 as usize;
-    tf.x[21] = g.s6 as usize;
-    tf.x[22] = g.s7 as usize;
-    tf.x[23] = g.s8 as usize;
-    tf.x[24] = g.s9 as usize;
-    tf.x[25] = g.s10 as usize;
-    tf.x[26] = g.s11 as usize;
-    tf.x[27] = g.t3 as usize;
-    tf.x[28] = g.t4 as usize;
-    tf.x[29] = g.t5 as usize;
-    tf.x[30] = g.t6 as usize;
+    tf.restore_from_sigcontext(g);
 }
 
 /// Inspect signals and possibly start delivering one. Returns true when
@@ -656,8 +621,8 @@ pub fn check_signals(task: &Arc<Task>, tf: &mut TrapFrame) -> bool {
             .swap(false, Ordering::Relaxed)
             && (act.flags & SA_RESTART) == 0
         {
-            tf.sepc += 4; // step past the ecall we had rewound
-            tf.x[9] = (-4isize) as usize; // -EINTR
+            tf.advance_past_syscall();
+            tf.set_syscall_ret((-4isize) as usize); // -EINTR
         }
 
         // Custom user handler.
@@ -741,15 +706,26 @@ fn deliver_user_handler(
     // unwind needs to step across this signal frame. musl is unaffected
     // (it just rt_sigreturns from there as before). If the app explicitly
     // installed its own restorer, honour it.
-    let restorer = if act.restorer == 0 {
-        crate::vdso::sigreturn_entry()
-    } else {
+    let restorer = if act.restorer != 0 {
         act.restorer
+    } else {
+        // riscv64: the vDSO's __vdso_rt_sigreturn (same `li a7,139; ecall`
+        // body but with .cfi_signal_frame CFI for glibc's forced unwind).
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::vdso::sigreturn_entry()
+        }
+        // loongarch64: the embedded vDSO is a RISC-V image, so use the
+        // per-process LA restorer page (`li.w $a7,139; syscall 0`).
+        #[cfg(target_arch = "loongarch64")]
+        {
+            SIG_RESTORER_VA
+        }
     };
 
     // Compute the sp for the handler. If SA_ONSTACK and an enabled
     // altstack exists and we're not already on it, switch.
-    let mut new_sp = tf.x[1]; // current user sp
+    let mut new_sp = tf.user_sp();
     {
         if (act.flags & SA_ONSTACK) != 0 {
             if let Some(ast) = *task.signals.altstack.lock() {
@@ -855,30 +831,33 @@ fn deliver_user_handler(
         acts[signo as usize] = KSigAction::default();
     }
 
-    // Patch TF: sp, sepc, a0/a1/a2, ra.
-    tf.x[1] = frame_addr;                 // sp
-    tf.sepc = act.handler;
-    tf.x[9] = signo as usize;             // a0
-    tf.x[10] = frame_addr;                // a1 (siginfo*) — same as frame base
-    tf.x[11] = frame_addr + size_of::<KSigInfo>(); // a2 (ucontext*)
-    tf.x[0] = restorer;                   // ra
+    // Patch TF: sp, PC, a0/a1/a2, ra in one architecture-agnostic call.
+    tf.enter_signal_handler(
+        act.handler,
+        restorer,
+        frame_addr,
+        signo,
+        frame_addr,                                // siginfo* = frame base
+        frame_addr + size_of::<KSigInfo>(),        // ucontext* = right after siginfo
+    );
 
     // EINTR / SA_RESTART for an interrupted blocking syscall is handled by
     // the caller (`check_signals`, via `in_blocking_syscall`): without
-    // SA_RESTART it steps sepc past the ecall and sets a0 = -EINTR before
-    // we get here, so the handler's sigreturn lands on the post-ecall
-    // instruction with the interrupted return value.
+    // SA_RESTART it steps the syscall PC past the ecall and sets the
+    // return slot to -EINTR before we get here, so the handler's
+    // sigreturn lands on the post-ecall instruction with the interrupted
+    // return value.
 
     Ok(())
 }
 
 // ----- rt_sigreturn -----
 
-/// Pop the rt_sigframe from `tf.sp` and restore tf + sig_mask. Returns
-/// the value to leave in `a0` (which is `tf.x[9]`); per Linux ABI this
-/// is the saved `a0` from before the signal, restored from the frame.
+/// Pop the rt_sigframe from the user sp and restore tf + sig_mask.
+/// Returns the value to place in the syscall return slot — per Linux ABI
+/// this is the saved a0 from before the signal, restored from the frame.
 pub fn do_sigreturn(task: &Arc<Task>, tf: &mut TrapFrame) -> isize {
-    let frame_addr = tf.x[1];
+    let frame_addr = tf.user_sp();
 
     // Read the frame back.
     let Some(bytes) = task.copy_in_bytes(frame_addr, SIGFRAME_SIZE) else {
@@ -901,8 +880,7 @@ pub fn do_sigreturn(task: &Arc<Task>, tf: &mut TrapFrame) -> isize {
     task.signals.mask.store(mask, Ordering::SeqCst);
     *task.signals.saved_mask.lock() = None;
 
-    // The a0 in `tf` was just restored from gregs (a0 == saved). Return
-    // that as the syscall result (caller will skip the usual `tf.x[9] = ret`
-    // path).
-    tf.x[9] as isize
+    // The syscall ret slot was just restored from gregs (== saved a0).
+    // Return it so the caller can short-circuit the usual ret-write path.
+    tf.syscall_ret() as isize
 }

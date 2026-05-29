@@ -42,12 +42,10 @@ fn handle_tty_input(b: u8) -> Option<u8> {
 
 fn get_console_byte_blocking() -> u8 {
     loop {
-        let c = sbi_rt::legacy::console_getchar();
-        if c == usize::MAX || c == !0_usize {
+        let Some(b) = crate::arch::console_get() else {
             core::hint::spin_loop();
             continue;
-        }
-        let b = c as u8;
+        };
         let b = if b == b'\r' { b'\n' } else { b };
         if let Some(b) = handle_tty_input(b) {
             return b;
@@ -57,14 +55,9 @@ fn get_console_byte_blocking() -> u8 {
 }
 
 fn get_console_byte_nonblock() -> Option<u8> {
-    let c = sbi_rt::legacy::console_getchar();
-    if c == usize::MAX || c == !0_usize {
-        None
-    } else {
-        let b = c as u8;
-        let b = if b == b'\r' { b'\n' } else { b };
-        handle_tty_input(b)
-    }
+    let b = crate::arch::console_get()?;
+    let b = if b == b'\r' { b'\n' } else { b };
+    handle_tty_input(b)
 }
 
 /// Block until at least one byte is available on stdin, then drain the
@@ -250,8 +243,7 @@ impl File {
         }
         if self.is_console {
             for &b in buf {
-                #[allow(deprecated)]
-                sbi_rt::legacy::console_putchar(b as usize);
+                crate::arch::console_put(b);
             }
             return Ok(buf.len());
         }

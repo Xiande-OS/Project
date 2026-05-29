@@ -59,7 +59,7 @@ fn with_socket<R>(fd: i32, f: impl FnOnce(&Socket) -> R) -> Result<R, isize> {
 fn block_and_retry() {
     let me = current_task();
     if crate::syscall::nettrace_enabled() {
-        let nr = unsafe { (*me.tf_ptr()).x[16] };
+        let nr = unsafe { (*me.tf_ptr()).syscall_no() };
         crate::println!("[net] pid={} BLOCK on syscall#{}", me.pid, nr);
     }
     crate::task::mark_socket_waiter(me.pid);
@@ -70,7 +70,7 @@ fn block_and_retry() {
     *me.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
         let tf = me.tf_ptr();
-        (*tf).sepc -= 4;
+        (*tf).rewind_syscall();
     }
 }
 
@@ -106,7 +106,7 @@ fn block_and_retry_recheck(ready: impl Fn() -> bool) {
 /// `block_and_retry_recheck`.
 pub(crate) fn block_with_timeout(timeout_ticks: u64, ready: impl Fn() -> bool) -> bool {
     let me = current_task();
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     let deadline = crate::task::sleeper_deadline(me.pid).unwrap_or_else(|| {
         let d = now.saturating_add(timeout_ticks);
         crate::task::sleep_until(me.pid, d);
@@ -121,7 +121,7 @@ pub(crate) fn block_with_timeout(timeout_ticks: u64, ready: impl Fn() -> bool) -
     *me.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
         let tf = me.tf_ptr();
-        (*tf).sepc -= 4;
+        (*tf).rewind_syscall();
     }
     if ready() {
         *me.state.lock() = crate::task::TaskState::Ready;

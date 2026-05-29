@@ -41,6 +41,9 @@ static DYN_HELLO_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("DYN_HELLO_ELF_PATH")));
 static LD_MUSL_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("LD_MUSL_PATH")));
+#[cfg(feature = "la_hello")]
+static LA_HELLO_ALIGNED: &AlignedElf<[u8]> =
+    &AlignedElf(*include_bytes!(env!("LA_HELLO_ELF_PATH")));
 
 fn hello_elf() -> &'static [u8] {
     &HELLO_ALIGNED.0
@@ -70,7 +73,7 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("  dtb @ {:#x}", dtb_pa);
 
     mm::init();
-    arch::riscv64::trap::init();
+    arch::trap_init();
     // Parse the embedded vDSO once (panics early on any layout problem).
     vdso::init();
     fs::init();
@@ -131,6 +134,11 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     if let Some(td) = fs::tmpfs::downcast_dir(&fs::root()) {
         let lib_dir = fs::tmpfs::TmpfsDir::new_root();
         td.place_inode("lib", lib_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
+        // /lib64: loongarch64 (and some glibc) dynamic binaries encode
+        // PT_INTERP as /lib64/ld-... — bind_loaders populates it from the
+        // disk's loaders. Harmless empty dir on riscv64.
+        let lib64_dir = fs::tmpfs::TmpfsDir::new_root();
+        td.place_inode("lib64", lib64_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
         let tmp_dir = fs::tmpfs::TmpfsDir::new_root();
         td.place_inode("tmp", tmp_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
     }
@@ -178,6 +186,28 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         syscall::set_nettrace(true);
     }
 
+    // loongarch64 bring-up smoke test: run the freestanding LA "hello"
+    // (write(1,...) + exit) to prove user paging + TLB refill + the first
+    // syscall work end-to-end, then power off. Takes priority over contest
+    // mode. Build with:
+    //   cargo build --release -p kernel --target loongarch64-unknown-none \
+    //     --offline --no-default-features --features la_hello
+    #[cfg(feature = "la_hello")]
+    {
+        let elf = &LA_HELLO_ALIGNED.0;
+        println!("[user] la_hello: loading LA hello ({} bytes)", elf.len());
+        let task = task::create_task_from_elf_with_path(
+            elf,
+            &["la_hello"],
+            &["PATH=/bin"],
+            "/bin/la_hello",
+        );
+        println!("[user] la_hello: entering user mode...");
+        task::run_user_loop(&task);
+        println!("[user] la_hello: returned — shutting down");
+        arch::shutdown();
+    }
+
     // Contest mode: mount the testsuite EXT4 disk, build a driver
     // script that loops over every `*_testcode.sh`, and hand it to
     // busybox sh. When sh exits the scheduler shuts the machine down
@@ -202,8 +232,7 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         }
         // Fall through to a hard shutdown if prepare_init failed.
         println!("[xiande-os] contest prep failed — shutting down");
-        sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-        loop { unsafe { core::arch::asm!("wfi") }; }
+        arch::shutdown();
     }
 
     let (name, elf, argv) = if cfg!(feature = "bare_hello") {
@@ -267,9 +296,6 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("[kernel panic] {}", info);
-    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::SystemFailure);
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+    arch::shutdown_failure();
 }
 

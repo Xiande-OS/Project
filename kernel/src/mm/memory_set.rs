@@ -545,7 +545,16 @@ impl MemorySet {
     /// trivially satisfies that.
     pub fn mmap_anon(&mut self, len: usize, perm: VmPerm, init: Option<&[u8]>) -> VirtAddr {
         let aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let start = self.mmap_top.0;
+        let mut start = self.mmap_top.0;
+        // Never hand back a region overlapping the program break heap.
+        // `mmap_top` can be dragged into [brk_base, brk_cur) by a MAP_FIXED
+        // overlay placed near the brk (e.g. a libc heap guard); allocating
+        // there would alias the heap and silently corrupt it (musl mallocng
+        // metadata, in practice). Skip past the heap when that happens.
+        let brk_hi = (self.brk_cur.0 + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if start < brk_hi && start + aligned > self.brk_base.0 {
+            start = brk_hi;
+        }
         let end = start + aligned;
         let area = VmArea::new(VirtAddr(start), VirtAddr(end), perm);
         if self.push_user_area(area, init).is_err() {
@@ -582,9 +591,14 @@ impl MemorySet {
         if self.push_user_area(area, init).is_err() {
             return VirtAddr(usize::MAX);
         }
-        // Keep mmap_top above any fixed mapping so later anonymous mmaps
-        // don't collide with a region the loader still expects to own.
-        if end > self.mmap_top.0 {
+        // Keep mmap_top above a fixed mapping that *extends the mmap arena*
+        // — e.g. the dynamic loader overlaying PT_LOAD segments onto a span
+        // it just reserved with an anonymous mmap (so `start <= mmap_top`).
+        // Do NOT drag mmap_top up to a far fixed mapping in unrelated
+        // territory (a libc heap-guard placed near brk, or the interpreter
+        // base): that pulls subsequent anonymous mmaps out of the arena and
+        // straight on top of the brk heap, aliasing it.
+        if start <= self.mmap_top.0 && end > self.mmap_top.0 {
             self.mmap_top = VirtAddr(end);
         }
         VirtAddr(va)

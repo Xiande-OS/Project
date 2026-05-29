@@ -6,7 +6,7 @@ pub mod socket;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use crate::arch::riscv64::trap::TrapFrame;
+use crate::arch::TrapFrame;
 use crate::fs::{self, File, FileType, Inode};
 use crate::println;
 use crate::task::current_task;
@@ -33,18 +33,18 @@ const O_DIRECTORY: i32 = 0o200000;
 const O_CLOEXEC: i32 = 0o2000000;
 
 pub fn dispatch(tf: &mut TrapFrame) {
-    let id = tf.x[16];
-    let a0 = tf.x[9];
-    let a1 = tf.x[10];
-    let a2 = tf.x[11];
-    let a3 = tf.x[12];
-    let a4 = tf.x[13];
-    let a5 = tf.x[14];
+    let id = tf.syscall_no();
+    let a0 = tf.syscall_arg(0);
+    let a1 = tf.syscall_arg(1);
+    let a2 = tf.syscall_arg(2);
+    let a3 = tf.syscall_arg(3);
+    let a4 = tf.syscall_arg(4);
+    let a5 = tf.syscall_arg(5);
 
     if syscall_trace_enabled() {
         crate::println!(
             "[sys pid={}] #{} sp={:#x} a0={:#x} a1={:#x} a2={:#x}",
-            crate::task::current_pid(), id, tf.x[1], a0, a1, a2
+            crate::task::current_pid(), id, tf.user_sp(), a0, a1, a2
         );
     }
 
@@ -104,8 +104,9 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_SIGACTION => sys_rt_sigaction(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGRETURN => {
-            // Restore tf (incl. a0) from the rt_sigframe. Return the
-            // restored a0 so the trailing `tf.x[9] = ret` is a no-op.
+            // Restore tf (incl. syscall ret slot) from the rt_sigframe.
+            // The returned value matches what set_syscall_ret would write,
+            // making the trailing ret-write a no-op.
             let task = current_task();
             crate::signal::do_sigreturn(&task, tf)
         }
@@ -197,6 +198,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_LINKAT => sys_linkat(a0 as i32, a1, a2 as i32, a3, a4 as i32),
         nr::SYS_SYMLINKAT => sys_symlinkat(a0, a1 as i32, a2),
         nr::SYS_CLONE => sys_clone(a0, a1, a2, a3, a4),
+        nr::SYS_CLONE3 => sys_clone3(a0, a1),
         nr::SYS_EXECVE => sys_execve(a0, a1, a2),
         nr::SYS_WAIT4 => sys_wait4(a0 as i32, a1, a2 as i32),
         nr::SYS_WAITID => sys_waitid(a0 as i32, a1 as i32, a2, a3 as i32),
@@ -248,7 +250,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         crate::task::TaskState::Waiting
     );
     if !is_blocked {
-        tf.x[9] = ret as usize;
+        tf.set_syscall_ret(ret as usize);
     }
 }
 
@@ -410,7 +412,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                 *task.state.lock() = crate::task::TaskState::Waiting;
                 unsafe {
                     let tf = task.tf_ptr();
-                    (*tf).sepc -= 4;
+                    (*tf).rewind_syscall();
                 }
                 return 0;
             }
@@ -437,7 +439,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     // so a read that never wakes returns EAGAIN instead of
                     // hanging forever. Unbounded otherwise.
                     if recv_to_ticks != 0 {
-                        let now = riscv::register::time::read64();
+                        let now = crate::arch::now_ticks();
                         let deadline = crate::task::sleeper_deadline(task.pid)
                             .unwrap_or_else(|| {
                                 let d = now.saturating_add(recv_to_ticks);
@@ -454,7 +456,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     *task.state.lock() = crate::task::TaskState::Waiting;
                     unsafe {
                         let tf = task.tf_ptr();
-                        (*tf).sepc -= 4;
+                        (*tf).rewind_syscall();
                     }
                     // Re-check after parking: a peer send() between our
                     // can_recv() test and the Waiting store would otherwise
@@ -477,7 +479,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     *task.state.lock() = crate::task::TaskState::Waiting;
                     unsafe {
                         let tf = task.tf_ptr();
-                        (*tf).sepc -= 4;
+                        (*tf).rewind_syscall();
                     }
                     return -11;
                 }
@@ -535,7 +537,7 @@ fn sys_readv(fd: i32, iov: usize, count: usize) -> isize {
                                         crate::task::TaskState::Waiting;
                                     unsafe {
                                         let tf = task.tf_ptr();
-                                        (*tf).sepc -= 4;
+                                        (*tf).rewind_syscall();
                                     }
                                     return -11;
                                 }
@@ -914,7 +916,7 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         // Finite timeout? Install a sleep deadline so we wake up when it
         // expires even if no fd ever became readable.
         if let Some(t) = timeout_ticks {
-            let now = riscv::register::time::read64();
+            let now = crate::arch::now_ticks();
             let deadline = crate::task::sleeper_deadline(task.pid)
                 .unwrap_or_else(|| {
                     let d = now.saturating_add(t);
@@ -933,7 +935,7 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         *task.state.lock() = crate::task::TaskState::Waiting;
         unsafe {
             let tf = task.tf_ptr();
-            (*tf).sepc -= 4;
+            (*tf).rewind_syscall();
         }
         // Lost-wakeup guard (see sys_pselect6): re-scan after parking so a
         // datagram/byte that landed during the park isn't missed.
@@ -1618,7 +1620,7 @@ impl crate::fs::Inode for TimerFd {
         if buf.len() < 8 { return Err(crate::fs::EINVAL); }
         let exp_at = *self.expiry.lock();
         if exp_at == 0 { return Ok(0); }
-        while riscv::register::time::read64() < exp_at {
+        while crate::arch::now_ticks() < exp_at {
             core::hint::spin_loop();
         }
         let interval = *self.interval_ticks.lock();
@@ -1626,7 +1628,7 @@ impl crate::fs::Inode for TimerFd {
             *self.expiry.lock() = 0;
             1
         } else {
-            let now = riscv::register::time::read64();
+            let now = crate::arch::now_ticks();
             let n = ((now - exp_at) / interval) + 1;
             *self.expiry.lock() = exp_at + n * interval;
             n
@@ -1674,7 +1676,7 @@ fn sys_timerfd_settime(fd: i32, _flags: i32, new_value: usize, old_value: usize)
 
     let interval = ts_to_ticks(interval_s, interval_ns);
     let value = ts_to_ticks(value_s, value_ns);
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     *tf.expiry.lock() = if value == 0 { 0 } else { now + value };
     *tf.interval_ticks.lock() = interval;
     0
@@ -2117,7 +2119,7 @@ fn sys_pselect6(
             // throttle loop selects with a finite timeout, expecting to be
             // re-scheduled when the throttle interval ends.
             if let Some(t) = timeout_ticks {
-                let now = riscv::register::time::read64();
+                let now = crate::arch::now_ticks();
                 let deadline = crate::task::sleeper_deadline(task.pid)
                     .unwrap_or_else(|| {
                         let d = now.saturating_add(t);
@@ -2151,7 +2153,7 @@ fn sys_pselect6(
             *task.state.lock() = crate::task::TaskState::Waiting;
             unsafe {
                 let tf = task.tf_ptr();
-                (*tf).sepc -= 4;
+                (*tf).rewind_syscall();
             }
             // Lost-wakeup guard: a peer that makes one of our read fds
             // ready between the scan above and the Waiting store would fire
@@ -2345,7 +2347,7 @@ fn sys_utimensat(dfd: i32, path: usize, times: usize, _flags: i32) -> isize {
         }
     };
 
-    let now_mtime = riscv::register::time::read64();
+    let now_mtime = crate::arch::now_ticks();
     let now_sec = (now_mtime / 10_000_000) as i64;
     let now_ns = ((now_mtime % 10_000_000) * 100) as i64;
 
@@ -2390,7 +2392,7 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     if total_ticks == 0 {
         return 0;
     }
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
 
     // Preserve the deadline across re-entry. We block by rewinding sepc to
     // the `ecall` and marking Waiting; the syscall re-runs on each wake.
@@ -2417,7 +2419,7 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     // acting). The deadline is preserved across re-entry above so the
     // restart doesn't extend the sleep.
     unsafe {
-        (*task.tf_ptr()).sepc -= 4;
+        (*task.tf_ptr()).rewind_syscall();
     }
 
     // If a deliverable signal is already pending, do NOT mark Waiting —
@@ -2478,7 +2480,7 @@ fn sys_setitimer(which: usize, new_val: usize, old_val: usize) -> isize {
     }
     let task = current_task();
     let pid = task.pid;
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
 
     // If userland wants the previous value, write it out first.
     if old_val != 0 {
@@ -2546,7 +2548,7 @@ fn sys_getitimer(which: usize, cur_val: usize) -> isize {
         return EFAULT;
     }
     let pid = current_task().pid;
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     let out = match crate::task::itimer_real_get(pid) {
         Some((deadline, interval)) => {
             let remain = if deadline > now { deadline - now } else { 0 };
@@ -3133,10 +3135,7 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
     // If no other runnable/waiting/zombie task exists, halt.
     let pid = task.pid;
     if !crate::task::any_runnable_except(pid) && !crate::task::any_waiting() {
-        sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-        loop {
-            unsafe { core::arch::asm!("wfi") };
-        }
+        crate::arch::shutdown();
     }
 }
 
@@ -3218,6 +3217,44 @@ fn sys_clone(flags: usize, child_sp: usize, ptid: usize, tls: usize, ctid: usize
         // Out of physical memory during address-space copy. Return
         // ENOMEM so userland's fork() fails gracefully instead of the
         // kernel panicking and dropping every downstream test group.
+        None => -12, // ENOMEM
+    }
+}
+
+/// clone3(struct clone_args *uargs, size_t size). glibc's pthread_create
+/// uses this in preference to clone(2). Translate the clone_args struct
+/// into the classic clone() parameters and reuse `clone_current`.
+///
+/// clone3 differs from clone: `stack` is the lowest address of the child
+/// stack (child sp = stack + stack_size), and the exit signal is its own
+/// field rather than the low byte of flags.
+fn sys_clone3(uargs: usize, size: usize) -> isize {
+    // Linux struct clone_args (prefix we use):
+    //   0:flags 8:pidfd 16:child_tid 24:parent_tid 32:exit_signal
+    //   40:stack 48:stack_size 56:tls
+    if size < 64 {
+        return -22; // EINVAL — too small to carry stack/tls
+    }
+    let task = current_task();
+    let Some(buf) = task.copy_in_bytes(uargs, core::cmp::min(size, 88)) else {
+        return -14; // EFAULT
+    };
+    let rd = |off: usize| -> u64 {
+        u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+    };
+    let flags = rd(0) as usize;
+    let child_tid = rd(16) as usize;
+    let parent_tid = rd(24) as usize;
+    let exit_signal = rd(32) as usize;
+    let stack = rd(40) as usize;
+    let stack_size = rd(48) as usize;
+    let tls = rd(56) as usize;
+    let child_sp = if stack != 0 { stack + stack_size } else { 0 };
+    // Fold the exit signal into the low byte so clone_current's SIGCHLD /
+    // wait bookkeeping matches the clone() convention.
+    let cl_flags = (flags & !0xff) | (exit_signal & 0xff);
+    match crate::task::clone_current(cl_flags, child_sp, parent_tid, child_tid, tls) {
+        Some(new_task) => new_task.pid as isize,
         None => -12, // ENOMEM
     }
 }
@@ -3421,7 +3458,7 @@ fn sys_wait4(pid: i32, status_addr: usize, options: i32) -> isize {
     // when a child becomes a zombie and wakes us.
     *me.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
-        (*me.tf_ptr()).sepc -= 4;
+        (*me.tf_ptr()).rewind_syscall();
     }
     0
 }
@@ -3470,7 +3507,7 @@ fn sys_uname(addr: usize) -> isize {
 fn sys_getrandom(buf: usize, len: usize, _flags: usize) -> isize {
     let task = current_task();
     let mut out = alloc::vec![0u8; len];
-    let mut x: u64 = riscv::register::time::read64()
+    let mut x: u64 = crate::arch::now_ticks()
         .wrapping_mul(2862933555777941757);
     for b in out.iter_mut() {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -3495,7 +3532,7 @@ struct Timeval {
 }
 
 fn sys_gettimeofday(tv: usize) -> isize {
-    let mtime = riscv::register::time::read64();
+    let mtime = crate::arch::now_ticks();
     let tv_val = Timeval {
         sec: (mtime / 10_000_000) as i64,
         usec: ((mtime % 10_000_000) / 10) as i64,
@@ -3504,7 +3541,7 @@ fn sys_gettimeofday(tv: usize) -> isize {
 }
 
 fn sys_clock_gettime(_clk: usize, ts: usize) -> isize {
-    let mtime = riscv::register::time::read64();
+    let mtime = crate::arch::now_ticks();
     let ts_val = Timespec {
         sec: (mtime / 10_000_000) as i64,
         nsec: ((mtime % 10_000_000) * 100) as i64,
@@ -3722,10 +3759,7 @@ fn cstr_to_str(bytes: &[u8]) -> Option<&str> {
 
 pub fn request_exit(status: i32) -> ! {
     println!("[kernel] killing task with status {}", status);
-    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::SystemFailure);
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+    crate::arch::shutdown_failure();
 }
 
 // =========================================================================
@@ -4043,7 +4077,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize) -> i
         // will see the pending signal and return on the next round.
         *task.state.lock() = crate::task::TaskState::Waiting;
         unsafe {
-            (*task.tf_ptr()).sepc -= 4;
+            (*task.tf_ptr()).rewind_syscall();
         }
         return 0;
     }
@@ -4060,7 +4094,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize) -> i
         // {0,0} poll: caller asked for non-blocking; nothing pending.
         return -11; // EAGAIN
     }
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     // Use existing SLEEPING_UNTIL entry if this is a re-entry (so the
     // deadline doesn't extend each time we get a spurious wake from an
     // out-of-set signal). Otherwise install a fresh deadline.
@@ -4082,7 +4116,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize) -> i
     // or the scheduler's wake_expired_sleepers fire on the deadline.
     *task.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
-        (*task.tf_ptr()).sepc -= 4;
+        (*task.tf_ptr()).rewind_syscall();
     }
     0
 }
@@ -4119,7 +4153,7 @@ fn sys_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
     // No deliverable signal; mark Waiting and rewind so we get rescheduled.
     *task.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
-        (*task.tf_ptr()).sepc -= 4;
+        (*task.tf_ptr()).rewind_syscall();
     }
     0
 }
