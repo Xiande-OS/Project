@@ -75,6 +75,7 @@ pub const SYS_TIMES: usize = 153;
 pub const SYS_UNAME: usize = 160;
 pub const SYS_GETRUSAGE: usize = 165;
 pub const SYS_GETTIMEOFDAY: usize = 169;
+pub const SYS_ADJTIMEX: usize = 171;
 pub const SYS_GETPID: usize = 172;
 pub const SYS_GETPPID: usize = 173;
 pub const SYS_GETUID: usize = 174;

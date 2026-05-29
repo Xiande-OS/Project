@@ -179,6 +179,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_EPOLL_CTL => 0,
         nr::SYS_EPOLL_PWAIT => 0,
         nr::SYS_GETTIMEOFDAY => sys_gettimeofday(a0),
+        nr::SYS_ADJTIMEX => sys_adjtimex(a0),
         nr::SYS_SCHED_YIELD => 0,
         nr::SYS_TGKILL => sys_tgkill(a0 as i32, a1 as i32, a2 as i32),
         nr::SYS_TKILL => sys_tkill(a0 as i32, a1 as i32),
@@ -1941,6 +1942,59 @@ fn sys_set_id(nr: usize, a0: usize, a1: usize, _a2: usize) -> isize {
         _ => {}
     }
     0
+}
+
+/// adjtimex(2). We don't steer the system clock, but we implement the
+/// syscall's validation and reporting semantics (mirroring the kernel's
+/// ntp_validate_timex) so the LTP adjtimex group runs:
+///   - read (modes == 0): report a synced clock with the standard HZ=100
+///     tick (10000us) and return TIME_OK.
+///   - mode 0x8000 (ADJ_ADJTIME without the single-shot bit): EINVAL, and
+///     the user buffer is left untouched (CVE-2018-11508 data-leak guard).
+///   - any clock modification by a non-root euid: EPERM.
+///   - ADJ_TICK with tick outside [900000/HZ, 1100000/HZ]: EINVAL.
+/// struct timex (LP64) offsets used here: modes@0, status@40, tick@88.
+fn sys_adjtimex(buf: usize) -> isize {
+    // Kernel-internal bit meanings (linux/timex.h), distinct from the uapi
+    // ADJ_* values: when ADJ_ADJTIME(0x8000) is set, 0x0001 means "single
+    // shot" and 0x2000 means "read only".
+    const ADJ_ADJTIME: u32 = 0x8000;
+    const ADJ_SINGLESHOT: u32 = 0x0001;
+    const ADJ_READONLY: u32 = 0x2000;
+    const ADJ_TICK: u32 = 0x4000;
+    const TIME_OK: isize = 0;
+    // HZ = 100 -> nominal tick 1_000_000/HZ, valid range [900000/HZ,1100000/HZ].
+    const TICK_NOMINAL: i64 = 10_000;
+    const TICK_MIN: i64 = 9_000;
+    const TICK_MAX: i64 = 11_000;
+
+    let task = current_task();
+    // Read enough of struct timex to see modes(@0) and tick(@88..96). A bad
+    // pointer (e.g. (timex*)-1) faults here -> EFAULT.
+    let Some(mut tx) = task.copy_in_bytes(buf, 96) else { return EFAULT; };
+    let modes = u32::from_le_bytes(tx[0..4].try_into().unwrap());
+
+    if modes & ADJ_ADJTIME != 0 && modes & ADJ_SINGLESHOT == 0 {
+        // 0x8000 alone is invalid; do not write anything back.
+        return EINVAL;
+    }
+    let euid = creds_of(cur_tgid())[1];
+    let read_only =
+        modes == 0 || (modes & ADJ_ADJTIME != 0 && modes & ADJ_READONLY != 0);
+    if !read_only && euid != 0 {
+        return EPERM;
+    }
+    if modes & ADJ_TICK != 0 {
+        let tick = i64::from_le_bytes(tx[88..96].try_into().unwrap());
+        if tick < TICK_MIN || tick > TICK_MAX {
+            return EINVAL;
+        }
+    }
+    // Success: report a synced clock (status@40 = TIME_OK, tick@88 = nominal).
+    tx[40..44].copy_from_slice(&0i32.to_le_bytes());
+    tx[88..96].copy_from_slice(&TICK_NOMINAL.to_le_bytes());
+    let _ = task.copy_out_bytes(buf, &tx);
+    TIME_OK
 }
 
 fn sys_prlimit64(pid: i32, resource: u32, new_lim: usize, old_lim: usize) -> isize {
