@@ -41,6 +41,12 @@ pub fn prepare_init() -> Option<(Arc<dyn Inode>, Vec<String>)> {
     // disk's copies available under /lib so dynamic exec succeeds.
     if mounted {
         bind_loaders();
+        // loongarch64: the /bin busybox + applets installed at boot are the
+        // RISC-V prebuilt and cannot run here. Re-point them at the disk's
+        // native LA busybox so shebangs (#!/bin/sh), system()/popen(), and
+        // PATH lookups of bare commands resolve to runnable code.
+        #[cfg(target_arch = "loongarch64")]
+        rebind_bin_to_disk_busybox();
     }
 
     let variants: Vec<(String, Vec<String>)> = if mounted {
@@ -173,18 +179,47 @@ fn bind_loaders() {
         ("/mnt/musl/lib/libc.so", "libc.so"),
     ];
     for (src, dst) in mappings {
-        match fs::lookup_path(fs::root(), src) {
-            Ok(inode) => {
-                if let Err(e) = fs::link_into("/lib", dst, inode) {
-                    println!("[xiande-os] link {} -> /lib/{} failed: {}", src, dst, e);
-                } else {
-                    println!("[xiande-os] /lib/{} -> {}", dst, src);
-                }
-            }
-            Err(_) => {
-                // Source missing — that's fine, this variant isn't shipped.
+        let Ok(inode) = fs::lookup_path(fs::root(), src) else {
+            // Source missing — that variant isn't shipped on this disk.
+            continue;
+        };
+        // Bind into both /lib and /lib64: musl/glibc dynamic binaries on
+        // the LA disk encode PT_INTERP as /lib64/ld-..., while others use
+        // /lib/. Provide the loader at both so dynamic exec resolves.
+        for dir in ["/lib", "/lib64"] {
+            if let Err(e) = fs::link_into(dir, dst, inode.clone()) {
+                println!("[xiande-os] link {} -> {}/{} failed: {}", src, dir, dst, e);
+            } else {
+                println!("[xiande-os] {}/{} -> {}", dir, dst, src);
             }
         }
+    }
+}
+
+/// loongarch64: the /bin busybox + applet links planted at boot are the
+/// RISC-V prebuilt (cannot execute here). Re-point them at the testsuite
+/// disk's native LA busybox so `/bin/sh` (script shebangs, system(),
+/// popen(), PATH lookups) runs real code instead of faulting with INE.
+#[cfg(target_arch = "loongarch64")]
+fn rebind_bin_to_disk_busybox() {
+    let bb = match ["/mnt/musl/busybox", "/mnt/glibc/busybox"]
+        .iter()
+        .find_map(|p| fs::lookup_path(fs::root(), p).ok())
+    {
+        Some(i) => i,
+        None => return,
+    };
+    // /busybox (shebang `#!/busybox sh`) + the full /bin applet set that
+    // main.rs linked, now pointing at the LA busybox (place_inode replaces).
+    let _ = fs::link_into("/", "busybox", bb.clone());
+    const APPLETS: &[&str] = &[
+        "busybox", "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir",
+        "mv", "cp", "true", "false", "env", "pwd", "wc", "grep", "head",
+        "tail", "sort", "uniq", "tr", "find", "touch", "test", "[", "[[",
+        "stat", "sleep", "kill",
+    ];
+    for a in APPLETS {
+        let _ = fs::link_into("/bin", a, bb.clone());
     }
 }
 

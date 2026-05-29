@@ -117,6 +117,11 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     if let Some(td) = fs::tmpfs::downcast_dir(&fs::root()) {
         let lib_dir = fs::tmpfs::TmpfsDir::new_root();
         td.place_inode("lib", lib_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
+        // /lib64: loongarch64 (and some glibc) dynamic binaries encode
+        // PT_INTERP as /lib64/ld-... — bind_loaders populates it from the
+        // disk's loaders. Harmless empty dir on riscv64.
+        let lib64_dir = fs::tmpfs::TmpfsDir::new_root();
+        td.place_inode("lib64", lib64_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
         let tmp_dir = fs::tmpfs::TmpfsDir::new_root();
         td.place_inode("tmp", tmp_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
     }
