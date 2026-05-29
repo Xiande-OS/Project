@@ -243,7 +243,16 @@ impl Fs {
 
     /// Read the file contents of an inode into a Vec.
     fn read_file(&self, ino: &Inode4) -> core::result::Result<Vec<u8>, &'static str> {
-        let mut out = vec![0u8; ino.size as usize];
+        // Fallible: a huge file (or an exhausted heap after many cached reads)
+        // must surface an error to the read/exec syscall, never trip the Rust
+        // alloc-error handler and panic the whole kernel (which would zero
+        // every test sequenced after it).
+        let size = ino.size as usize;
+        let mut out: Vec<u8> = Vec::new();
+        if out.try_reserve_exact(size).is_err() {
+            return Err("ENOMEM: file does not fit in heap");
+        }
+        out.resize(size, 0);
         let bs = self.sb.block_size as u64;
         let map = self.extent_map(ino)?;
         for (file_blk, phys_blk, len) in map {
