@@ -305,11 +305,34 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
             // far exceed our 90s budget) is done at sdcard-build time,
             // not via in-kernel sed: the redirect-into-overlay path is
             // fragile and the test image is rebuilt for each run anyway.
-            s.push_str(&alloc::format!(
-                "./busybox timeout -s KILL {b} ./busybox sh ./{s}\n",
-                b = budget,
-                s = script
-            ));
+            if script.starts_with("ltp_") {
+                // The LTP testcode.sh runs every binary in testcases/bin with
+                // no per-case timeout. Some are *helpers* that block forever
+                // when run standalone (e.g. cgroup_fj_proc sigsuspend()s
+                // waiting for a SIGUSR1 its parent script never sends), and a
+                // raw C helper has no tst_test SIGALRM to self-abort — so one
+                // such case wedges the whole loop and every later case scores
+                // zero (the loop never reached case >107). Rewrite the loop's
+                // bare `"$file"` invocation to wrap each case in its own
+                // `timeout` (this is exactly what LTP's own runltp does). A
+                // hung case now takes a real SIGKILL (ret 137) and the loop
+                // continues; the per-case limit is just above tst_test's own
+                // 60s timeout so genuine tests are never cut short.
+                s.push_str(&alloc::format!(
+                    "./busybox sed 's@^\\( *\\)\"$file\"\\( *\\)$@\\1./busybox timeout -s KILL 65 \"$file\"@' ./{s} > /tmp/ltp_to.sh 2>/dev/null\n",
+                    s = script
+                ));
+                s.push_str(&alloc::format!(
+                    "./busybox timeout -s KILL {b} ./busybox sh /tmp/ltp_to.sh\n",
+                    b = budget,
+                ));
+            } else {
+                s.push_str(&alloc::format!(
+                    "./busybox timeout -s KILL {b} ./busybox sh ./{s}\n",
+                    b = budget,
+                    s = script
+                ));
+            }
             s.push_str(&alloc::format!(
                 "./busybox echo '#### OS COMP TEST GROUP END {g}-{v} ####'\n",
                 g = group,
