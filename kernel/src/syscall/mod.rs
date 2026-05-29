@@ -16,6 +16,7 @@ const EBADF: isize = -9;
 const EFAULT: isize = -14;
 const EINVAL: isize = -22;
 const ERANGE: isize = -34;
+const EACCES: isize = -13;
 const ENOENT: isize = -2;
 
 const AT_FDCWD: i32 = -100;
@@ -807,8 +808,13 @@ fn sys_mkdirat(dfd: i32, path: usize, _mode: u32) -> isize {
     }
 }
 
-/// Linux `struct termios` on RISC-V (60 bytes). Just enough that
-/// `isatty(stdin)` returns true and the shell treats us as a terminal.
+/// The kernel UAPI `struct termios` (asm-generic, used by riscv64) that
+/// TCGETS fills: exactly 36 bytes — four 4-byte flags, c_line, and c_cc[19].
+/// It must NOT carry c_ispeed/c_ospeed: those belong to `struct termios2`
+/// (TCGETS2), and glibc's tcgetattr() allocates only a 36-byte
+/// `__kernel_termios` on the stack for TCGETS. Writing more overflows that
+/// buffer and smashes the caller's stack canary (every dynamic glibc binary
+/// aborts with "stack smashing detected" right after its first isatty()).
 #[repr(C)]
 #[derive(Default)]
 struct Termios {
@@ -818,8 +824,6 @@ struct Termios {
     c_lflag: u32,
     c_line: u8,
     c_cc: [u8; 19],
-    c_ispeed: u32,
-    c_ospeed: u32,
 }
 
 #[repr(C)]
@@ -2740,14 +2744,63 @@ fn sys_getitimer(which: usize, cur_val: usize) -> isize {
     write_struct(cur_val, &out)
 }
 
-fn sys_faccessat(dfd: i32, path: usize, _mode: i32) -> isize {
+/// Read an inode's (mode, owner uid, owner gid). tmpfs tracks these in its
+/// Meta (the rootfs is tmpfs, so LTP's tmpdir files carry their real chmod);
+/// everything else falls back to conventional defaults.
+fn inode_perm(inode: &Arc<dyn Inode>) -> (u32, u32, u32) {
+    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+        let m = *f.meta.lock();
+        (m.mode & 0o7777, m.uid, m.gid)
+    } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
+        let m = *d.meta.lock();
+        (m.mode & 0o7777, m.uid, m.gid)
+    } else {
+        let def = match inode.kind() {
+            FileType::Directory => 0o755,
+            _ => 0o644,
+        };
+        (def, 0, 0)
+    }
+}
+
+fn sys_faccessat(dfd: i32, path: usize, mode: i32) -> isize {
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
-    match resolve_at(dfd, &path_str) {
-        Some(_) => 0,
-        None => ENOENT,
+    let Some(inode) = resolve_at(dfd, &path_str) else {
+        return ENOENT;
+    };
+    // R_OK=4, W_OK=2, X_OK=1, F_OK=0. Any bit outside that set is invalid.
+    if mode & !0o7 != 0 {
+        return EINVAL;
     }
+    let amode = (mode & 0o7) as u32;
+    if amode == 0 {
+        return 0;
+    }
+    let (fmode, fuid, fgid) = inode_perm(&inode);
+    // access(2) checks against the *real* uid/gid (glibc/musl pass flags=0).
+    let creds = creds_of(cur_tgid());
+    let (ruid, rgid) = (creds[0], creds[2]);
+    // Pick the permission triple that applies, then check the requested bits.
+    let granted = if ruid == 0 {
+        // root: R and W are always granted; X only if some exec bit is set.
+        let mut g = 0o6;
+        if fmode & 0o111 != 0 {
+            g |= 0o1;
+        }
+        g
+    } else if ruid == fuid {
+        (fmode >> 6) & 0o7
+    } else if rgid == fgid {
+        (fmode >> 3) & 0o7
+    } else {
+        fmode & 0o7
+    };
+    if amode & !granted != 0 {
+        return EACCES;
+    }
+    0
 }
 
 fn sys_unlinkat(dfd: i32, path: usize, _flag: i32) -> isize {
