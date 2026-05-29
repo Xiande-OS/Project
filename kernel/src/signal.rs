@@ -375,6 +375,41 @@ pub fn raise_signal(target: &Arc<Task>, signo: u32) -> bool {
     true
 }
 
+/// Linux `force_sig` semantics for a **synchronous, CPU-generated** fault
+/// signal (SIGSEGV/SIGBUS/SIGILL raised from the trap handler). Such a
+/// signal must never be silently lost: if the task has it blocked, or set
+/// to SIG_IGN, a plain `raise_signal` leaves it undeliverable and the trap
+/// handler sret's back to the faulting instruction, which faults again —
+/// forever (an unbounded InstructionPageFault storm). So:
+///   * if the signal is currently blocked, or its disposition is SIG_IGN,
+///     reset the disposition to SIG_DFL (forcing the default terminate/core
+///     action — a process cannot mask away or ignore a fault it just took);
+///   * unblock it so `pick_signal` will select it on the trap-return scan;
+///   * post it.
+/// An installed, *unblocked* handler is left intact and delivered once. If
+/// that handler returns to the faulting PC and re-faults, the signal is by
+/// then blocked (masked during its own handler), so this routine forces the
+/// default on the second fault — the process always terminates instead of
+/// looping. Mirrors how Linux refuses to let a task evade a synchronous
+/// fault via SIG_IGN / a blocked mask.
+pub fn force_fault_signal(task: &Arc<Task>, signo: u32) {
+    if !is_valid_signo(signo) {
+        return;
+    }
+    let bit = sigbit(signo);
+    let blocked = (task.signals.mask.load(Ordering::SeqCst) & bit) != 0;
+    {
+        let mut acts = task.signals.actions.lock();
+        let slot = &mut acts[signo as usize];
+        if blocked || slot.handler == SIG_IGN {
+            *slot = KSigAction::default(); // -> SIG_DFL (terminate/core)
+        }
+    }
+    // Unblock so the pending signal is deliverable on the next pick_signal.
+    task.signals.mask.fetch_and(!bit, Ordering::SeqCst);
+    let _ = raise_signal(task, signo);
+}
+
 fn collect_descendants(root_pid: i32) -> alloc::vec::Vec<Arc<crate::task::Task>> {
     let all = crate::task::all_tasks();
     let mut included: alloc::collections::BTreeSet<i32> =

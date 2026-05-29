@@ -236,16 +236,17 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 _ => crate::signal::SIGSEGV,
             };
             let task = crate::task::current_task();
-            // If the default action is SIG_DFL and would terminate, calling
-            // raise + letting check_signals do its thing also clears the
-            // PC so we don't loop. But if the user installed a handler we
-            // must not re-execute the faulting instruction after the
-            // handler returns; signals run at trap boundary which means we
-            // re-enter user mode after the handler -> sret -> faulting
-            // PC. So for unhandled / DFL faults this is fine; for handler-
-            // returns, the handler still runs but then user faults again.
-            // For now we just deliver and let the natural flow proceed.
-            let _ = crate::signal::raise_signal(&task, signo);
+            // A synchronous, CPU-generated fault signal must never be lost.
+            // If the task has it blocked or set to SIG_IGN, a plain raise
+            // leaves it undeliverable and we sret back to the faulting PC
+            // and fault again forever (the unbounded InstructionPageFault
+            // storm). force_fault_signal applies Linux `force_sig`
+            // semantics — unblock, and reset a blocked/ignored disposition
+            // to SIG_DFL — so the process is always terminated. An
+            // installed, unblocked handler still runs once; if it returns
+            // to the faulting PC the signal is blocked during its own
+            // handler, so the re-fault forces the default and terminates.
+            crate::signal::force_fault_signal(&task, signo);
         }
         Trap::Exception(e) => {
             panic!(

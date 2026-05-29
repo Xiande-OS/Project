@@ -315,7 +315,10 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     0x09 => crate::signal::SIGBUS,        // ALE (alignment)
                     _ => crate::signal::SIGSEGV,          // PIL/PIS/PIF/PME/PNR/PNX/PPI/ADE
                 };
-                let _ = crate::signal::raise_signal(&task, signo);
+                // force_sig semantics: a synchronous fault signal must not be
+                // lost to a blocked mask / SIG_IGN, else we return to the
+                // faulting `era` and loop forever. See riscv64 trap.rs.
+                crate::signal::force_fault_signal(&task, signo);
             }
             _ => {
                 let badv = csrrd(0x7);
