@@ -231,10 +231,11 @@ fn order_scripts(scripts: &[String]) -> Vec<String> {
     // and most-likely-to-pass group, so it's first.
     let priority = |name: &str| -> u8 {
         // basic first (highest yield, well-validated). Light scripts
-        // next. Then benchmarks. libcbench *dead last* — its
-        // b_malloc_thread_local subtest segfaults and somehow kills
-        // the surrounding init.sh chain, so anything sequenced after
-        // it never runs.
+        // next. Then benchmarks ordered so the most fragile (unixbench
+        // SHELL fork-storm — can panic under very tight OOM) runs
+        // LAST. libcbench now passes cleanly so it goes before
+        // unixbench, otherwise its data was lost when unixbench
+        // tripped the kernel.
         match name {
             n if n.starts_with("basic_") => 0,
             n if n.starts_with("lua_") => 1,
@@ -246,8 +247,8 @@ fn order_scripts(scripts: &[String]) -> Vec<String> {
             n if n.starts_with("lmbench_") => 7,
             n if n.starts_with("iperf_") => 8,
             n if n.starts_with("netperf_") => 9,
-            n if n.starts_with("unixbench_") => 10,
-            n if n.starts_with("libcbench_") => 99,
+            n if n.starts_with("libcbench_") => 10,
+            n if n.starts_with("unixbench_") => 11,
             _ => 50,
         }
     };
