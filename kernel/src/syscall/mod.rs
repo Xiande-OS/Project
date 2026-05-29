@@ -1922,6 +1922,11 @@ fn cur_tgid() -> i32 {
 fn creds_of(tgid: i32) -> [u32; 4] {
     CREDS.lock().get(&tgid).copied().unwrap_or([0, 0, 0, 0])
 }
+/// Effective uid of the current thread group (0 = root). Used by the socket
+/// layer to enforce the privileged-port bind restriction.
+pub fn current_euid() -> u32 {
+    creds_of(cur_tgid())[1]
+}
 pub fn forget_creds(pid: i32) {
     CREDS.lock().remove(&pid);
 }

@@ -25,6 +25,7 @@ const EINVAL: isize = -22;
 const EISCONN: isize = -106;
 const ENOTSOCK: isize = -88;
 const EAFNOSUPPORT: isize = -97;
+const EACCES: isize = -13;
 const EPROTONOSUPPORT: isize = -93;
 const ENETUNREACH: isize = -101;
 const ECONNREFUSED: isize = -111;
@@ -188,6 +189,12 @@ pub fn sys_bind(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
     let Some(mut sa) = parse_sockaddr_in(&bytes) else {
         return EAFNOSUPPORT;
     };
+
+    // Binding a privileged port (<1024) requires root (CAP_NET_BIND_SERVICE).
+    // LTP bind02 drops to "nobody" and expects EACCES.
+    if sa.port != 0 && sa.port < 1024 && crate::syscall::current_euid() != 0 {
+        return EACCES;
+    }
 
     // bind(..., port=0) means "let the kernel pick an ephemeral port".
     // libc-test/socket.c relies on this for both UDP and TCP. Pick the
