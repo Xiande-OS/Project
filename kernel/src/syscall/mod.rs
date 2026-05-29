@@ -182,7 +182,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SIGALTSTACK => sys_sigaltstack(a0, a1),
         nr::SYS_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(a0, a1, a2),
         nr::SYS_RT_SIGSUSPEND => sys_rt_sigsuspend(a0, a1),
-        nr::SYS_SYSINFO => 0,
+        nr::SYS_SYSINFO => sys_sysinfo(a0),
         // SysV shared memory: iozone -t (throughput mode), netperf, libcbench
         // all try shmget/shmat. Stub as ENOSYS-ish failure (-1) which makes
         // them fall back to non-SysV-shmem paths.
@@ -190,9 +190,9 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SHMCTL => -1,
         nr::SYS_SHMAT => -1,
         nr::SYS_SHMDT => -1,
-        nr::SYS_GETRUSAGE => 0,
+        nr::SYS_GETRUSAGE => sys_getrusage(a0 as i32, a1),
         nr::SYS_MEMBARRIER => 0,
-        nr::SYS_TIMES => 0,
+        nr::SYS_TIMES => sys_times(a0),
         nr::SYS_READLINKAT => sys_readlinkat(a0 as i32, a1, a2, a3),
         nr::SYS_RENAMEAT2 => sys_renameat2(a0 as i32, a1, a2 as i32, a3, a4 as u32),
         nr::SYS_LINKAT => sys_linkat(a0 as i32, a1, a2 as i32, a3, a4 as i32),
@@ -3529,6 +3529,82 @@ struct Timespec {
 struct Timeval {
     sec: i64,
     usec: i64,
+}
+
+/// times(2): no per-process CPU accounting, so the tms fields are zero;
+/// the return value is a monotonic tick count at CLK_TCK=100. Previously a
+/// `=> 0` stub that left the caller's `struct tms` uninitialized (garbage).
+#[repr(C)]
+struct KTms { utime: i64, stime: i64, cutime: i64, cstime: i64 }
+fn sys_times(buf: usize) -> isize {
+    if buf != 0 {
+        let t = KTms { utime: 0, stime: 0, cutime: 0, cstime: 0 };
+        if write_struct(buf, &t) != 0 {
+            return EFAULT;
+        }
+    }
+    // clock_t ticks at CLK_TCK (100 Hz) since boot.
+    (crate::arch::now_ticks() / (crate::arch::TICKS_PER_SEC / 100)) as isize
+}
+
+/// sysinfo(2): fill the struct with plausible values. Previously `=> 0`
+/// which left `struct sysinfo` as uninitialized stack garbage (e.g.
+/// mem_unit = absurd values), failing LTP sysinfo01 and anything that
+/// reads the fields. Layout matches Linux's 64-bit `struct sysinfo`.
+#[repr(C)]
+struct KSysinfo {
+    uptime: i64,
+    loads: [u64; 3],
+    totalram: u64,
+    freeram: u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap: u64,
+    procs: u16,
+    pad: u16,
+    totalhigh: u64,
+    freehigh: u64,
+    mem_unit: u32,
+    _f: [u8; 0],
+}
+fn sys_sysinfo(addr: usize) -> isize {
+    if addr == 0 {
+        return EFAULT;
+    }
+    let total: u64 = 256 * 1024 * 1024; // RAM we advertise (kernel heap class)
+    let procs = crate::task::all_tasks().len() as u16;
+    let si = KSysinfo {
+        uptime: (crate::arch::now_ticks() / crate::arch::TICKS_PER_SEC) as i64,
+        loads: [0, 0, 0],
+        totalram: total,
+        freeram: total / 2,
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs: if procs == 0 { 1 } else { procs },
+        pad: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        _f: [],
+    };
+    write_struct(addr, &si)
+}
+
+/// getrusage(2): no resource accounting yet, so report a zeroed `struct
+/// rusage` (two timevals + 14 longs = 144 bytes) and success. Previously
+/// `=> 0` left the caller's struct as garbage.
+fn sys_getrusage(_who: i32, addr: usize) -> isize {
+    if addr == 0 {
+        return 0;
+    }
+    let zeros = [0u8; 144];
+    if current_task().copy_out_bytes(addr, &zeros).is_none() {
+        return EFAULT;
+    }
+    0
 }
 
 fn sys_gettimeofday(tv: usize) -> isize {
