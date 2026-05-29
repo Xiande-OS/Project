@@ -252,6 +252,27 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
     // script hangs we still bank the easy points.
     for (dir, scripts) in variants {
         s.push_str(&alloc::format!("cd {}\n", dir));
+        // LTP shell-based cases (`.sh` files under ltp/testcases/bin) source
+        // their lib helpers — `. tst_test.sh`, `. tst_net.sh`, `. cgroup_lib.sh`
+        // and friends — via the shell's PATH search. Those helpers live next
+        // to the test binaries themselves at `<variant>/ltp/testcases/bin/`,
+        // which isn't on PATH by default (we only ship `/bin`). Without it,
+        // hundreds of LTP shell cases die on their second line with
+        //   "<lib>.sh: not found"
+        // and score 0. Stage the LTP bin dir into PATH for the rest of this
+        // variant's groups; non-LTP groups don't care (their entries are
+        // resolved as `./binary`, not via PATH). Also export LTPROOT and
+        // LTP_TIMEOUT_MUL — a number of LTP cases gate on these and skip
+        // setup when absent.
+        let ltp_dir = alloc::format!("{}/ltp", dir);
+        s.push_str(&alloc::format!(
+            "if [ -d {ltp}/testcases/bin ]; then \
+                 export PATH=\"{ltp}/testcases/bin:$PATH\"; \
+                 export LTPROOT={ltp}; \
+                 export LTP_TIMEOUT_MUL=2; \
+             fi\n",
+            ltp = ltp_dir,
+        ));
         // Derive `musl` / `glibc` from the dir path's last segment.
         let variant = dir.rsplit('/').next().unwrap_or("musl");
         let ordered = order_scripts(scripts);
