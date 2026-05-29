@@ -110,9 +110,22 @@ fn bind_loaders() {
     let mappings: &[(&str, &str)] = &[
         // glibc loader — required by both musl/basic/* and glibc/basic/*.
         ("/mnt/glibc/lib/ld-linux-riscv64-lp64d.so.1", "ld-linux-riscv64-lp64d.so.1"),
+        // glibc shared libraries — netperf (and other glibc-dynamic
+        // contest binaries) declare DT_NEEDED libm.so.6 + libc.so.6 +
+        // ld-linux-riscv64-lp64d.so.1. Without these in /lib the loader
+        // prints
+        //   "cannot open shared object file: No such file or directory"
+        // and exits 127 before the test markers print.
+        ("/mnt/glibc/lib/libc.so.6", "libc.so.6"),
+        ("/mnt/glibc/lib/libm.so.6", "libm.so.6"),
         // musl loader (the libc.so on this contest disk IS the loader).
-        ("/mnt/musl/libc.so", "ld-musl-riscv64-sf.so.1"),
-        ("/mnt/musl/libc.so", "ld-musl-riscv64.so.1"),
+        ("/mnt/musl/lib/libc.so", "ld-musl-riscv64-sf.so.1"),
+        ("/mnt/musl/lib/libc.so", "ld-musl-riscv64.so.1"),
+        // musl dynamic binaries (e.g. netperf, netserver) DT_NEEDED libc.so.
+        // The musl libc IS the loader, but a DT_NEEDED entry still
+        // triggers the loader's library search; without /lib/libc.so the
+        // search ends in ENOENT.
+        ("/mnt/musl/lib/libc.so", "libc.so"),
     ];
     for (src, dst) in mappings {
         match fs::lookup_path(fs::root(), src) {
