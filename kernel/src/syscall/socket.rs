@@ -86,6 +86,41 @@ fn block_and_retry_recheck(ready: impl Fn() -> bool) {
     }
 }
 
+/// Park the current task waiting for the loopback queue to fill, but no
+/// longer than `timeout_ticks`. Returns `true` if the deadline has already
+/// expired (caller should surface EAGAIN). Otherwise installs a sleep
+/// deadline (via the same SLEEPING_UNTIL map nanosleep uses) and parks;
+/// `wake_expired_sleepers` will flip the task back to Ready at the deadline.
+///
+/// On re-entry the syscall re-checks the queue first; if data arrived, the
+/// caller calls `forget_sleeper` so a *later* recv on the same fd doesn't
+/// inherit a stale deadline. The lost-wakeup recheck mirrors
+/// `block_and_retry_recheck`.
+pub(crate) fn block_with_timeout(timeout_ticks: u64, ready: impl Fn() -> bool) -> bool {
+    let me = current_task();
+    let now = riscv::register::time::read64();
+    let deadline = crate::task::sleeper_deadline(me.pid).unwrap_or_else(|| {
+        let d = now.saturating_add(timeout_ticks);
+        crate::task::sleep_until(me.pid, d);
+        d
+    });
+    if now >= deadline {
+        crate::task::forget_sleeper(me.pid);
+        return true; // timed out
+    }
+    crate::task::wake_socket_waiters();
+    crate::task::mark_socket_waiter(me.pid);
+    *me.state.lock() = crate::task::TaskState::Waiting;
+    unsafe {
+        let tf = me.tf_ptr();
+        (*tf).sepc -= 4;
+    }
+    if ready() {
+        *me.state.lock() = crate::task::TaskState::Ready;
+    }
+    false
+}
+
 /// Wake ourselves (Waiting -> Ready) so on the next scheduler tick we get
 /// rerun. The current syscall completes normally first; the rewound sepc
 /// + Waiting state takes effect at trap exit.
@@ -352,22 +387,33 @@ pub fn sys_connect(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
             // the peer can route reply datagrams back to us. iperf3 -u/-c
             // doesn't call bind() on the data socket; without this step the
             // server's reply lands in the void.
+            //
+            // We also pin the UdpEnd's `peer_port` so udp_deliver routes
+            // only matching-source datagrams here. The multi-bind iperf3
+            // server keeps several sockets on the same port; without this
+            // filter every datagram lands in every queue and the per-stream
+            // sequence counters explode (huge "lost/duplicate" numbers).
             let _ = with_socket(fd, |s| {
                 let mut st = s.state.lock();
                 st.peer = Some(sa);
-                if is_loopback(sa.addr) && st.udp_end.is_none() {
-                    let port = st
-                        .bound
-                        .map(|b| b.port)
-                        .unwrap_or_else(crate::net::loopback::alloc_ephemeral);
-                    let ue = crate::net::loopback::register_udp(port);
-                    // Reflect the bound port back so subsequent getsockname
-                    // works (iperf3 inspects this).
-                    st.bound = Some(SockAddrIn {
-                        addr: Ipv4Address::new(127, 0, 0, 1),
-                        port,
-                    });
-                    st.udp_end = Some(ue);
+                if is_loopback(sa.addr) {
+                    if st.udp_end.is_none() {
+                        let port = st
+                            .bound
+                            .map(|b| b.port)
+                            .unwrap_or_else(crate::net::loopback::alloc_ephemeral);
+                        let ue = crate::net::loopback::register_udp(port);
+                        // Reflect the bound port back so subsequent
+                        // getsockname works (iperf3 inspects this).
+                        st.bound = Some(SockAddrIn {
+                            addr: Ipv4Address::new(127, 0, 0, 1),
+                            port,
+                        });
+                        st.udp_end = Some(ue);
+                    }
+                    if let Some(ue) = st.udp_end.as_ref() {
+                        crate::net::loopback::set_udp_peer(ue, Some(sa.port));
+                    }
                 }
             });
             return 0;
@@ -567,9 +613,8 @@ pub fn sys_recvfrom(
         (
             s.handle,
             s.kind,
-            // A recv timeout makes blocking recvfrom behave like non-blocking
-            // for our purposes (return EAGAIN rather than park forever).
-            st.nonblock || st.recv_timeout,
+            st.nonblock,
+            st.recv_timeout_ticks,
             st.loopback.clone(),
             st.udp_end.clone(),
         )
@@ -577,7 +622,7 @@ pub fn sys_recvfrom(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (handle, kind, nonblock, lb, udp_end) = info;
+    let (handle, kind, nonblock, recv_to_ticks, lb, udp_end) = info;
     net::poll();
 
     let task = current_task();
@@ -590,15 +635,24 @@ pub fn sys_recvfrom(
                 let n = lb.recv(&mut buf);
                 if n == 0 {
                     if lb.peer_eof() {
+                        crate::task::forget_sleeper(task.pid);
                         return 0;
                     }
                     if nonblock {
                         return EAGAIN;
                     }
                     let lb2 = lb.clone();
+                    if recv_to_ticks != 0 {
+                        let lb3 = lb.clone();
+                        if block_with_timeout(recv_to_ticks, move || lb3.can_recv() || lb3.peer_eof()) {
+                            return EAGAIN; // timed out
+                        }
+                        return EAGAIN; // re-entered, recheck after wake
+                    }
                     block_and_retry_recheck(move || lb2.can_recv() || lb2.peer_eof());
                     return EAGAIN;
                 }
+                crate::task::forget_sleeper(task.pid);
                 if task.copy_out_bytes(buf_ptr, &buf[..n]).is_none() {
                     return EFAULT;
                 }
@@ -661,10 +715,18 @@ pub fn sys_recvfrom(
                         return EAGAIN;
                     }
                     let ue2 = ue.clone();
+                    if recv_to_ticks != 0 {
+                        let ue3 = ue.clone();
+                        if block_with_timeout(recv_to_ticks, move || !ue3.incoming.lock().is_empty()) {
+                            return EAGAIN; // timed out
+                        }
+                        return EAGAIN; // re-entered, recheck after wake
+                    }
                     block_and_retry_recheck(move || !ue2.incoming.lock().is_empty());
                     return EAGAIN;
                 }
                 if let Some(dg) = dg {
+                    crate::task::forget_sleeper(task.pid);
                     let n = core::cmp::min(buf.len(), dg.data.len());
                     if task.copy_out_bytes(buf_ptr, &dg.data[..n]).is_none() {
                         return EFAULT;
@@ -803,26 +865,29 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: usize, _optlen:
     const SOL_SOCKET: i32 = 1;
     const SO_RCVTIMEO: i32 = 20;
     // iperf3 puts a finite SO_RCVTIMEO on its UDP socket so its blocking
-    // recvfrom won't hang forever when no packet arrives. We can't track
-    // wall-clock per recv, but recording "a timeout is set" lets the recv
-    // path surface EAGAIN instead of parking — close enough for iperf3,
-    // which just retries on timeout. A zero timeval clears it.
+    // recvfrom won't hang forever when no packet arrives. Convert the
+    // timeval to mtime ticks (10 MHz on QEMU virt) and stash it on the
+    // socket; the recv path uses sleep_until() to bound the block. A zero
+    // timeval clears it.
     if level == SOL_SOCKET && optname == SO_RCVTIMEO {
         let task = current_task();
         // struct timeval { i64 tv_sec; i64 tv_usec; } == 16 bytes.
-        let nonzero = if optval != 0 {
+        let ticks: u64 = if optval != 0 {
             match task.copy_in_bytes(optval, 16) {
                 Some(b) => {
                     let sec = i64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
                     let usec = i64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
-                    sec != 0 || usec != 0
+                    let sec = sec.max(0) as u64;
+                    let usec = usec.max(0) as u64;
+                    // 10 MHz mtime: 1us = 10 ticks, 1s = 10_000_000 ticks.
+                    sec.saturating_mul(10_000_000).saturating_add(usec.saturating_mul(10))
                 }
-                None => false,
+                None => 0,
             }
         } else {
-            false
+            0
         };
-        let _ = with_socket(fd, |s| s.state.lock().recv_timeout = nonzero);
+        let _ = with_socket(fd, |s| s.state.lock().recv_timeout_ticks = ticks);
     }
     // Stub OK for SO_REUSEADDR / SO_KEEPALIVE / SO_LINGER / TCP_NODELAY etc.
     0

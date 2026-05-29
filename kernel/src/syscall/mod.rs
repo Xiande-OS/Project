@@ -402,10 +402,27 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             if let Some(lp) = lp {
                 if !lp.peer_eof() && !lp.can_recv() {
                     let st = sock.state.lock();
-                    let nonblock = st.nonblock || st.recv_timeout;
+                    let nonblock = st.nonblock;
+                    let recv_to_ticks = st.recv_timeout_ticks;
                     drop(st);
                     if nonblock {
                         return -11;
+                    }
+                    // Bounded recv timeout (SO_RCVTIMEO): park with a deadline
+                    // so a read that never wakes returns EAGAIN instead of
+                    // hanging forever. Unbounded otherwise.
+                    if recv_to_ticks != 0 {
+                        let now = riscv::register::time::read64();
+                        let deadline = crate::task::sleeper_deadline(task.pid)
+                            .unwrap_or_else(|| {
+                                let d = now.saturating_add(recv_to_ticks);
+                                crate::task::sleep_until(task.pid, d);
+                                d
+                            });
+                        if now >= deadline {
+                            crate::task::forget_sleeper(task.pid);
+                            return -11; // timed out
+                        }
                     }
                     crate::task::wake_socket_waiters();
                     crate::task::mark_socket_waiter(task.pid);
@@ -441,6 +458,12 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                 }
             }
         }
+    }
+    // Read on a socket completed (data or EOF): clear any pending
+    // SO_RCVTIMEO deadline so it doesn't poison a later blocking call on
+    // the same task. Cheap no-op if we never set one.
+    if file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>().is_some() {
+        crate::task::forget_sleeper(task.pid);
     }
     if task.copy_out_bytes(buf, &tmp[..n]).is_none() {
         return EFAULT;
@@ -726,20 +749,25 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         return 0;
     }
     let task = current_task();
-    // A non-NULL timeout pointer to {0,0} means "poll, don't block".
-    // Honor it so callers (iperf3) that poll for instant readiness aren't
-    // parked forever waiting on a peer that is itself polling.
-    let zero_timeout = if timeout != 0 {
+    // A non-NULL timeout pointer to {0,0} means "poll, don't block". Other
+    // finite values mean "block up to N then return 0". NULL = block forever.
+    let (zero_timeout, timeout_ticks) = if timeout != 0 {
         match task.copy_in_bytes(timeout, 16) {
             Some(b) => {
                 let secs = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
                 let nsecs = u64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
-                secs == 0 && nsecs == 0
+                if secs == 0 && nsecs == 0 {
+                    (true, None)
+                } else {
+                    let t = secs.saturating_mul(10_000_000)
+                        .saturating_add(nsecs / 100);
+                    (false, Some(t))
+                }
             }
-            None => false,
+            None => (false, None),
         }
     } else {
-        false
+        (false, None)
     };
     let size = nfds * core::mem::size_of::<PollFd>();
     let Some(raw) = task.copy_in_bytes(fds, size) else {
@@ -807,6 +835,21 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
     // scheduler's socket-waiter wake path. A zero timeout (poll) must
     // return immediately with 0 instead of parking.
     if ready == 0 && !other_indices.is_empty() && console_indices.is_empty() && !zero_timeout {
+        // Finite timeout? Install a sleep deadline so we wake up when it
+        // expires even if no fd ever became readable.
+        if let Some(t) = timeout_ticks {
+            let now = riscv::register::time::read64();
+            let deadline = crate::task::sleeper_deadline(task.pid)
+                .unwrap_or_else(|| {
+                    let d = now.saturating_add(t);
+                    crate::task::sleep_until(task.pid, d);
+                    d
+                });
+            if now >= deadline {
+                crate::task::forget_sleeper(task.pid);
+                return 0; // timed out — revents are all 0
+            }
+        }
         // Nudge any peer parked on the loopback pipes before sleeping so
         // we don't deadlock against a peer that's also blocked.
         crate::task::wake_socket_waiters();
@@ -840,6 +883,9 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
     }
     if task.copy_out_bytes(fds, &out).is_none() {
         return EFAULT;
+    }
+    if timeout_ticks.is_some() {
+        crate::task::forget_sleeper(task.pid);
     }
     ready
 }
@@ -1851,22 +1897,33 @@ fn sys_pselect6(
         return 0;
     }
     let task = current_task();
-    // A zero timeout means "poll, never block" (iperf3's server loop uses
-    // this). Detect it so we return the immediate readiness count rather
-    // than parking the task forever (which deadlocks the loopback flow:
-    // the server polls with {sec:0,nsec:0} expecting an instant 0 so its
-    // state machine can advance to TEST_START).
-    let zero_timeout = if _timeout != 0 {
+    // Parse timeout. Three regimes:
+    //   * timeout == NULL  → block forever (timeout_ticks=None, zero_timeout=false)
+    //   * {0,0}            → poll, never block
+    //   * other            → block up to N ticks then return 0
+    // iperf3's main loops both rely on the finite-timeout behavior (its
+    // throttle scheduler picks the next "green light" instant and selects
+    // until then). Ignoring it left the client parked indefinitely after
+    // its first packet because no fd was readable and write_set had been
+    // FD_CLR'd by the throttle check.
+    let (zero_timeout, timeout_ticks) = if _timeout != 0 {
         match task.copy_in_bytes(_timeout, 16) {
             Some(b) => {
                 let secs = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
                 let nsecs = u64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
-                secs == 0 && nsecs == 0
+                if secs == 0 && nsecs == 0 {
+                    (true, None)
+                } else {
+                    // 10 MHz mtime: 1us = 10 ticks, 1s = 10_000_000 ticks.
+                    let t = secs.saturating_mul(10_000_000)
+                        .saturating_add(nsecs / 100);
+                    (false, Some(t))
+                }
             }
-            None => false,
+            None => (false, None),
         }
     } else {
-        false
+        (false, None)
     };
     let bytes = (nfds + 7) / 8;
     let read_set = |addr: usize| -> alloc::vec::Vec<u8> {
@@ -1933,6 +1990,33 @@ fn sys_pselect6(
                 }
             }
         } else {
+            // Finite timeout? Install a sleep deadline so we wake up when
+            // it expires even if no fd ever became readable. iperf3's
+            // throttle loop selects with a finite timeout, expecting to be
+            // re-scheduled when the throttle interval ends.
+            if let Some(t) = timeout_ticks {
+                let now = riscv::register::time::read64();
+                let deadline = crate::task::sleeper_deadline(task.pid)
+                    .unwrap_or_else(|| {
+                        let d = now.saturating_add(t);
+                        crate::task::sleep_until(task.pid, d);
+                        d
+                    });
+                if now >= deadline {
+                    crate::task::forget_sleeper(task.pid);
+                    // Timed out — write the (empty) bitmaps and return 0.
+                    if rfds != 0 {
+                        let _ = task.copy_out_bytes(rfds, &r_out);
+                    }
+                    if wfds != 0 {
+                        let _ = task.copy_out_bytes(wfds, &w_out);
+                    }
+                    if efds != 0 {
+                        let _ = task.copy_out_bytes(efds, &zero);
+                    }
+                    return 0;
+                }
+            }
             // Wake any peer parked on the loopback pipes before we sleep:
             // the iperf3 control flow has the server poll (zero timeout)
             // and the client block here on NULL timeout; nudging peers
@@ -1974,6 +2058,12 @@ fn sys_pselect6(
     }
     if efds != 0 {
         let _ = task.copy_out_bytes(efds, &zero);
+    }
+    // Clear any leftover finite-timeout deadline so the next pselect doesn't
+    // inherit a stale entry (it would short-circuit to "timed out" before
+    // installing a fresh one).
+    if timeout_ticks.is_some() {
+        crate::task::forget_sleeper(task.pid);
     }
     ready
 }

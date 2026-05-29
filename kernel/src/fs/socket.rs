@@ -65,12 +65,15 @@ pub struct SocketState {
     /// Set on UDP sockets bound to 127.0.0.1 / 0.0.0.0 so datagram delivery
     /// works without going through smoltcp.
     pub udp_end: Option<Arc<UdpEnd>>,
-    /// True once SO_RCVTIMEO is set to a non-zero value. We don't track wall
-    /// time per-recv, but iperf3 relies on a *finite* recv timeout so its
-    /// blocking recvfrom on the UDP socket doesn't hang forever waiting for
-    /// a packet that never arrives. With this set we surface EAGAIN instead
-    /// of parking, which iperf3 treats as "timed out, move on".
-    pub recv_timeout: bool,
+    /// SO_RCVTIMEO value in mtime ticks (0 = no timeout). iperf3 sets a
+    /// 30-second SO_RCVTIMEO on its UDP data socket so a blocking recvfrom
+    /// that never sees a packet eventually times out instead of hanging
+    /// forever. The recv path uses this with sleep_until to block up to
+    /// `recv_timeout_ticks` and then surface EAGAIN. Treating it as a
+    /// nonblock flag (return EAGAIN on the first empty queue check) breaks
+    /// iperf3's UDP_CONNECT handshake, where the client writes a probe and
+    /// then expects the server's reply to arrive shortly.
+    pub recv_timeout_ticks: u64,
 }
 
 pub struct Socket {
@@ -94,7 +97,7 @@ impl Socket {
                 loopback: None,
                 listener: None,
                 udp_end: None,
-                recv_timeout: false,
+                recv_timeout_ticks: 0,
             }),
         })
     }
@@ -112,7 +115,7 @@ impl Socket {
                 loopback: None,
                 listener: None,
                 udp_end: None,
-                recv_timeout: false,
+                recv_timeout_ticks: 0,
             }),
         })
     }
