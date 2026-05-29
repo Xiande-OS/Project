@@ -39,8 +39,17 @@ fn main() {
     // The contest harness rejects on-line dependency downloads, so we
     // never spawn nested `cargo build` invocations for the user-land
     // workspace from here — that wiring is now in xtask.
+    //
+    // The prebuilt user binaries are RISC-V ELFs; for a loongarch64 kernel
+    // the embedded `hello` is the freestanding LA test program (built from
+    // user/hello-la.S) so the LA port can exercise user mode without a disk.
+    let hello_src = if target_arch == "loongarch64" {
+        "hello-la.elf"
+    } else {
+        "hello.elf"
+    };
     copy_or_stub(
-        user_dir.join("hello.elf"),
+        user_dir.join(hello_src),
         out_dir.join("hello.elf"),
         "HELLO_ELF_PATH",
     );

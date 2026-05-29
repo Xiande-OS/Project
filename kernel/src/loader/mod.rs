@@ -39,8 +39,20 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
     if header.pt1.magic != [0x7f, b'E', b'L', b'F'] {
         return Err("not an ELF");
     }
-    if header.pt2.machine().as_machine() != xmas_elf::header::Machine::RISC_V {
-        return Err("ELF not RISC-V");
+    // Accept only the native machine. xmas-elf has no LoongArch variant,
+    // so match EM_LOONGARCH (258) via the catch-all `Other`.
+    #[cfg(target_arch = "riscv64")]
+    let native = matches!(
+        header.pt2.machine().as_machine(),
+        xmas_elf::header::Machine::RISC_V
+    );
+    #[cfg(target_arch = "loongarch64")]
+    let native = matches!(
+        header.pt2.machine().as_machine(),
+        xmas_elf::header::Machine::Other(258)
+    );
+    if !native {
+        return Err("ELF machine mismatch");
     }
 
     let mut max_end_va = 0usize;
