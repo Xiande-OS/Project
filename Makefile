@@ -73,20 +73,22 @@ endif
 all: kernel-rv kernel-la
 
 # Recreate the hidden cargo configuration the contest harness stripped,
-# and best-effort ensure the riscv64 target std is installed.
+# and best-effort ensure the riscv64 + loongarch64 target stds are present.
 prepare:
 	@if [ -d cargo ] && [ ! -d .cargo ]; then cp -r cargo .cargo; fi
 	@if [ -d kernel/cargo ] && [ ! -d kernel/.cargo ]; then cp -r kernel/cargo kernel/.cargo; fi
-	@# Add the precompiled riscv64 std target IF it's missing AND rustup is
-	@# present. Silenced + best-effort: if rustup isn't installed, or the
-	@# target is already there, or the operation fails (e.g. read-only
-	@# toolchain root), we just move on and let `cargo build` produce a
-	@# clear error if the target really is unavailable. We do NOT call
-	@# `rustup update` or `rustup toolchain install` — those are the
-	@# operations that fail on the grader's split-filesystem layout.
+	@# Add the precompiled riscv64/loongarch64 std targets IF missing AND
+	@# rustup is present. Silenced + best-effort: if rustup isn't installed,
+	@# the target is already there, or the op fails (e.g. read-only toolchain
+	@# root), we move on and let `cargo build` produce a clear error (the
+	@# kernel-la rule falls back to a placeholder ELF). We only ever call
+	@# `rustup target add` — never `rustup update`/`toolchain install`, the
+	@# operations that fail on the grader's split-filesystem (EXDEV) layout.
 	@command -v rustup >/dev/null 2>&1 || exit 0; \
-	 rustup target list --installed 2>/dev/null | grep -qx '$(TARGET_RV)' || \
-	   rustup target add $(TARGET_RV) >/dev/null 2>&1 || true
+	 for t in $(TARGET_RV) $(TARGET_LA); do \
+	   rustup target list --installed 2>/dev/null | grep -qx "$$t" || \
+	     rustup target add "$$t" >/dev/null 2>&1 || true; \
+	 done
 
 kernel-rv: prepare
 	$(CARGO) build --release -p $(KERNEL_PKG) --target $(TARGET_RV) --offline
