@@ -353,6 +353,16 @@ fn panic_dead_locked(cur_pid: i32, reason: &str) -> ! {
 /// Wake any nanosleep'd tasks whose deadline has been reached. Called
 /// from the scheduler hook on every trap exit; cheap when the map is
 /// empty.
+///
+/// We deliberately do NOT remove the entry from SLEEPING_UNTIL on
+/// expiry — only flip the state Waiting->Ready. This is required for
+/// the rewind-sepc syscalls (sys_rt_sigtimedwait) to detect expiry on
+/// re-entry by re-checking the still-present deadline; otherwise the
+/// re-entry installs a FRESH deadline `now + timeout` and the call
+/// never times out (libctest's runtest.exe loses its 5s watchdog for
+/// pthread_cancel and similar pthread tests, taking the whole group
+/// down). Stale entries get cleared by `forget_sleeper` on the success
+/// path, the next `sleep_until` (which overwrites), or `exit_one_thread`.
 pub fn wake_expired_sleepers(now: u64) {
     let expired: Vec<i32> = {
         let m = SLEEPING_UNTIL.lock();
@@ -361,9 +371,7 @@ pub fn wake_expired_sleepers(now: u64) {
     if expired.is_empty() {
         return;
     }
-    let mut m = SLEEPING_UNTIL.lock();
     for pid in expired {
-        m.remove(&pid);
         if let Some(t) = TABLE.lock().tasks.get(&pid).cloned() {
             let mut s = t.state.lock();
             if *s == TaskState::Waiting {

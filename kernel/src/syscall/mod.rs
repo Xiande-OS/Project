@@ -2788,6 +2788,12 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
     // Drop ourselves from any futex queue.
     crate::sync::futex::forget_task(task.pid);
 
+    // Drop any stale SLEEPING_UNTIL entry. The deadline-keeps-after-expiry
+    // policy in wake_expired_sleepers means a nanosleep'd thread can leave a
+    // post-deadline entry in the map; cleared here so the map never grows
+    // unboundedly over a long contest run.
+    crate::task::forget_sleeper(task.pid);
+
     // Defer reclamation of this thread's user stack. For genuine pthreads we
     // recorded the stack pointer handed to clone; queue it on the (shared)
     // address space so it is freed at the *next* thread creation in this
