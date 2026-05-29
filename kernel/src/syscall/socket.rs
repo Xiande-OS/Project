@@ -280,6 +280,10 @@ pub fn sys_accept4(fd: i32, sa_ptr: usize, sa_len_ptr: usize, flags: i32) -> isi
                     addr: Ipv4Address::new(127, 0, 0, 1),
                     port: listener.port,
                 });
+                // accept4(SOCK_NONBLOCK) must mark the *accepted* socket
+                // non-blocking (LTP accept4_01 checks the new fd's O_NONBLOCK
+                // via F_GETFL). Only cloexec was being honored before.
+                st.nonblock = (flags & SOCK_NONBLOCK) != 0;
             }
             if sa_ptr != 0 {
                 let sa = SockAddrIn { addr: Ipv4Address::new(127, 0, 0, 1), port: peer_port };
