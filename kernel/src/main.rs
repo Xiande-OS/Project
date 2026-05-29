@@ -151,6 +151,9 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     if option_env!("SYSTRACE").is_some() {
         syscall::set_syscall_trace(true);
     }
+    if option_env!("NETTRACE").is_some() {
+        syscall::set_nettrace(true);
+    }
 
     // Contest mode: mount the testsuite EXT4 disk, build a driver
     // script that loops over every `*_testcode.sh`, and hand it to

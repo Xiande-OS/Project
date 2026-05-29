@@ -252,6 +252,14 @@ pub fn syscall_trace_enabled() -> bool {
     SYSCALL_TRACE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+static NET_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn nettrace_enabled() -> bool {
+    NET_TRACE.load(core::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_nettrace(on: bool) {
+    NET_TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// First-time-only print for an unimplemented syscall number. A
 /// looping ENOSYS retrieval (some contest binaries spin on accept,
 /// epoll, etc. instead of giving up) used to OOM the host log file at
@@ -683,7 +691,17 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
 }
 
 fn sys_close(fd: i32) -> isize {
-    match current_task().fd_table.lock().close(fd) {
+    let task = current_task();
+    if nettrace_enabled() {
+        let f = task.fd_table.lock().get(fd);
+        if let Some(f) = f {
+            if f.inode.as_any().is::<crate::fs::socket::Socket>() {
+                crate::println!("[net] pid={} close(socket fd={})", task.pid, fd);
+            }
+        }
+    }
+    let r = task.fd_table.lock().close(fd);
+    match r {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
     }
@@ -2954,6 +2972,9 @@ fn sys_exit_group(status: i32) -> isize {
 /// Common exit path for one thread. If this is the last thread in the
 /// tgid (or `group_exit`), notify the parent via SIGCHLD + wake.
 fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, group_exit: bool) {
+    if nettrace_enabled() {
+        crate::println!("[net] pid={} EXIT status={} group={}", task.pid, status, group_exit);
+    }
     // Pre-encode the wait4 status as Linux expects: normal exit puts the
     // low byte of `status` in bits 8..15. wait4 returns it verbatim.
     task.exit_code
@@ -3304,7 +3325,9 @@ fn read_string_array(addr: usize) -> Option<alloc::vec::Vec<String>> {
     Some(out)
 }
 
-fn sys_wait4(pid: i32, status_addr: usize, _options: i32) -> isize {
+const WNOHANG: i32 = 1;
+
+fn sys_wait4(pid: i32, status_addr: usize, options: i32) -> isize {
     let me = current_task();
     let zombie = {
         let children = me.children.lock();
@@ -3330,12 +3353,19 @@ fn sys_wait4(pid: i32, status_addr: usize, _options: i32) -> isize {
         return z.pid as isize;
     }
 
-    // No matching zombie. Mark Waiting and rewind sepc so the ecall is
-    // re-executed when we get rescheduled. The scheduler will switch
-    // to a child.
+    // No matching zombie.
     if me.children.lock().is_empty() {
         return -10; // ECHILD
     }
+    // WNOHANG: caller does not want to block — report "no child ready" (0)
+    // immediately. busybox sh polls background jobs this way; blocking here
+    // would hang the shell forever whenever a long-lived background process
+    // (e.g. netperf's netserver) is alive.
+    if options & WNOHANG != 0 {
+        return 0;
+    }
+    // Otherwise block: mark Waiting and rewind sepc so the ecall re-runs
+    // when a child becomes a zombie and wakes us.
     *me.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
         (*me.tf_ptr()).sepc -= 4;

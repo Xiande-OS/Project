@@ -58,6 +58,10 @@ fn with_socket<R>(fd: i32, f: impl FnOnce(&Socket) -> R) -> Result<R, isize> {
 /// `schedule_next_after_trap` because the state moved out of Running.
 fn block_and_retry() {
     let me = current_task();
+    if crate::syscall::nettrace_enabled() {
+        let nr = unsafe { (*me.tf_ptr()).x[16] };
+        crate::println!("[net] pid={} BLOCK on syscall#{}", me.pid, nr);
+    }
     crate::task::mark_socket_waiter(me.pid);
     *me.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
@@ -934,22 +938,43 @@ pub fn sys_getsockopt(_fd: i32, level: i32, optname: i32, optval: usize, optlen_
 // ---------- shutdown(2) ----------
 
 pub fn sys_shutdown(fd: i32, how: i32) -> isize {
-    let res = with_socket(fd, |s| match s.kind {
-        SocketKind::Tcp => {
+    if crate::syscall::nettrace_enabled() {
+        crate::println!("[net] pid={} shutdown(fd={}, how={})", current_task().pid, fd, how);
+    }
+    let res = with_socket(fd, |s| {
+        // Loopback fast-path sockets bypass smoltcp entirely, so a
+        // shutdown must be signalled on the in-kernel pipe — otherwise the
+        // peer blocked in recv() never sees EOF. netperf relies on exactly
+        // this: after the test it shutdown(SHUT_WR)s its control socket so
+        // netserver's worker recv returns 0 and replies; without it both
+        // ends deadlock and netperf never exits.
+        let lb = s.state.lock().loopback.clone();
+        if let Some(lb) = lb {
             match how {
-                SHUT_WR | SHUT_RDWR => {
-                    net::tcp_close(s.handle);
-                }
-                SHUT_RD => {
-                    // smoltcp has no half-close on RX. Just no-op.
-                }
+                SHUT_WR | SHUT_RDWR => lb.shutdown_write(),
+                SHUT_RD => {}
                 _ => return EINVAL,
             }
-            0
+            crate::task::wake_socket_waiters();
+            return 0;
         }
-        SocketKind::Udp => {
-            net::udp_close(s.handle);
-            0
+        match s.kind {
+            SocketKind::Tcp => {
+                match how {
+                    SHUT_WR | SHUT_RDWR => {
+                        net::tcp_close(s.handle);
+                    }
+                    SHUT_RD => {
+                        // smoltcp has no half-close on RX. Just no-op.
+                    }
+                    _ => return EINVAL,
+                }
+                0
+            }
+            SocketKind::Udp => {
+                net::udp_close(s.handle);
+                0
+            }
         }
     });
     match res {
