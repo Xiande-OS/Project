@@ -19,11 +19,14 @@
 # features and offset_of! (the only "modern" feature) is stable since
 # 1.77, so any recent stable works.
 
-CARGO        := cargo
-TARGET_RV    := riscv64gc-unknown-none-elf
-KERNEL_PKG   := kernel
-RELEASE_DIR  := target/$(TARGET_RV)/release
-KERNEL_ELF   := $(RELEASE_DIR)/$(KERNEL_PKG)
+CARGO         := cargo
+TARGET_RV     := riscv64gc-unknown-none-elf
+TARGET_LA     := loongarch64-unknown-none
+KERNEL_PKG    := kernel
+RELEASE_DIR   := target/$(TARGET_RV)/release
+KERNEL_ELF    := $(RELEASE_DIR)/$(KERNEL_PKG)
+RELEASE_DIR_LA := target/$(TARGET_LA)/release
+KERNEL_ELF_LA := $(RELEASE_DIR_LA)/$(KERNEL_PKG)
 
 # Belt-and-suspenders: even without rust-toolchain.toml, refuse implicit
 # toolchain installs/updates. Anything that tries to mutate the toolchain
@@ -89,12 +92,17 @@ kernel-rv: prepare
 	$(CARGO) build --release -p $(KERNEL_PKG) --target $(TARGET_RV) --offline
 	cp $(KERNEL_ELF) kernel-rv
 
-# LoongArch port is not yet implemented. Produce a minimal LoongArch64
-# ELF so `make all` succeeds and the RV side can still be evaluated. The
-# stub has no real code — when QEMU loads it the loongarch evaluator
-# will immediately fail / time out, but `make all` will not.
-kernel-la: scripts/build_la_stub.sh
-	bash scripts/build_la_stub.sh kernel-la
+# LoongArch64 kernel. Built from the same crate as kernel-rv via the
+# arch backend in src/arch/loongarch64. If the loongarch target is not
+# installed (e.g. an offline machine without the rust-std component),
+# fall back to the placeholder ELF so `make all` still completes.
+kernel-la: prepare
+	@if $(CARGO) build --release -p $(KERNEL_PKG) --target $(TARGET_LA) --offline; then \
+		cp $(KERNEL_ELF_LA) kernel-la; \
+	else \
+		echo "[kernel-la] loongarch target unavailable — using placeholder ELF"; \
+		bash scripts/build_la_stub.sh kernel-la; \
+	fi
 
 clean:
 	rm -rf target kernel-rv kernel-la .cargo kernel/.cargo

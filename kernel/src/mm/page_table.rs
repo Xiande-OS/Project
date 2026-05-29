@@ -123,10 +123,18 @@ impl PageTable {
         self.root.ppn
     }
 
-    /// satp value for Sv39 with this table as the active translation.
+    /// The architecture's address-space activation token for this table
+    /// (consumed by `crate::arch::activate_page_table`). On riscv64 this is
+    /// the Sv39 `satp` value (mode | root PPN); on loongarch64 it is the
+    /// physical address of the root directory frame loaded into PGDL.
+    #[cfg(target_arch = "riscv64")]
     pub fn satp(&self) -> usize {
         const SATP_MODE_SV39: usize = 8 << 60;
         SATP_MODE_SV39 | self.root_ppn().0
+    }
+    #[cfg(target_arch = "loongarch64")]
+    pub fn satp(&self) -> usize {
+        self.root_ppn().base().0
     }
 
     fn find_or_create(&mut self, vpn: VirtPageNum) -> Option<&mut Pte> {
@@ -206,12 +214,10 @@ impl PageTable {
 /// Invalidate one VPN in the local hart TLB. Caller must ensure the
 /// store to the PTE happened before this.
 pub fn local_flush_va(vpn: VirtPageNum) {
-    unsafe {
-        core::arch::asm!("sfence.vma {0}, zero", in(reg) vpn.base().0);
-    }
+    crate::arch::flush_tlb_va(vpn.base().0);
 }
 
 /// Flush the entire local hart TLB.
 pub fn local_flush_all() {
-    unsafe { core::arch::asm!("sfence.vma") };
+    crate::arch::flush_tlb_all();
 }

@@ -1,7 +1,15 @@
+# Default target for a bare `cargo build` in this crate. The Makefile
+# passes `--target` explicitly for both kernels, which overrides this.
 [build]
 target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-no-pie",
+    "-C", "force-frame-pointers=yes",
+]
+
+[target.loongarch64-unknown-none]
 rustflags = [
     "-C", "link-arg=-no-pie",
     "-C", "force-frame-pointers=yes",

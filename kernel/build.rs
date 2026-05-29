@@ -21,11 +21,19 @@ fn main() {
     let user_dir = workspace_root.join("user");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // Linker script for the kernel itself (absolute path so rust-lld
-    // can find it regardless of cwd at link time).
-    let linker_script = manifest_dir.join("linker.ld");
+    // Linker script for the kernel itself (absolute path so rust-lld can
+    // find it regardless of cwd at link time). Pick the per-architecture
+    // script based on the target cargo is building for.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let linker_name = if target_arch == "loongarch64" {
+        "linker-la.ld"
+    } else {
+        "linker.ld"
+    };
+    let linker_script = manifest_dir.join(linker_name);
     println!("cargo:rustc-link-arg=-T{}", linker_script.display());
     println!("cargo:rerun-if-changed=linker.ld");
+    println!("cargo:rerun-if-changed=linker-la.ld");
 
     // For each embedded user-mode binary, prefer a checked-in prebuilt.
     // The contest harness rejects on-line dependency downloads, so we

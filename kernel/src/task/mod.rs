@@ -15,7 +15,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
 
-use crate::arch::riscv64::trap::TrapFrame;
+use crate::arch::TrapFrame;
 use crate::loader::LoadedElf;
 use crate::mm::memory_set::{MemorySet, VmArea, VmPerm};
 use crate::mm::{VirtAddr, PAGE_SIZE};
@@ -946,13 +946,7 @@ pub fn execve_current_with_path(
         *slot = ms;
         new_satp = slot.satp();
     }
-    unsafe {
-        core::arch::asm!(
-            "csrw satp, {satp}",
-            "sfence.vma",
-            satp = in(reg) new_satp,
-        );
-    }
+    crate::arch::activate_page_table(new_satp);
 
     // Replace trap frame with fresh entry state.
     let mut tf = TrapFrame::default();
@@ -1008,12 +1002,8 @@ pub fn run_user_loop(task: &Arc<Task>) -> ! {
     let satp = task.memory_set.lock().satp();
     let tf_ptr = task.tf_ptr();
 
+    crate::arch::activate_page_table(satp);
     unsafe {
-        core::arch::asm!(
-            "csrw satp, {satp}",
-            "sfence.vma",
-            satp = in(reg) satp,
-        );
         __trap_return(tf_ptr as *const _);
     }
 }
@@ -1139,13 +1129,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
                 CURRENT_PID.store(next.pid, Ordering::Relaxed);
                 let next_satp = next.memory_set.lock().satp();
                 if cur_satp != Some(next_satp) {
-                    unsafe {
-                        core::arch::asm!(
-                            "csrw satp, {satp}",
-                            "sfence.vma",
-                            satp = in(reg) next_satp,
-                        );
-                    }
+                    crate::arch::activate_page_table(next_satp);
                 }
                 let next_tf = next.tf_ptr();
                 unsafe { crate::signal::check_signals(&next, &mut *next_tf); }
@@ -1213,13 +1197,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         // user signal frame writes to the right page table. If next
         // becomes Zombie below, restore cur_satp before falling back.
         if cur_satp != Some(next_satp) {
-            unsafe {
-                core::arch::asm!(
-                    "csrw satp, {satp}",
-                    "sfence.vma",
-                    satp = in(reg) next_satp,
-                );
-            }
+            crate::arch::activate_page_table(next_satp);
         }
         let next_tf = next.tf_ptr();
         unsafe { crate::signal::check_signals(&next, &mut *next_tf); }
@@ -1227,13 +1205,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             // Restore the previous satp and try the next candidate.
             if let Some(s) = cur_satp {
                 if Some(next_satp) != cur_satp {
-                    unsafe {
-                        core::arch::asm!(
-                            "csrw satp, {satp}",
-                            "sfence.vma",
-                            satp = in(reg) s,
-                        );
-                    }
+                    crate::arch::activate_page_table(s);
                 }
             }
             continue;

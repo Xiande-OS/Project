@@ -7,8 +7,6 @@ authors.workspace = true
 build = "build.rs"
 
 [dependencies]
-sbi-rt = { version = "0.0.3", features = ["legacy"] }
-riscv = "0.11"
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock", "lazy"] }
 bitflags = "2.6"
 buddy_system_allocator = "0.10"
@@ -17,6 +15,12 @@ xmas-elf = "0.9"
 virtio-drivers = "0.7"
 fdt = "0.1"
 smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dns"] }
+
+# riscv64-only: SBI calls and the `riscv` register crate carry RISC-V
+# inline asm, so they must not be pulled into the loongarch64 build.
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+sbi-rt = { version = "0.0.3", features = ["legacy"] }
+riscv = "0.11"
 
 [features]
 default = ["contest"]

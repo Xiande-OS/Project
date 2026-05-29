@@ -70,7 +70,7 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("  dtb @ {:#x}", dtb_pa);
 
     mm::init();
-    arch::riscv64::trap::init();
+    arch::trap_init();
     // Parse the embedded vDSO once (panics early on any layout problem).
     vdso::init();
     fs::init();

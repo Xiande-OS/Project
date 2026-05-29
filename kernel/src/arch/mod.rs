@@ -16,6 +16,47 @@ pub mod riscv64;
 #[cfg(target_arch = "riscv64")]
 use riscv64 as imp;
 
+#[cfg(target_arch = "loongarch64")]
+pub mod loongarch64;
+
+#[cfg(target_arch = "loongarch64")]
+use loongarch64 as imp;
+
+/// The architecture's trap frame. Common code (`signal`, `syscall`,
+/// `task`) names it through this re-export and only ever touches it via
+/// its inherent methods, so it is portable across backends.
+pub use imp::trap::TrapFrame;
+
+// ---- Traps ------------------------------------------------------------
+
+/// Install the trap vector(s) and start the preemption timer. Call once
+/// during early boot, after the console is up.
+pub fn trap_init() {
+    imp::trap::init();
+}
+
+// ---- MMU --------------------------------------------------------------
+
+/// Make the address space identified by `token` (the value returned by
+/// `mm::PageTable::satp()`) the active translation and flush stale TLB
+/// entries.
+#[inline]
+pub fn activate_page_table(token: usize) {
+    imp::mm::activate(token);
+}
+
+/// Invalidate the local-hart TLB entry covering virtual address `va`.
+#[inline]
+pub fn flush_tlb_va(va: usize) {
+    imp::mm::flush_va(va);
+}
+
+/// Flush the entire local-hart TLB.
+#[inline]
+pub fn flush_tlb_all() {
+    imp::mm::flush_all();
+}
+
 // ---- Time -------------------------------------------------------------
 
 /// Raw monotonic tick counter. Unit is architecture-defined; convert via

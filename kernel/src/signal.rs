@@ -35,7 +35,7 @@ use spin::Mutex;
 
 pub type SigActions = [KSigAction; (NSIG + 1) as usize];
 
-use crate::arch::riscv64::trap::TrapFrame;
+use crate::arch::TrapFrame;
 use crate::mm::memory_set::MemorySet;
 use crate::mm::VirtAddr;
 use crate::task::{Task, TaskState};

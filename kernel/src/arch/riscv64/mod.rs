@@ -3,6 +3,7 @@
 use core::arch::global_asm;
 
 pub mod console;
+pub mod mm;
 pub mod power;
 pub mod time;
 pub mod trap;

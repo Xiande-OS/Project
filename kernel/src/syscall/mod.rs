@@ -6,7 +6,7 @@ pub mod socket;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use crate::arch::riscv64::trap::TrapFrame;
+use crate::arch::TrapFrame;
 use crate::fs::{self, File, FileType, Inode};
 use crate::println;
 use crate::task::current_task;
