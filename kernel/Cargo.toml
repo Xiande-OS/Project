@@ -33,3 +33,6 @@ rust_git = []
 shell = []
 console = []
 dyn_hello = []
+# loongarch64 bring-up: boot a freestanding LA "hello" that writes to fd 1
+# and exits, proving user paging + the first syscall path end-to-end.
+la_hello = []

@@ -41,6 +41,9 @@ static DYN_HELLO_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("DYN_HELLO_ELF_PATH")));
 static LD_MUSL_ALIGNED: &AlignedElf<[u8]> =
     &AlignedElf(*include_bytes!(env!("LD_MUSL_PATH")));
+#[cfg(feature = "la_hello")]
+static LA_HELLO_ALIGNED: &AlignedElf<[u8]> =
+    &AlignedElf(*include_bytes!(env!("LA_HELLO_ELF_PATH")));
 
 fn hello_elf() -> &'static [u8] {
     &HELLO_ALIGNED.0
@@ -159,6 +162,28 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     }
     if option_env!("NETTRACE").is_some() {
         syscall::set_nettrace(true);
+    }
+
+    // loongarch64 bring-up smoke test: run the freestanding LA "hello"
+    // (write(1,...) + exit) to prove user paging + TLB refill + the first
+    // syscall work end-to-end, then power off. Takes priority over contest
+    // mode. Build with:
+    //   cargo build --release -p kernel --target loongarch64-unknown-none \
+    //     --offline --no-default-features --features la_hello
+    #[cfg(feature = "la_hello")]
+    {
+        let elf = &LA_HELLO_ALIGNED.0;
+        println!("[user] la_hello: loading LA hello ({} bytes)", elf.len());
+        let task = task::create_task_from_elf_with_path(
+            elf,
+            &["la_hello"],
+            &["PATH=/bin"],
+            "/bin/la_hello",
+        );
+        println!("[user] la_hello: entering user mode...");
+        task::run_user_loop(&task);
+        println!("[user] la_hello: returned — shutting down");
+        arch::shutdown();
     }
 
     // Contest mode: mount the testsuite EXT4 disk, build a driver

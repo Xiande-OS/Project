@@ -542,6 +542,7 @@ fn build_cmdline(argv: &[&str]) -> Vec<u8> {
     out
 }
 
+#[cfg(target_arch = "riscv64")]
 fn map_kernel_into(ms: &mut MemorySet) {
     extern "C" {
         fn __kernel_start();
@@ -552,6 +553,16 @@ fn map_kernel_into(ms: &mut MemorySet) {
     ms.map_mmio(0x1000_0000, 0x1000_1000); // UART
     ms.map_mmio(0x1000_1000, 0x1000_9000); // virtio-mmio
 }
+
+/// loongarch64 reaches the whole kernel image + all MMIO through the DMW0
+/// (cached) and DMW1 (uncached) direct-map windows, which bypass the TLB
+/// entirely. The per-process page table therefore needs no kernel or MMIO
+/// identity mappings — only the user (low-half) regions installed by
+/// `push_user_area`. Mapping the high-half kernel VA here would also be
+/// actively wrong: the 3×9-bit walk only sees the low 27 VPN bits, so a
+/// DMW kernel address would alias an unrelated low user VPN.
+#[cfg(target_arch = "loongarch64")]
+fn map_kernel_into(_ms: &mut MemorySet) {}
 
 fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
     let pid = alloc_pid();

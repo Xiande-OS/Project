@@ -126,18 +126,26 @@ __trap_return:
     # Fires on any TLB miss. Walks the page tables rooted at the PGD CSR
     # (auto low/high-half selected from TLBRBADV) using the hardware walk
     # assists (lddir/ldpte) and refills a TLB entry pair. The page-table
-    # node/leaf format must be LoongArch-native for lddir/ldpte to parse
-    # it — that MM rework is tracked separately; until then this fires
-    # only once user paging is exercised.
+    # node/leaf format is LoongArch-native (built by mm/page_table.rs under
+    # cfg(loongarch64)) so lddir/ldpte parse it directly.
+    #
+    # The tree is 3 levels of 9 bits over 4 KiB pages, configured in PWCL
+    # (trap.rs init): Dir2 = top (VA bits 38:30), Dir1 = middle (29:21),
+    # PTE = leaf (20:12). lddir's level immediate selects the PWCL/PWCH
+    # directory fields: level 2 -> Dir2, level 1 -> Dir1. The leaf level is
+    # consumed by ldpte (not lddir). This handler runs in DA mode (TLB off),
+    # so lddir/ldpte read the directory/leaf bases as physical addresses —
+    # which is exactly what the page table stores (PGDL + directory slots
+    # hold bare physical bases).
     .balign 4096
     .globl __tlb_refill_entry
 __tlb_refill_entry:
     csrwr   $t0, 0x8b            # TLBRSAVE = t0
-    csrrd   $t0, 0x1b           # PGD root (auto hi/lo from TLBRBADV)
-    lddir   $t0, $t0, 3         # top directory -> next level base
-    lddir   $t0, $t0, 1         # -> leaf PTE table base
-    ldpte   $t0, 0              # even PTE -> TLBRELO0
-    ldpte   $t0, 1              # odd PTE  -> TLBRELO1
+    csrrd   $t0, 0x1b           # PGD root base (auto hi/lo from TLBRBADV)
+    lddir   $t0, $t0, 2         # Dir2[idx] -> Dir1 table base
+    lddir   $t0, $t0, 1         # Dir1[idx] -> leaf PTE table base
+    ldpte   $t0, 0              # even leaf -> TLBRELO0
+    ldpte   $t0, 1              # odd leaf  -> TLBRELO1
     tlbfill
     csrrd   $t0, 0x8b           # restore t0
     ertn

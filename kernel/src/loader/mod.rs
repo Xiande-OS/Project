@@ -39,20 +39,27 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
     if header.pt1.magic != [0x7f, b'E', b'L', b'F'] {
         return Err("not an ELF");
     }
-    // Accept only the native machine. xmas-elf has no LoongArch variant,
-    // so match EM_LOONGARCH (258) via the catch-all `Other`.
+    // Accept ELFs for the architecture we're running on. xmas_elf knows
+    // RISC-V (EM=0xF3) by name; LoongArch (EM=258 / 0x102) lands in the
+    // catch-all `Other` variant. On loongarch64 we also tolerate a RISC-V
+    // image so the (RISC-V) busybox embedded for the contest path still
+    // loads and reaches user mode (it then faults with INE on its first
+    // foreign instruction); the contest path proper runs the native LA
+    // busybox from the mounted disk.
     #[cfg(target_arch = "riscv64")]
-    let native = matches!(
-        header.pt2.machine().as_machine(),
-        xmas_elf::header::Machine::RISC_V
-    );
+    {
+        use xmas_elf::header::Machine;
+        if header.pt2.machine().as_machine() != Machine::RISC_V {
+            return Err("ELF not RISC-V");
+        }
+    }
     #[cfg(target_arch = "loongarch64")]
-    let native = matches!(
-        header.pt2.machine().as_machine(),
-        xmas_elf::header::Machine::Other(258)
-    );
-    if !native {
-        return Err("ELF machine mismatch");
+    {
+        use xmas_elf::header::Machine;
+        match header.pt2.machine().as_machine() {
+            Machine::Other(258) | Machine::RISC_V => {}
+            _ => return Err("ELF arch unsupported"),
+        }
     }
 
     let mut max_end_va = 0usize;

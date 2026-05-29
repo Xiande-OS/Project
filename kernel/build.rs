@@ -83,4 +83,12 @@ fn main() {
         out_dir.join("ld-musl-riscv64.so.1"),
         "LD_MUSL_PATH",
     );
+    // Freestanding LoongArch "hello" used by the `la_hello` boot feature to
+    // smoke-test user paging + the first syscall end-to-end on LA. Empty
+    // placeholder on RV (or if the prebuilt is absent).
+    copy_or_stub(
+        user_dir.join("la_hello.elf"),
+        out_dir.join("la_hello.elf"),
+        "LA_HELLO_ELF_PATH",
+    );
 }
