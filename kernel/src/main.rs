@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
-#![feature(alloc_error_handler)]
+// No unstable features used. Since Rust 1.68 the default allocation-error
+// handler already panics, so we don't need a custom #[alloc_error_handler]
+// — and dropping it lets us build on stable Rust (so the grader doesn't
+// have to download a pinned nightly toolchain).
 
 extern crate alloc;
 
@@ -253,7 +256,3 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
-#[alloc_error_handler]
-fn alloc_error(layout: core::alloc::Layout) -> ! {
-    panic!("alloc error: {:?}", layout);
-}
