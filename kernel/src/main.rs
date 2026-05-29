@@ -104,9 +104,12 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     }
     fs::install_file("/bin", "dyn_hello", dyn_hello_elf()).unwrap();
     // Install the dynamic linker so PT_INTERP="/lib/ld-musl-riscv64.so.1" works.
+    // Also mount tmpfs at /tmp so tmpfile()/mkstemp from libc-test work.
     if let Some(td) = fs::tmpfs::downcast_dir(&fs::root()) {
         let lib_dir = fs::tmpfs::TmpfsDir::new_root();
         td.place_inode("lib", lib_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
+        let tmp_dir = fs::tmpfs::TmpfsDir::new_root();
+        td.place_inode("tmp", tmp_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
     }
     fs::install_file("/lib", "ld-musl-riscv64.so.1", ld_musl_blob()).unwrap();
     // POSIX shared-memory mount point at /dev/shm.
