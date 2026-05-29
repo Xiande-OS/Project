@@ -437,7 +437,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     // so a read that never wakes returns EAGAIN instead of
                     // hanging forever. Unbounded otherwise.
                     if recv_to_ticks != 0 {
-                        let now = riscv::register::time::read64();
+                        let now = crate::arch::now_ticks();
                         let deadline = crate::task::sleeper_deadline(task.pid)
                             .unwrap_or_else(|| {
                                 let d = now.saturating_add(recv_to_ticks);
@@ -914,7 +914,7 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         // Finite timeout? Install a sleep deadline so we wake up when it
         // expires even if no fd ever became readable.
         if let Some(t) = timeout_ticks {
-            let now = riscv::register::time::read64();
+            let now = crate::arch::now_ticks();
             let deadline = crate::task::sleeper_deadline(task.pid)
                 .unwrap_or_else(|| {
                     let d = now.saturating_add(t);
@@ -1618,7 +1618,7 @@ impl crate::fs::Inode for TimerFd {
         if buf.len() < 8 { return Err(crate::fs::EINVAL); }
         let exp_at = *self.expiry.lock();
         if exp_at == 0 { return Ok(0); }
-        while riscv::register::time::read64() < exp_at {
+        while crate::arch::now_ticks() < exp_at {
             core::hint::spin_loop();
         }
         let interval = *self.interval_ticks.lock();
@@ -1626,7 +1626,7 @@ impl crate::fs::Inode for TimerFd {
             *self.expiry.lock() = 0;
             1
         } else {
-            let now = riscv::register::time::read64();
+            let now = crate::arch::now_ticks();
             let n = ((now - exp_at) / interval) + 1;
             *self.expiry.lock() = exp_at + n * interval;
             n
@@ -1674,7 +1674,7 @@ fn sys_timerfd_settime(fd: i32, _flags: i32, new_value: usize, old_value: usize)
 
     let interval = ts_to_ticks(interval_s, interval_ns);
     let value = ts_to_ticks(value_s, value_ns);
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     *tf.expiry.lock() = if value == 0 { 0 } else { now + value };
     *tf.interval_ticks.lock() = interval;
     0
@@ -2117,7 +2117,7 @@ fn sys_pselect6(
             // throttle loop selects with a finite timeout, expecting to be
             // re-scheduled when the throttle interval ends.
             if let Some(t) = timeout_ticks {
-                let now = riscv::register::time::read64();
+                let now = crate::arch::now_ticks();
                 let deadline = crate::task::sleeper_deadline(task.pid)
                     .unwrap_or_else(|| {
                         let d = now.saturating_add(t);
@@ -2345,7 +2345,7 @@ fn sys_utimensat(dfd: i32, path: usize, times: usize, _flags: i32) -> isize {
         }
     };
 
-    let now_mtime = riscv::register::time::read64();
+    let now_mtime = crate::arch::now_ticks();
     let now_sec = (now_mtime / 10_000_000) as i64;
     let now_ns = ((now_mtime % 10_000_000) * 100) as i64;
 
@@ -2390,7 +2390,7 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     if total_ticks == 0 {
         return 0;
     }
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
 
     // Preserve the deadline across re-entry. We block by rewinding sepc to
     // the `ecall` and marking Waiting; the syscall re-runs on each wake.
@@ -2478,7 +2478,7 @@ fn sys_setitimer(which: usize, new_val: usize, old_val: usize) -> isize {
     }
     let task = current_task();
     let pid = task.pid;
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
 
     // If userland wants the previous value, write it out first.
     if old_val != 0 {
@@ -2546,7 +2546,7 @@ fn sys_getitimer(which: usize, cur_val: usize) -> isize {
         return EFAULT;
     }
     let pid = current_task().pid;
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     let out = match crate::task::itimer_real_get(pid) {
         Some((deadline, interval)) => {
             let remain = if deadline > now { deadline - now } else { 0 };
@@ -3133,10 +3133,7 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
     // If no other runnable/waiting/zombie task exists, halt.
     let pid = task.pid;
     if !crate::task::any_runnable_except(pid) && !crate::task::any_waiting() {
-        sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-        loop {
-            unsafe { core::arch::asm!("wfi") };
-        }
+        crate::arch::shutdown();
     }
 }
 
@@ -3470,7 +3467,7 @@ fn sys_uname(addr: usize) -> isize {
 fn sys_getrandom(buf: usize, len: usize, _flags: usize) -> isize {
     let task = current_task();
     let mut out = alloc::vec![0u8; len];
-    let mut x: u64 = riscv::register::time::read64()
+    let mut x: u64 = crate::arch::now_ticks()
         .wrapping_mul(2862933555777941757);
     for b in out.iter_mut() {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -3495,7 +3492,7 @@ struct Timeval {
 }
 
 fn sys_gettimeofday(tv: usize) -> isize {
-    let mtime = riscv::register::time::read64();
+    let mtime = crate::arch::now_ticks();
     let tv_val = Timeval {
         sec: (mtime / 10_000_000) as i64,
         usec: ((mtime % 10_000_000) / 10) as i64,
@@ -3504,7 +3501,7 @@ fn sys_gettimeofday(tv: usize) -> isize {
 }
 
 fn sys_clock_gettime(_clk: usize, ts: usize) -> isize {
-    let mtime = riscv::register::time::read64();
+    let mtime = crate::arch::now_ticks();
     let ts_val = Timespec {
         sec: (mtime / 10_000_000) as i64,
         nsec: ((mtime % 10_000_000) * 100) as i64,
@@ -3722,10 +3719,7 @@ fn cstr_to_str(bytes: &[u8]) -> Option<&str> {
 
 pub fn request_exit(status: i32) -> ! {
     println!("[kernel] killing task with status {}", status);
-    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::SystemFailure);
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+    crate::arch::shutdown_failure();
 }
 
 // =========================================================================
@@ -4060,7 +4054,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize) -> i
         // {0,0} poll: caller asked for non-blocking; nothing pending.
         return -11; // EAGAIN
     }
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     // Use existing SLEEPING_UNTIL entry if this is a re-entry (so the
     // deadline doesn't extend each time we get a spurious wake from an
     // out-of-set signal). Otherwise install a fresh deadline.

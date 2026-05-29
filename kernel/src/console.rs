@@ -1,24 +1,24 @@
-//! SBI console output.
+//! Kernel console output.
 //!
-//! M0 uses the SBI legacy `console_putchar` for simplicity. Once we have
-//! a 16550 driver (M1+) we'll route through that instead.
+//! Byte I/O is delegated to the active architecture backend
+//! (`crate::arch::console_put`); on riscv64 that's the SBI legacy
+//! console, on LoongArch a 16550 UART.
 
 use core::fmt::{self, Write};
 
-struct SbiConsole;
+struct Console;
 
-impl Write for SbiConsole {
+impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for &b in s.as_bytes() {
-            #[allow(deprecated)]
-            sbi_rt::legacy::console_putchar(b as usize);
+            crate::arch::console_put(b);
         }
         Ok(())
     }
 }
 
 pub fn _print(args: fmt::Arguments<'_>) {
-    let _ = SbiConsole.write_fmt(args);
+    let _ = Console.write_fmt(args);
 }
 
 #[macro_export]

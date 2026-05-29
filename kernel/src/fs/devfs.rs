@@ -60,7 +60,7 @@ impl Inode for DevNode {
             }
             DevKind::Tty => Ok(0),
             DevKind::Random => {
-                let mut x: u64 = riscv::register::time::read64()
+                let mut x: u64 = crate::arch::now_ticks()
                     .wrapping_mul(2862933555777941757);
                 for b in buf.iter_mut() {
                     x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -76,8 +76,7 @@ impl Inode for DevNode {
             DevKind::Full => Err(super::ENOSPC),
             DevKind::Tty => {
                 for &b in buf {
-                    #[allow(deprecated)]
-                    sbi_rt::legacy::console_putchar(b as usize);
+                    crate::arch::console_put(b);
                 }
                 Ok(buf.len())
             }

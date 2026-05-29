@@ -185,8 +185,7 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         }
         // Fall through to a hard shutdown if prepare_init failed.
         println!("[xiande-os] contest prep failed — shutting down");
-        sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-        loop { unsafe { core::arch::asm!("wfi") }; }
+        arch::shutdown();
     }
 
     let (name, elf, argv) = if cfg!(feature = "bare_hello") {
@@ -250,9 +249,6 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("[kernel panic] {}", info);
-    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::SystemFailure);
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+    arch::shutdown_failure();
 }
 

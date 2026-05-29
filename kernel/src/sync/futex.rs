@@ -223,7 +223,7 @@ fn futex_wait(task: &Arc<Task>, uaddr: usize, val: u32, timeout_ptr: usize, bits
     // so glibc's pthread_cond_timedwait(10ms) only "timed out" after another
     // `now` worth of uptime — fine early in a run, but past the per-test
     // watchdog once uptime grew (the flaky pthread_condattr_setclock hang).
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     let deadline_ticks = if let Some((s, ns)) = parse_timespec(task, timeout_ptr) {
         let ticks = ts_to_ticks(s, ns);
         if absolute {
@@ -386,7 +386,7 @@ pub fn has_pending_deadline(now: u64) -> bool {
 /// Walks every queue; for each Waiter whose deadline has passed, removes it
 /// from the queue and marks Ready with WaitResult::Timedout.
 pub fn poll_timeouts() {
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     let mut tab = FUTEXES.lock();
     let mut empty_keys: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     for (key, q) in tab.iter_mut() {

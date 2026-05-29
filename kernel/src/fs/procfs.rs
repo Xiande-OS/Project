@@ -24,7 +24,7 @@ use super::{FileType, Inode, Result, EINVAL, ENOENT};
 static BOOT_MTIME: AtomicU64 = AtomicU64::new(0);
 
 fn now_mtime() -> u64 {
-    riscv::register::time::read64()
+    crate::arch::now_ticks()
 }
 
 fn boot_mtime() -> u64 {

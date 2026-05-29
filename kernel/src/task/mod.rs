@@ -332,7 +332,7 @@ fn panic_dead_locked(cur_pid: i32, reason: &str) -> ! {
     crate::println!("\n=== KERNEL DEADLOCK DETECTED ===");
     crate::println!("reason: {}", reason);
     crate::println!("current pid: {}", cur_pid);
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     crate::println!("mtime: {}", now);
     crate::println!("task table:");
     let snapshot: Vec<(i32, TaskState, i32, i32)> = {
@@ -1042,7 +1042,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     // Wake any nanosleep'd tasks whose deadline has elapsed. Without
     // this a polling sleeper (busybox `timeout`) holds the CPU forever.
     {
-        let now = riscv::register::time::read64();
+        let now = crate::arch::now_ticks();
         wake_expired_sleepers(now);
         wake_expired_itimers(now);
     }
@@ -1092,7 +1092,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         //     visible instead of a silent hang.
         loop {
             {
-        let now = riscv::register::time::read64();
+        let now = crate::arch::now_ticks();
         wake_expired_sleepers(now);
         wake_expired_itimers(now);
     }
@@ -1104,12 +1104,11 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             // No-progress check: are there any other live tasks at
             // all, and do any of them have a deadline that could
             // eventually wake us? If neither, this is a real deadlock.
-            let now = riscv::register::time::read64();
+            let now = crate::arch::now_ticks();
             let alive_others = any_runnable_except(cur_pid) || any_waiting();
             if !alive_others {
                 if cur_state == Some(TaskState::Zombie) {
-                    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-                    loop { unsafe { core::arch::asm!("wfi") }; }
+                    crate::arch::shutdown();
                 }
                 panic_dead_locked(cur_pid, "no other live tasks");
             }
@@ -1175,7 +1174,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             // Zombie path: spin until something Ready appears.
             loop {
                 {
-        let now = riscv::register::time::read64();
+        let now = crate::arch::now_ticks();
         wake_expired_sleepers(now);
         wake_expired_itimers(now);
     }
@@ -1185,8 +1184,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
                 }
                 if any_runnable_except(cur_pid) { break; }
                 if !any_waiting() {
-                    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-                    loop { unsafe { core::arch::asm!("wfi") }; }
+                    crate::arch::shutdown();
                 }
                 core::hint::spin_loop();
             }

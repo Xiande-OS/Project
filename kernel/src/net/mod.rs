@@ -26,7 +26,7 @@ pub mod loopback;
 /// monotonic Instant.
 fn now_ms() -> i64 {
     // `time` CSR is 10 MHz on QEMU virt → 10_000 ticks per ms.
-    (riscv::register::time::read64() / 10_000) as i64
+    (crate::arch::now_ticks() / 10_000) as i64
 }
 
 fn now() -> Instant {
@@ -139,7 +139,7 @@ pub fn init() {
     let mac = dev.mac();
     let hw = EthernetAddress(mac);
     let mut cfg = Config::new(HardwareAddress::Ethernet(hw));
-    cfg.random_seed = riscv::register::time::read64();
+    cfg.random_seed = crate::arch::now_ticks();
 
     let mut iface = Interface::new(cfg, &mut phy, now());
     iface.update_ip_addrs(|addrs| {

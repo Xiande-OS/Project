@@ -106,7 +106,7 @@ fn block_and_retry_recheck(ready: impl Fn() -> bool) {
 /// `block_and_retry_recheck`.
 pub(crate) fn block_with_timeout(timeout_ticks: u64, ready: impl Fn() -> bool) -> bool {
     let me = current_task();
-    let now = riscv::register::time::read64();
+    let now = crate::arch::now_ticks();
     let deadline = crate::task::sleeper_deadline(me.pid).unwrap_or_else(|| {
         let d = now.saturating_add(timeout_ticks);
         crate::task::sleep_until(me.pid, d);
