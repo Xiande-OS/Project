@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
 
 use crate::arch::riscv64::trap::TrapFrame;
@@ -96,6 +96,15 @@ pub struct Task {
     /// /proc/self/smaps balloons to thousands of regions and reading it in
     /// print_stats becomes quadratic). 0 = not a reclaimable thread stack.
     pub thread_stack_top: AtomicUsize,
+    /// Set while the task is parked in an *interruptible* blocking syscall
+    /// (recv/accept/poll/... via `block_and_retry`, nanosleep, etc.) with
+    /// sepc rewound to the ecall. If a signal handler is then delivered,
+    /// the delivery path turns the in-flight syscall into -EINTR (unless
+    /// the handler is SA_RESTART) so userspace can observe the
+    /// interruption — netperf's CRR loop, for one, only checks its
+    /// times-up flag after its blocking recv returns. Cleared at the
+    /// start of every syscall.
+    pub in_blocking_syscall: AtomicBool,
 }
 
 unsafe impl Send for Task {}
@@ -580,6 +589,7 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
         clear_child_tid: Mutex::new(0),
         vfork_child: Mutex::new(None),
         thread_stack_top: AtomicUsize::new(0),
+        in_blocking_syscall: AtomicBool::new(false),
     });
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
@@ -844,6 +854,7 @@ pub fn clone_current(
                 0
             },
         ),
+        in_blocking_syscall: AtomicBool::new(false),
     });
     // Write the TF onto the new kstack.
     unsafe {

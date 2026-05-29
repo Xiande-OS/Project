@@ -598,6 +598,21 @@ pub fn check_signals(task: &Arc<Task>, tf: &mut TrapFrame) -> bool {
             }
         }
 
+        // EINTR plumbing: if the task is parked in an interruptible
+        // blocking syscall (sepc rewound to the ecall) and this handler is
+        // NOT SA_RESTART, un-rewind past the ecall and make the syscall
+        // return -EINTR. After the handler's sigreturn, userspace observes
+        // the interrupted syscall instead of silently re-blocking. With
+        // SA_RESTART, leave sepc rewound so the syscall restarts.
+        if task
+            .in_blocking_syscall
+            .swap(false, Ordering::Relaxed)
+            && (act.flags & SA_RESTART) == 0
+        {
+            tf.sepc += 4; // step past the ecall we had rewound
+            tf.x[9] = (-4isize) as usize; // -EINTR
+        }
+
         // Custom user handler.
         if let Err(()) = deliver_user_handler(task, tf, signo, &act) {
             // Fall back to default terminate if frame setup failed.

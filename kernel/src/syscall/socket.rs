@@ -63,6 +63,10 @@ fn block_and_retry() {
         crate::println!("[net] pid={} BLOCK on syscall#{}", me.pid, nr);
     }
     crate::task::mark_socket_waiter(me.pid);
+    // Mark interruptible so a signal delivered while we're parked turns
+    // this syscall into -EINTR (unless SA_RESTART) instead of silently
+    // re-blocking after the handler returns.
+    me.in_blocking_syscall.store(true, core::sync::atomic::Ordering::Relaxed);
     *me.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
         let tf = me.tf_ptr();

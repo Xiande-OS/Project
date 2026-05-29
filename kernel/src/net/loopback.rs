@@ -228,7 +228,19 @@ pub fn unregister_listener(port: u16) {
 /// enqueue the server side on its backlog, return the client side. If no
 /// listener: return None (caller returns ECONNREFUSED).
 pub fn try_connect(dst_port: u16, src_port_hint: u16) -> Option<Arc<LoopbackEnd>> {
-    let listener = find_listener(dst_port)?;
+    let listener = match find_listener(dst_port) {
+        Some(l) => l,
+        None => {
+            if crate::syscall::nettrace_enabled() {
+                crate::println!("[net] try_connect({}) -> NO LISTENER", dst_port);
+            }
+            return None;
+        }
+    };
+    if crate::syscall::nettrace_enabled() {
+        crate::println!("[net] try_connect({}) -> pending now {}", dst_port,
+            listener.pending.lock().len() + 1);
+    }
     let local = if src_port_hint != 0 {
         src_port_hint
     } else {

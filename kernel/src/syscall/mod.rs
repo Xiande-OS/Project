@@ -48,6 +48,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
         );
     }
 
+    // Fresh syscall: clear the interruptible-blocking flag. A blocking
+    // primitive (block_and_retry / nanosleep) re-sets it if it parks.
+    crate::task::current_task()
+        .in_blocking_syscall
+        .store(false, core::sync::atomic::Ordering::Relaxed);
+
     let ret = match id {
         nr::SYS_WRITE => sys_write(a0 as i32, a1, a2),
         nr::SYS_WRITEV => sys_writev(a0 as i32, a1, a2),
