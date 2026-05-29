@@ -158,9 +158,19 @@ pub struct TcpListener {
 }
 
 /// A bound UDP socket. Datagrams sent to this port land in `incoming`.
+///
+/// When `peer_port` is `None` the socket is wildcard-bound and accepts any
+/// source. Once the application calls `connect(2)` the kernel pins the
+/// expected source (see `set_udp_peer`) so we don't fan out per-flow
+/// datagrams to sibling sockets that happen to share the listen port —
+/// iperf3's `-P 5` UDP test keeps five data sockets plus one listener all
+/// bound to `:5001`, and without filtering each datagram lands in *all*
+/// six queues, blowing up the sequence-number bookkeeping (huge "lost"
+/// counts) and burning CPU re-reading dupes.
 pub struct UdpEnd {
     pub port: u16,
     pub incoming: Mutex<VecDeque<UdpDatagram>>,
+    pub peer_port: Mutex<Option<u16>>,
 }
 
 pub struct UdpDatagram {
@@ -238,6 +248,7 @@ pub fn register_udp(port: u16) -> Arc<UdpEnd> {
     let e = Arc::new(UdpEnd {
         port,
         incoming: Mutex::new(VecDeque::new()),
+        peer_port: Mutex::new(None),
     });
     let mut m = UDP_BINDS.lock();
     let v = m.entry(port).or_default();
@@ -245,6 +256,13 @@ pub fn register_udp(port: u16) -> Arc<UdpEnd> {
     v.retain(|w| w.strong_count() > 0);
     v.push(Arc::downgrade(&e));
     e
+}
+
+/// Pin this socket's expected source port. Subsequent `udp_deliver` calls
+/// only push into this end when the datagram's `src_port` matches. Pass
+/// `None` to clear (treated as wildcard). Called from `sys_connect` on UDP.
+pub fn set_udp_peer(end: &Arc<UdpEnd>, peer_port: Option<u16>) {
+    *end.peer_port.lock() = peer_port;
 }
 
 /// Any one live end bound to `port` (used for getsockname-style lookups).
@@ -270,10 +288,18 @@ pub fn unregister_udp(port: u16) {
 }
 
 /// Deliver a datagram from `src_port` to `dst_port`. Returns true if at
-/// least one receiver existed. Delivers to *every* live socket bound to
-/// the port: iperf3's UDP server keeps two ends on the test port and reads
-/// from whichever it picked, so a single-target delivery races into the
-/// wrong queue and the data vanishes.
+/// least one receiver was picked.
+///
+/// Routing: prefer the connected end whose `peer_port == src_port`. If no
+/// such end exists, fall back to a single wildcard (`peer_port == None`)
+/// end. We never deliver to a connected end whose peer doesn't match —
+/// otherwise iperf3's `-P N` UDP test (N data sockets all bound to the
+/// same listen port) sees every datagram in every queue and the sequence
+/// bookkeeping disintegrates.
+///
+/// If there is exactly one bound end and it's wildcard, we deliver
+/// (covers single-stream UDP where the server's per-flow socket hasn't
+/// been `connect()`ed yet at the moment the first packet arrives).
 pub fn udp_deliver(dst_port: u16, src_port: u16, data: &[u8]) -> bool {
     let ends: Vec<Arc<UdpEnd>> = {
         let mut m = UDP_BINDS.lock();
@@ -292,15 +318,41 @@ pub fn udp_deliver(dst_port: u16, src_port: u16, data: &[u8]) -> bool {
     if ends.is_empty() {
         return false;
     }
+    // Pass 1: connected end matching src_port.
+    let mut matched = false;
     for dst in &ends {
-        dst.incoming.lock().push_back(UdpDatagram {
-            src_port,
-            data: data.to_vec(),
-        });
+        if dst.peer_port.lock().map(|p| p == src_port).unwrap_or(false) {
+            dst.incoming.lock().push_back(UdpDatagram {
+                src_port,
+                data: data.to_vec(),
+            });
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
+        // Pass 2: first wildcard end. iperf3's UDP server reads the initial
+        // UDP_CONNECT_MSG off the wildcard prot_listener, then `connect()`s
+        // a fresh peer-port-pinned socket and spawns a new wildcard
+        // listener; both are bound to the same port at once. Without a
+        // wildcard fallback the second client (in parallel mode) would
+        // arrive at the FIRST stream's pinned socket and get dropped.
+        for dst in &ends {
+            if dst.peer_port.lock().is_none() {
+                dst.incoming.lock().push_back(UdpDatagram {
+                    src_port,
+                    data: data.to_vec(),
+                });
+                matched = true;
+                break;
+            }
+        }
     }
     // Wake any task blocked in recv/select on this UDP socket so the
     // scheduler can promote it back to Ready before the next time slice
     // expires.
-    crate::task::wake_socket_waiters();
-    true
+    if matched {
+        crate::task::wake_socket_waiters();
+    }
+    matched
 }
