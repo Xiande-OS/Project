@@ -3924,12 +3924,17 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
     if (prot & PROT_EXEC) != 0 {
         perm |= crate::mm::memory_set::VmPerm::X;
     }
-    // PROT_NONE (prot == 0) stays inaccessible: perm is U-only, so to_pte()
-    // installs a non-leaf PTE that translate() rejects. The page faults on
-    // user access (guard page) and copy_in/out returns EFAULT for a kernel
-    // access — which is what LTP's tst_get_bad_addr relies on. musl's
-    // reserve-with-PROT_NONE-then-mprotect pattern still works because the
-    // frames are allocated up-front and mprotect just rewrites their PTEs.
+    if prot == 0 {
+        // musl/busybox reserve an arena with mmap(PROT_NONE) and then write
+        // into it (the malloc/heap allocator relies on the region being
+        // usable without an explicit mprotect — see commit 513af62 which
+        // made PROT_NONE truly inaccessible and stalled the whole musl LTP
+        // run at bbr02 on the first busybox heap write). Keep the region R|W
+        // so those programs work. (The EFAULT-on-bad-pointer behaviour LTP's
+        // tst_get_bad_addr wants is being re-added separately via a VmArea
+        // permission check on the copy path, which doesn't break this.)
+        perm |= crate::mm::memory_set::VmPerm::R | crate::mm::memory_set::VmPerm::W;
+    }
 
     const MAP_FIXED: i32 = 0x10;
     let mut ms = task.memory_set_mut();
