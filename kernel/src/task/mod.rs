@@ -652,11 +652,16 @@ fn setup_initial_stack(
 
     sp &= !0xfusize;
 
-    let auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec![
-        // AT_SYSINFO_EHDR: base of the vDSO ELF. glibc parses its program
-        // headers + .eh_frame from here so pthread_cancel's forced unwind
-        // can step across the signal frame (see kernel/src/vdso.rs).
-        (33, crate::vdso::VDSO_BASE),
+    let mut auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    // AT_SYSINFO_EHDR: base of the vDSO ELF. glibc parses its program
+    // headers + .eh_frame from here so pthread_cancel's forced unwind can
+    // step across the signal frame (see kernel/src/vdso.rs). The embedded
+    // vDSO is a RISC-V image, so only advertise it on riscv64 — handing a
+    // foreign vDSO to a loongarch64 libc makes it parse a bogus ELF and
+    // chase near-null symbol pointers. LA libc just uses direct syscalls.
+    #[cfg(target_arch = "riscv64")]
+    auxv.push((33, crate::vdso::VDSO_BASE));
+    auxv.extend_from_slice(&[
         (3, elf.phdr_va),
         (4, elf.phent),
         (5, elf.phnum),
@@ -675,7 +680,7 @@ fn setup_initial_stack(
         (15, platform_va),
         (31, arg_addrs.first().copied().unwrap_or(0)),
         (0, 0),
-    ];
+    ]);
 
     let ptrs_bytes = 8
         + 8 * (arg_addrs.len() + 1 + env_addrs.len() + 1)

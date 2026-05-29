@@ -45,13 +45,18 @@ use crate::task::{Task, TaskState};
 /// below the dynamic-linker base (0x10_0000_0000).
 pub const SIG_RESTORER_VA: usize = 0x5000_0000;
 
-/// Build a 4 KiB page whose first 8 bytes are `li a7, 139 ; ecall`.
-/// Repeating the instructions across the page is unnecessary but
-/// harmless.
+/// Build a 4 KiB page whose first 8 bytes are the `rt_sigreturn` (139)
+/// trampoline for the target ISA. The kernel points a returning signal
+/// handler's `ra` here; on return it issues rt_sigreturn. The two
+/// instructions are architecture-specific machine code.
 fn restorer_page_bytes() -> [u8; 4096] {
     let mut buf = [0u8; 4096];
-    // li a7, 139   -> 0x08b00893
+    // riscv64: `li a7, 139` (0x08b00893) ; `ecall` (0x00000073)
+    #[cfg(target_arch = "riscv64")]
     let insns: [u32; 2] = [0x08b00893, 0x00000073];
+    // loongarch64: `li.w $a7, 139` (0x03822c0b) ; `syscall 0` (0x002b0000)
+    #[cfg(target_arch = "loongarch64")]
+    let insns: [u32; 2] = [0x03822c0b, 0x002b0000];
     let bytes = unsafe {
         core::slice::from_raw_parts(insns.as_ptr() as *const u8, 8)
     };

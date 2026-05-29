@@ -65,11 +65,31 @@ pub fn prepare_init() -> Option<(Arc<dyn Inode>, Vec<String>)> {
         println!("---- /init.sh ----\n{}---- end ----", body);
     }
 
+    // Pick the init interpreter for `sh /init.sh`. The driver script and
+    // the testcode scripts invoke the disk-relative `./busybox`, so only
+    // this top-level interpreter needs choosing.
+    #[cfg(target_arch = "riscv64")]
     let bb = match fs::lookup_path(fs::root(), BUSYBOX_PATH) {
         Ok(i) => i,
         Err(_) => {
             println!("[xiande-os] {} missing — abort", BUSYBOX_PATH);
             return None;
+        }
+    };
+    // On loongarch64 the embedded /bin/busybox is a RISC-V binary and
+    // cannot run, so use the testsuite disk's native LA busybox.
+    #[cfg(target_arch = "loongarch64")]
+    let bb = {
+        let candidates = ["/mnt/glibc/busybox", "/mnt/musl/busybox", BUSYBOX_PATH];
+        match candidates
+            .iter()
+            .find_map(|p| fs::lookup_path(fs::root(), p).ok())
+        {
+            Some(i) => i,
+            None => {
+                println!("[xiande-os] no usable busybox (disk or /bin) — abort");
+                return None;
+            }
         }
     };
 
