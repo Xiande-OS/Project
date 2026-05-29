@@ -214,6 +214,19 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 g = group,
                 v = variant,
             ));
+            // Reap servers a group daemonized (iperf3 -s -D, netserver -D,
+            // ...) and left running. A daemon calls setsid(), so it
+            // survives its group's `timeout`/sh exit and lingers into the
+            // next group — a leftover iperf3 server starves/locks the
+            // following netperf group (its data sockets never complete).
+            // pkill them between groups so each network group starts clean.
+            if matches!(group, "iperf" | "netperf" | "lmbench") {
+                s.push_str(
+                    "./busybox pkill -9 -x iperf3 2>/dev/null\n\
+                     ./busybox pkill -9 -x netserver 2>/dev/null\n\
+                     ./busybox pkill -9 -x netperf 2>/dev/null\n",
+                );
+            }
         }
     }
     s
