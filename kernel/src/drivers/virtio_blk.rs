@@ -7,6 +7,7 @@
 //! The block logic itself is transport-agnostic; only `init()` and the
 //! `BlockDevice` enum wrapper differ.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 use spin::{Mutex, Once};
@@ -124,8 +125,61 @@ impl BlkInner {
     }
 }
 
+/// Sector size in bytes (virtio-blk / ext4-on-512).
+const SECTOR_BYTES: usize = 512;
+/// Read-cache ceiling: 32768 sectors = 16 MiB of cached blocks. The hot
+/// reuse set on an LTP run — the musl loader + libc.so re-read on *every*
+/// dynamically-linked exec, plus the ext4 superblock / group-descriptor /
+/// inode-table / directory blocks re-read for every lookup — comfortably
+/// fits, so cache hits turn what used to be thousands of redundant
+/// virtio-blk round-trips into memcpys. That is the single biggest LTP
+/// throughput lever (more cases clear the 600s budget).
+const CACHE_MAX_SECTORS: usize = 32768;
+
+/// Bounded read cache, sector-granular. Correctness model: the contest
+/// test disk is read-mostly (LTP/libctest write their scratch to the
+/// tmpfs /tmp and /dev/shm, not to the ext4 image), so on the rare write
+/// we simply drop the whole cache — trivially coherent, no per-sector
+/// invalidation logic to get subtly wrong. On overflow we also clear and
+/// let the hot set re-populate; with a 16 MiB ceiling that's infrequent.
+struct BlockCache {
+    map: BTreeMap<usize, [u8; SECTOR_BYTES]>,
+}
+
+impl BlockCache {
+    fn new() -> Self {
+        Self { map: BTreeMap::new() }
+    }
+    fn get(&self, sector: usize, out: &mut [u8]) -> bool {
+        if out.len() != SECTOR_BYTES {
+            return false;
+        }
+        if let Some(d) = self.map.get(&sector) {
+            out.copy_from_slice(d);
+            true
+        } else {
+            false
+        }
+    }
+    fn put(&mut self, sector: usize, data: &[u8]) {
+        if data.len() != SECTOR_BYTES {
+            return;
+        }
+        if self.map.len() >= CACHE_MAX_SECTORS && !self.map.contains_key(&sector) {
+            self.map.clear();
+        }
+        let mut a = [0u8; SECTOR_BYTES];
+        a.copy_from_slice(data);
+        self.map.insert(sector, a);
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
 pub struct BlockDevice {
     inner: Mutex<BlkInner>,
+    cache: Mutex<BlockCache>,
 }
 
 static BLK: Once<Arc<BlockDevice>> = Once::new();
@@ -182,6 +236,7 @@ fn init_mmio() -> Option<Arc<BlockDevice>> {
         };
         let dev = Arc::new(BlockDevice {
             inner: Mutex::new(BlkInner::Mmio(blk)),
+            cache: Mutex::new(BlockCache::new()),
         });
         BLK.call_once(|| dev.clone());
         crate::println!("[virtio-blk] online at {:#x}, capacity={} sectors", base, dev.capacity());
@@ -217,6 +272,7 @@ fn init_pci() -> Option<Arc<BlockDevice>> {
         };
         let dev = Arc::new(BlockDevice {
             inner: Mutex::new(BlkInner::Pci(blk)),
+            cache: Mutex::new(BlockCache::new()),
         });
         BLK.call_once(|| dev.clone());
         crate::println!(
@@ -247,10 +303,25 @@ impl BlockDevice {
     }
 
     pub fn read_block(&self, sector: usize, buf: &mut [u8]) -> Result<(), ()> {
-        self.inner.lock().read_blocks(sector, buf)
+        // Fast path: serve a full sector from the cache without touching the
+        // device. The lock guard drops at the end of the `&&` so we never
+        // hold the cache lock across the device read below.
+        if buf.len() == SECTOR_BYTES && self.cache.lock().get(sector, buf) {
+            return Ok(());
+        }
+        self.inner.lock().read_blocks(sector, buf)?;
+        if buf.len() == SECTOR_BYTES {
+            self.cache.lock().put(sector, buf);
+        }
+        Ok(())
     }
 
     pub fn write_block(&self, sector: usize, buf: &[u8]) -> Result<(), ()> {
-        self.inner.lock().write_blocks(sector, buf)
+        let r = self.inner.lock().write_blocks(sector, buf);
+        // Drop the entire read cache on any write: coherent without
+        // per-sector bookkeeping (writes to the ext4 image are rare in the
+        // contest — scratch goes to tmpfs).
+        self.cache.lock().clear();
+        r
     }
 }
