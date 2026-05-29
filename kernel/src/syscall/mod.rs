@@ -665,6 +665,29 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
     let readable = access == O_RDONLY || access == O_RDWR;
     let writable = access == O_WRONLY || access == O_RDWR;
 
+    // O_TMPFILE (__O_TMPFILE = 0o20000000): create an anonymous, unnamed
+    // regular file in the given directory, reachable only through the
+    // returned fd. glibc's tmpfile() relies on this (musl uses a named
+    // temp + unlink, which is why musl's tmpfile worked but glibc's
+    // didn't — utime/ungetc/lseek_large all die at tmpfile()). We back it
+    // with a standalone tmpfs file that isn't linked into any directory.
+    const O_TMPFILE: i32 = 0o20000000;
+    if (flags & O_TMPFILE) != 0 {
+        // The path must name an existing directory (the temp file's
+        // "home"); validate it but don't link anything into it.
+        match resolve_at(dfd, &path_str) {
+            Some(d) if d.kind() == FileType::Directory => {}
+            Some(_) => return -20, // ENOTDIR
+            None => return ENOENT,
+        }
+        let inode: Arc<dyn Inode> = Arc::new(crate::fs::tmpfs::TmpfsFile::new());
+        let file = Arc::new(File::from_inode(inode, readable, writable, append));
+        return match current_task().fd_table.lock().alloc(file, cloexec) {
+            Ok(fd) => fd as isize,
+            Err(e) => err_to_isize(e),
+        };
+    }
+
     let inode = match resolve_at(dfd, &path_str) {
         Some(i) => {
             if excl && create {
@@ -1432,14 +1455,28 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
             0
         }
         F_GETFL => {
-            // Report O_NONBLOCK so userland (iperf3) sees the flag it set.
+            // Report the real access mode + flags. glibc's tmpfile() and
+            // fdopen() call F_GETFL and reject the fd if the mode doesn't
+            // match what they need (e.g. tmpfile needs "w+"/O_RDWR, fdopen
+            // "a" needs write). Returning 0 (O_RDONLY) made all of them
+            // fail with EINVAL — utime/ungetc/lseek_large/ftello.
             let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            let mut fl: i32 = if file.readable && file.writable {
+                O_RDWR
+            } else if file.writable {
+                O_WRONLY
+            } else {
+                O_RDONLY
+            };
+            if file.append {
+                fl |= O_APPEND;
+            }
             if let Some(sock) = file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>() {
                 if sock.state.lock().nonblock {
-                    return O_NONBLOCK as isize;
+                    fl |= O_NONBLOCK;
                 }
             }
-            0
+            fl as isize
         }
         F_SETFL => {
             // Honor O_NONBLOCK on sockets: iperf3/netperf flip their data
