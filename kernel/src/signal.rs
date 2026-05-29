@@ -128,6 +128,14 @@ pub const MINSIGSTKSZ: usize = 2048;
 // siginfo si_code (small subset)
 pub const SI_USER: i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
+/// Sent by tkill(2)/tgkill(2). glibc's pthread_cancel / setxid handlers
+/// require this in `si_code`.
+pub const SI_TKILL: i32 = -6;
+
+/// First realtime signal number. glibc reserves SIGRTMIN (32) = SIGCANCEL
+/// and 33 = SIGSETXID for its internal pthread machinery, both delivered
+/// via tgkill (hence SI_TKILL).
+pub const SIGRTMIN: u32 = 32;
 
 #[derive(Clone, Copy, Debug)]
 pub struct KSigAction {
@@ -166,6 +174,25 @@ pub struct SignalState {
     pub pending: AtomicU64,
     pub altstack: Mutex<Option<SigAltStack>>,
     pub saved_mask: Mutex<Option<u64>>,
+    /// Per-signal siginfo source captured at `raise_signal` time: the
+    /// `(si_code, si_pid)` the SA_SIGINFO handler will observe. Indexed by
+    /// signo (0 unused). Defaults to (SI_USER, 0). glibc's pthread_cancel /
+    /// __nptl_setxid SIGCANCEL/SIGSETXID handlers reject the signal unless
+    /// `si_code == SI_TKILL` and `si_pid == getpid()`, so the kill-family
+    /// syscalls must hand the *sender's* identity through to delivery.
+    pub siginfo: Mutex<[SigSource; (NSIG + 1) as usize]>,
+}
+
+/// `(si_code, si_pid)` captured when a signal is raised.
+#[derive(Clone, Copy)]
+pub struct SigSource {
+    pub code: i32,
+    pub pid: i32,
+}
+impl Default for SigSource {
+    fn default() -> Self {
+        Self { code: SI_USER, pid: 0 }
+    }
 }
 
 impl SignalState {
@@ -176,6 +203,7 @@ impl SignalState {
             pending: AtomicU64::new(0),
             altstack: Mutex::new(None),
             saved_mask: Mutex::new(None),
+            siginfo: Mutex::new([SigSource::default(); (NSIG + 1) as usize]),
         }
     }
 
@@ -189,6 +217,7 @@ impl SignalState {
             pending: AtomicU64::new(0),
             altstack: Mutex::new(*self.altstack.lock()),
             saved_mask: Mutex::new(None),
+            siginfo: Mutex::new([SigSource::default(); (NSIG + 1) as usize]),
         }
     }
 
@@ -202,6 +231,7 @@ impl SignalState {
             pending: AtomicU64::new(0),
             altstack: Mutex::new(*self.altstack.lock()),
             saved_mask: Mutex::new(None),
+            siginfo: Mutex::new([SigSource::default(); (NSIG + 1) as usize]),
         }
     }
 
@@ -221,6 +251,7 @@ impl SignalState {
         self.pending.store(0, Ordering::Relaxed);
         *self.altstack.lock() = None;
         *self.saved_mask.lock() = None;
+        *self.siginfo.lock() = [SigSource::default(); (NSIG + 1) as usize];
     }
 }
 
@@ -284,6 +315,22 @@ pub fn raise_signal(target: &Arc<Task>, signo: u32) -> bool {
         }
     }
     target.signals.pending.fetch_or(sigbit(signo), Ordering::SeqCst);
+
+    // Record the siginfo source the handler will see. The realtime signals
+    // (>= SIGRTMIN = 32) are glibc's internal pthread machinery, always
+    // delivered via tgkill, whose handlers (sigcancel_handler /
+    // __nptl_setxid_sighandler) demand `si_code == SI_TKILL` and
+    // `si_pid == getpid()`. We supply SI_TKILL + the process TGID for
+    // those; standard signals keep the existing SI_USER/0 behaviour (no
+    // current consumer reads their si_code). Self-directed signals — which
+    // is every case glibc's cancel handler accepts — have sender TGID ==
+    // target TGID, so the target's tgid is the right si_pid.
+    {
+        let code = if signo >= SIGRTMIN { SI_TKILL } else { SI_USER };
+        let pid = target.tgid.load(Ordering::Relaxed);
+        target.signals.siginfo.lock()[signo as usize] = SigSource { code, pid };
+    }
+
     // Wake from blocking syscalls.
     let was_waiting = {
         let mut s = target.state.lock();
@@ -684,9 +731,19 @@ fn deliver_user_handler(
     signo: u32,
     act: &KSigAction,
 ) -> Result<(), ()> {
-    // If user didn't set a restorer (the riscv musl path), fall back to
-    // the kernel-installed restorer page.
-    let restorer = if act.restorer == 0 { SIG_RESTORER_VA } else { act.restorer };
+    // Restorer (the `ra` the handler returns to). riscv musl/glibc both
+    // leave SA_RESTORER unset, so we supply one. We use the vDSO's
+    // `__vdso_rt_sigreturn` rather than the bare SIG_RESTORER_VA page: its
+    // body is identical (`li a7,139; ecall`), but its PC carries
+    // `.cfi_signal_frame` CFI, which is what glibc's pthread_cancel forced
+    // unwind needs to step across this signal frame. musl is unaffected
+    // (it just rt_sigreturns from there as before). If the app explicitly
+    // installed its own restorer, honour it.
+    let restorer = if act.restorer == 0 {
+        crate::vdso::sigreturn_entry()
+    } else {
+        act.restorer
+    };
 
     // Compute the sp for the handler. If SA_ONSTACK and an enabled
     // altstack exists and we're not already on it, switch.
@@ -720,16 +777,20 @@ fn deliver_user_handler(
     // Build the frame in kernel memory then copy out.
     let mut frame = RtSigFrame::default();
 
-    // siginfo
+    // siginfo. si_code + si_pid come from the source recorded when the
+    // signal was raised (see raise_signal). For glibc's SIGCANCEL the
+    // handler insists on si_code == SI_TKILL && si_pid == getpid(); a
+    // hardcoded SI_USER here made it ignore the cancel and the canceled
+    // thread spun forever (pthread_join hang).
+    let src = task.signals.siginfo.lock()[signo as usize];
     frame.info.si_signo = signo as i32;
     frame.info.si_errno = 0;
-    frame.info.si_code = SI_USER;
+    frame.info.si_code = src.code;
     // si_pid/si_uid follow at offset 16 (after si_signo,si_errno,si_code).
     // The C kernel layout is: int signo; int errno; int code; int pid; int uid; ...
     // pad starts at byte 12; pid at byte 16, uid at byte 20.
-    let sender_pid: i32 = crate::task::current_pid();
     let pad = &mut frame.info._pad;
-    pad[16 - 12..16 - 12 + 4].copy_from_slice(&sender_pid.to_le_bytes());
+    pad[16 - 12..16 - 12 + 4].copy_from_slice(&src.pid.to_le_bytes());
     pad[20 - 12..20 - 12 + 4].copy_from_slice(&0i32.to_le_bytes()); // uid
 
     // ucontext
@@ -800,10 +861,11 @@ fn deliver_user_handler(
     tf.x[11] = frame_addr + size_of::<KSigInfo>(); // a2 (ucontext*)
     tf.x[0] = restorer;                   // ra
 
-    // We don't try to roll back / restart the in-flight syscall. POSIX
-    // SA_RESTART would re-issue ecall by sepc -= 4 if the kernel had
-    // returned -EINTR; we don't have EINTR plumbing yet, so handlers
-    // returning into a blocking syscall just won't be interrupted.
+    // EINTR / SA_RESTART for an interrupted blocking syscall is handled by
+    // the caller (`check_signals`, via `in_blocking_syscall`): without
+    // SA_RESTART it steps sepc past the ecall and sets a0 = -EINTR before
+    // we get here, so the handler's sigreturn lands on the post-ecall
+    // instruction with the interrupted return value.
 
     Ok(())
 }

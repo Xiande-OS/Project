@@ -517,6 +517,7 @@ pub fn create_task_from_elf_with_path(
     let elf = crate::loader::load_elf(elf_image, &mut ms).expect("ELF load");
     let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);
     crate::signal::install_restorer_page(&mut ms);
+    crate::vdso::install(&mut ms);
 
     let mut tf = TrapFrame::default();
     tf.sepc = elf.entry;
@@ -642,6 +643,10 @@ fn setup_initial_stack(
     sp &= !0xfusize;
 
     let auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec![
+        // AT_SYSINFO_EHDR: base of the vDSO ELF. glibc parses its program
+        // headers + .eh_frame from here so pthread_cancel's forced unwind
+        // can step across the signal frame (see kernel/src/vdso.rs).
+        (33, crate::vdso::VDSO_BASE),
         (3, elf.phdr_va),
         (4, elf.phent),
         (5, elf.phnum),
@@ -930,6 +935,7 @@ pub fn execve_current_with_path(
     let elf = crate::loader::load_elf(elf_image, &mut ms).map_err(|_| -22i32)?;
     let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);
     crate::signal::install_restorer_page(&mut ms);
+    crate::vdso::install(&mut ms);
 
     // execve detaches the caller from any shared address space (POSIX
     // semantics): we replace the contents of the Arc<Mutex<MemorySet>>.

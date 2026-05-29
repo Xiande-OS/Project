@@ -17,6 +17,7 @@ mod signal;
 mod sync;
 mod syscall;
 mod task;
+mod vdso;
 
 use core::panic::PanicInfo;
 
@@ -67,6 +68,8 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
 
     mm::init();
     arch::riscv64::trap::init();
+    // Parse the embedded vDSO once (panics early on any layout problem).
+    vdso::init();
     fs::init();
 
     // Drop runnable binaries into /bin so execve can resolve them.
