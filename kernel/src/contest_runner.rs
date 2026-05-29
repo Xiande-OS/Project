@@ -116,6 +116,10 @@ fn enumerate_variants(mount: &str) -> Vec<(String, Vec<String>)> {
 /// absolute paths PT_INTERP encodes. Tries each known mapping and just
 /// reports failures — missing files mean that variant isn't on the disk.
 fn bind_loaders() {
+    // The dynamic-loader file names are architecture-specific (the disk
+    // ships riscv64 loaders on the RV image, loongarch64 loaders on the LA
+    // image). glibc's libc.so.6/libm.so.6 names are arch-neutral.
+    #[cfg(target_arch = "riscv64")]
     let mappings: &[(&str, &str)] = &[
         // glibc loader — required by both musl/basic/* and glibc/basic/*.
         ("/mnt/glibc/lib/ld-linux-riscv64-lp64d.so.1", "ld-linux-riscv64-lp64d.so.1"),
@@ -134,6 +138,18 @@ fn bind_loaders() {
         // The musl libc IS the loader, but a DT_NEEDED entry still
         // triggers the loader's library search; without /lib/libc.so the
         // search ends in ENOENT.
+        ("/mnt/musl/lib/libc.so", "libc.so"),
+    ];
+    #[cfg(target_arch = "loongarch64")]
+    let mappings: &[(&str, &str)] = &[
+        // glibc loader (confirmed present on the LA testsuite image).
+        ("/mnt/glibc/lib/ld-linux-loongarch-lp64d.so.1", "ld-linux-loongarch-lp64d.so.1"),
+        ("/mnt/glibc/lib/libc.so.6", "libc.so.6"),
+        ("/mnt/glibc/lib/libm.so.6", "libm.so.6"),
+        // musl loader (the libc.so on the disk IS the loader); cover the
+        // names LA musl binaries encode in PT_INTERP / DT_NEEDED.
+        ("/mnt/musl/lib/libc.so", "ld-musl-loongarch64.so.1"),
+        ("/mnt/musl/lib/libc.so", "ld-musl-loongarch-lp64d.so.1"),
         ("/mnt/musl/lib/libc.so", "libc.so"),
     ];
     for (src, dst) in mappings {
