@@ -255,7 +255,7 @@ fn futex_wait(task: &Arc<Task>, uaddr: usize, val: u32, timeout_ptr: usize, bits
         *s = TaskState::Waiting;
     }
     unsafe {
-        (*task.tf_ptr()).sepc -= 4;
+        (*task.tf_ptr()).rewind_syscall();
     }
     0
 }

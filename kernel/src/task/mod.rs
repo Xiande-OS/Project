@@ -520,12 +520,9 @@ pub fn create_task_from_elf_with_path(
     crate::vdso::install(&mut ms);
 
     let mut tf = TrapFrame::default();
-    tf.sepc = elf.entry;
-    tf.x[1] = user_sp_top;
-    // SPIE | SUM | FS=Initial (1<<13) so user-mode FP doesn't trap on first
-    // touch. busybox' setjmp saves fs0..fs11.
-    let sstatus: usize = (1 << 5) | (1 << 18) | (1 << 13);
-    tf.sstatus = sstatus;
+    tf.set_user_pc(elf.entry);
+    tf.set_user_sp(user_sp_top);
+    tf.init_user_state();
 
     let task = make_task_with_ms(ms, tf, 0);
     *task.cmdline.lock() = build_cmdline(argv);
@@ -791,12 +788,12 @@ pub fn clone_current(
 
     // ---- TF: clone parent's, override sp/tp/a0 ----
     let mut new_tf = unsafe { (*parent.tf_ptr()).clone() };
-    new_tf.x[9] = 0; // child sees 0 from clone
+    new_tf.set_syscall_ret(0); // child sees 0 from clone
     if child_sp != 0 {
-        new_tf.x[1] = child_sp;
+        new_tf.set_user_sp(child_sp);
     }
     if flags & CLONE_SETTLS != 0 {
-        new_tf.x[3] = newtls; // x4 = tp (index 3 because x[0] is x1)
+        new_tf.set_user_tp(newtls);
     }
 
     // ---- Allocate the task with a fresh kstack/TF, then patch shared fields ----
@@ -910,7 +907,7 @@ pub fn clone_current(
     if flags & CLONE_VFORK != 0 {
         *parent.vfork_child.lock() = Some(task.pid);
         unsafe {
-            (*parent.tf_ptr()).x[9] = task.pid as usize;
+            (*parent.tf_ptr()).set_syscall_ret(task.pid as usize);
         }
         *parent.state.lock() = TaskState::Waiting;
     }
@@ -959,9 +956,9 @@ pub fn execve_current_with_path(
 
     // Replace trap frame with fresh entry state.
     let mut tf = TrapFrame::default();
-    tf.sepc = elf.entry;
-    tf.x[1] = user_sp_top;
-    tf.sstatus = (1 << 5) | (1 << 18) | (1 << 13); // SPIE | SUM | FS=Initial
+    tf.set_user_pc(elf.entry);
+    tf.set_user_sp(user_sp_top);
+    tf.init_user_state();
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
     }

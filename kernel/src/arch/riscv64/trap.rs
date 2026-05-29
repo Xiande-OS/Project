@@ -24,6 +24,147 @@ pub struct TrapFrame {
     pub _reserved: usize,
 }
 
+/// Architecture-independent accessors. Arch-independent code goes through
+/// these instead of poking `.x[]` and `.sepc` directly; a future LoongArch
+/// TrapFrame supplies the same method names backed by its own register
+/// layout, so signal/syscall/task code is portable.
+///
+/// riscv64 register conventions:
+///   x[0]=ra, x[1]=sp, x[2]=gp, x[3]=tp,
+///   x[4..6]=t0..t2,
+///   x[7..8]=s0..s1, x[17..26]=s2..s11,
+///   x[9..16]=a0..a7,
+///   x[27..30]=t3..t6.
+impl TrapFrame {
+    // --- Program counter -----------------------------------------------
+
+    #[inline] pub fn user_pc(&self) -> usize { self.sepc }
+    #[inline] pub fn set_user_pc(&mut self, pc: usize) { self.sepc = pc; }
+    /// Rewind PC by one syscall instruction so the syscall re-executes on
+    /// next entry. Used by blocking syscalls before parking.
+    #[inline] pub fn rewind_syscall(&mut self) { self.sepc -= 4; }
+    /// Advance PC past the syscall instruction (used when delivering a
+    /// signal that aborts a blocking syscall: skip past the rewound ecall).
+    #[inline] pub fn advance_past_syscall(&mut self) { self.sepc += 4; }
+
+    // --- User stack pointer / return address ---------------------------
+
+    #[inline] pub fn user_sp(&self) -> usize { self.x[1] }
+    #[inline] pub fn set_user_sp(&mut self, sp: usize) { self.x[1] = sp; }
+    #[inline] pub fn set_user_ra(&mut self, ra: usize) { self.x[0] = ra; }
+    /// Set the thread pointer (TLS base). riscv64: tp = x4 (index 3).
+    #[inline] pub fn set_user_tp(&mut self, tp: usize) { self.x[3] = tp; }
+
+    /// Configure the architecture-defined privilege/mode bits so that
+    /// `__trap_return` sends this frame back to user mode with interrupts
+    /// enabled and the FP unit available on first touch.
+    ///
+    /// riscv64: sstatus = SPIE | SUM | FS=Initial.
+    #[inline]
+    pub fn init_user_state(&mut self) {
+        self.sstatus = (1 << 5) | (1 << 18) | (1 << 13);
+    }
+
+    // --- Syscall ABI ---------------------------------------------------
+
+    /// Syscall number (riscv64 Linux ABI: a7).
+    #[inline] pub fn syscall_no(&self) -> usize { self.x[16] }
+    /// Syscall argument n (0..=5 → a0..a5).
+    #[inline]
+    pub fn syscall_arg(&self, n: usize) -> usize {
+        debug_assert!(n < 6);
+        self.x[9 + n]
+    }
+    /// Set the syscall return value (riscv64 Linux ABI: a0).
+    #[inline] pub fn set_syscall_ret(&mut self, v: usize) { self.x[9] = v; }
+    /// Read the value currently in the return-value slot (used by
+    /// sigreturn to restore the saved a0).
+    #[inline] pub fn syscall_ret(&self) -> usize { self.x[9] }
+
+    // --- Signal handler entry ------------------------------------------
+
+    /// Prepare to enter a signal handler. Sets up sp/ra/PC and the three
+    /// standard arguments (`signo`, `siginfo*`, `ucontext*`).
+    #[inline]
+    pub fn enter_signal_handler(
+        &mut self,
+        handler: usize,
+        restorer: usize,
+        sp: usize,
+        signo: u32,
+        siginfo: usize,
+        ucontext: usize,
+    ) {
+        self.x[1] = sp;
+        self.set_user_pc(handler);
+        self.x[9] = signo as usize;   // a0
+        self.x[10] = siginfo;          // a1
+        self.x[11] = ucontext;         // a2
+        self.x[0] = restorer;          // ra
+    }
+
+    // --- Signal frame mcontext save / restore --------------------------
+    //
+    // The mcontext layout (the userspace KGRegs struct) is part of the
+    // riscv64 musl signal ABI. Keeping the register-by-register dance
+    // here keeps signal.rs unaware of the specific x[N] → named-register
+    // mapping. A future LoongArch TrapFrame will supply matching
+    // `save_to_sigcontext` / `restore_from_sigcontext` methods over its
+    // own KGRegs equivalent (likely re-exported from arch).
+
+    /// Capture the user-mode GPRs + PC into a sigcontext mcontext record.
+    pub fn save_to_sigcontext(&self, g: &mut crate::signal::KGRegs) {
+        let x = &self.x;
+        g.pc = self.sepc as u64;
+        g.ra = x[0] as u64;  g.sp = x[1] as u64;
+        g.gp = x[2] as u64;  g.tp = x[3] as u64;
+        g.t0 = x[4] as u64;  g.t1 = x[5] as u64;  g.t2 = x[6] as u64;
+        g.s0 = x[7] as u64;  g.s1 = x[8] as u64;
+        g.a0 = x[9] as u64;  g.a1 = x[10] as u64; g.a2 = x[11] as u64; g.a3 = x[12] as u64;
+        g.a4 = x[13] as u64; g.a5 = x[14] as u64; g.a6 = x[15] as u64; g.a7 = x[16] as u64;
+        g.s2 = x[17] as u64; g.s3 = x[18] as u64; g.s4 = x[19] as u64; g.s5 = x[20] as u64;
+        g.s6 = x[21] as u64; g.s7 = x[22] as u64; g.s8 = x[23] as u64; g.s9 = x[24] as u64;
+        g.s10 = x[25] as u64; g.s11 = x[26] as u64;
+        g.t3 = x[27] as u64; g.t4 = x[28] as u64; g.t5 = x[29] as u64; g.t6 = x[30] as u64;
+    }
+
+    /// Restore the user-mode GPRs + PC from a sigcontext mcontext record.
+    pub fn restore_from_sigcontext(&mut self, g: &crate::signal::KGRegs) {
+        self.sepc = g.pc as usize;
+        self.x[0] = g.ra as usize;
+        self.x[1] = g.sp as usize;
+        self.x[2] = g.gp as usize;
+        self.x[3] = g.tp as usize;
+        self.x[4] = g.t0 as usize;
+        self.x[5] = g.t1 as usize;
+        self.x[6] = g.t2 as usize;
+        self.x[7] = g.s0 as usize;
+        self.x[8] = g.s1 as usize;
+        self.x[9] = g.a0 as usize;
+        self.x[10] = g.a1 as usize;
+        self.x[11] = g.a2 as usize;
+        self.x[12] = g.a3 as usize;
+        self.x[13] = g.a4 as usize;
+        self.x[14] = g.a5 as usize;
+        self.x[15] = g.a6 as usize;
+        self.x[16] = g.a7 as usize;
+        self.x[17] = g.s2 as usize;
+        self.x[18] = g.s3 as usize;
+        self.x[19] = g.s4 as usize;
+        self.x[20] = g.s5 as usize;
+        self.x[21] = g.s6 as usize;
+        self.x[22] = g.s7 as usize;
+        self.x[23] = g.s8 as usize;
+        self.x[24] = g.s9 as usize;
+        self.x[25] = g.s10 as usize;
+        self.x[26] = g.s11 as usize;
+        self.x[27] = g.t3 as usize;
+        self.x[28] = g.t4 as usize;
+        self.x[29] = g.t5 as usize;
+        self.x[30] = g.t6 as usize;
+    }
+}
+
 /// One scheduler tick. 10 MHz mtimer → 1ms preemption quantum. Short
 /// enough that a userspace tight loop (e.g. libctest's pthread_cancel)
 /// can't hold the hart for long; the trap-driven scheduler nudge runs

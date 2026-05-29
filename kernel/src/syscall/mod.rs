@@ -33,18 +33,18 @@ const O_DIRECTORY: i32 = 0o200000;
 const O_CLOEXEC: i32 = 0o2000000;
 
 pub fn dispatch(tf: &mut TrapFrame) {
-    let id = tf.x[16];
-    let a0 = tf.x[9];
-    let a1 = tf.x[10];
-    let a2 = tf.x[11];
-    let a3 = tf.x[12];
-    let a4 = tf.x[13];
-    let a5 = tf.x[14];
+    let id = tf.syscall_no();
+    let a0 = tf.syscall_arg(0);
+    let a1 = tf.syscall_arg(1);
+    let a2 = tf.syscall_arg(2);
+    let a3 = tf.syscall_arg(3);
+    let a4 = tf.syscall_arg(4);
+    let a5 = tf.syscall_arg(5);
 
     if syscall_trace_enabled() {
         crate::println!(
             "[sys pid={}] #{} sp={:#x} a0={:#x} a1={:#x} a2={:#x}",
-            crate::task::current_pid(), id, tf.x[1], a0, a1, a2
+            crate::task::current_pid(), id, tf.user_sp(), a0, a1, a2
         );
     }
 
@@ -104,8 +104,9 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_SIGACTION => sys_rt_sigaction(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGRETURN => {
-            // Restore tf (incl. a0) from the rt_sigframe. Return the
-            // restored a0 so the trailing `tf.x[9] = ret` is a no-op.
+            // Restore tf (incl. syscall ret slot) from the rt_sigframe.
+            // The returned value matches what set_syscall_ret would write,
+            // making the trailing ret-write a no-op.
             let task = current_task();
             crate::signal::do_sigreturn(&task, tf)
         }
@@ -248,7 +249,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         crate::task::TaskState::Waiting
     );
     if !is_blocked {
-        tf.x[9] = ret as usize;
+        tf.set_syscall_ret(ret as usize);
     }
 }
 
@@ -410,7 +411,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                 *task.state.lock() = crate::task::TaskState::Waiting;
                 unsafe {
                     let tf = task.tf_ptr();
-                    (*tf).sepc -= 4;
+                    (*tf).rewind_syscall();
                 }
                 return 0;
             }
@@ -454,7 +455,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     *task.state.lock() = crate::task::TaskState::Waiting;
                     unsafe {
                         let tf = task.tf_ptr();
-                        (*tf).sepc -= 4;
+                        (*tf).rewind_syscall();
                     }
                     // Re-check after parking: a peer send() between our
                     // can_recv() test and the Waiting store would otherwise
@@ -477,7 +478,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     *task.state.lock() = crate::task::TaskState::Waiting;
                     unsafe {
                         let tf = task.tf_ptr();
-                        (*tf).sepc -= 4;
+                        (*tf).rewind_syscall();
                     }
                     return -11;
                 }
@@ -535,7 +536,7 @@ fn sys_readv(fd: i32, iov: usize, count: usize) -> isize {
                                         crate::task::TaskState::Waiting;
                                     unsafe {
                                         let tf = task.tf_ptr();
-                                        (*tf).sepc -= 4;
+                                        (*tf).rewind_syscall();
                                     }
                                     return -11;
                                 }
@@ -933,7 +934,7 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         *task.state.lock() = crate::task::TaskState::Waiting;
         unsafe {
             let tf = task.tf_ptr();
-            (*tf).sepc -= 4;
+            (*tf).rewind_syscall();
         }
         // Lost-wakeup guard (see sys_pselect6): re-scan after parking so a
         // datagram/byte that landed during the park isn't missed.
@@ -2151,7 +2152,7 @@ fn sys_pselect6(
             *task.state.lock() = crate::task::TaskState::Waiting;
             unsafe {
                 let tf = task.tf_ptr();
-                (*tf).sepc -= 4;
+                (*tf).rewind_syscall();
             }
             // Lost-wakeup guard: a peer that makes one of our read fds
             // ready between the scan above and the Waiting store would fire
@@ -2417,7 +2418,7 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     // acting). The deadline is preserved across re-entry above so the
     // restart doesn't extend the sleep.
     unsafe {
-        (*task.tf_ptr()).sepc -= 4;
+        (*task.tf_ptr()).rewind_syscall();
     }
 
     // If a deliverable signal is already pending, do NOT mark Waiting —
@@ -3418,7 +3419,7 @@ fn sys_wait4(pid: i32, status_addr: usize, options: i32) -> isize {
     // when a child becomes a zombie and wakes us.
     *me.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
-        (*me.tf_ptr()).sepc -= 4;
+        (*me.tf_ptr()).rewind_syscall();
     }
     0
 }
@@ -4037,7 +4038,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize) -> i
         // will see the pending signal and return on the next round.
         *task.state.lock() = crate::task::TaskState::Waiting;
         unsafe {
-            (*task.tf_ptr()).sepc -= 4;
+            (*task.tf_ptr()).rewind_syscall();
         }
         return 0;
     }
@@ -4076,7 +4077,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize) -> i
     // or the scheduler's wake_expired_sleepers fire on the deadline.
     *task.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
-        (*task.tf_ptr()).sepc -= 4;
+        (*task.tf_ptr()).rewind_syscall();
     }
     0
 }
@@ -4113,7 +4114,7 @@ fn sys_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
     // No deliverable signal; mark Waiting and rewind so we get rescheduled.
     *task.state.lock() = crate::task::TaskState::Waiting;
     unsafe {
-        (*task.tf_ptr()).sepc -= 4;
+        (*task.tf_ptr()).rewind_syscall();
     }
     0
 }
