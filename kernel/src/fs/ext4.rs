@@ -269,6 +269,58 @@ impl Fs {
         Ok(out)
     }
 
+    /// Read up to `buf.len()` bytes at byte offset `off`, touching only the
+    /// blocks that overlap the request (each fetched through the bounded
+    /// block cache). Unlike read_file this never allocates the whole file,
+    /// so reading thousands of large test binaries can't pin hundreds of MB
+    /// of per-inode cache and exhaust the heap. Returns bytes read (clamped
+    /// to the file size); sparse holes read as zero.
+    fn read_range(
+        &self,
+        ino: &Inode4,
+        off: usize,
+        buf: &mut [u8],
+    ) -> core::result::Result<usize, &'static str> {
+        let size = ino.size as usize;
+        if off >= size {
+            return Ok(0);
+        }
+        let want = core::cmp::min(buf.len(), size - off);
+        if want == 0 {
+            return Ok(0);
+        }
+        let bs = self.sb.block_size as usize;
+        let map = self.extent_map(ino)?;
+        let mut done = 0usize;
+        while done < want {
+            let cur = off + done;
+            let fblk = (cur / bs) as u64;
+            let blk_off = cur % bs;
+            let take = core::cmp::min(bs - blk_off, want - done);
+            let phys = map.iter().find_map(|&(start, phys, len)| {
+                let s = start as u64;
+                if fblk >= s && fblk < s + len as u64 {
+                    Some(phys + (fblk - s))
+                } else {
+                    None
+                }
+            });
+            match phys {
+                Some(pblk) => {
+                    let block = self.read_block(pblk)?;
+                    buf[done..done + take].copy_from_slice(&block[blk_off..blk_off + take]);
+                }
+                None => {
+                    for b in buf[done..done + take].iter_mut() {
+                        *b = 0;
+                    }
+                }
+            }
+            done += take;
+        }
+        Ok(done)
+    }
+
     /// Enumerate directory entries (name -> inode#, file_type).
     fn read_dir(&self, ino: &Inode4) -> core::result::Result<Vec<(String, u32, u8)>, &'static str> {
         if (ino.mode & S_IFMT) != S_IFDIR {
@@ -511,14 +563,10 @@ impl Inode for Ext4File {
             buf[..n].copy_from_slice(&v[start..end]);
             return Ok(n);
         }
-        let data = self.data()?;
-        if start >= data.len() {
-            return Ok(0);
-        }
-        let end = core::cmp::min(start + buf.len(), data.len());
-        let n = end - start;
-        buf[..n].copy_from_slice(&data[start..end]);
-        Ok(n)
+        // Ranged read straight from the block cache — no whole-file cache,
+        // so exec/read of many large binaries doesn't pin per-inode memory.
+        let raw = self.fs.read_inode(self.ino).map_err(|_| EINVAL)?;
+        self.fs.read_range(&raw, start, buf).map_err(|_| EINVAL)
     }
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize> {
         let mut slot = self.mutated.lock();
