@@ -412,27 +412,37 @@ pub struct KStackT {
     pub ss_size: u64,
 }
 
-/// 1024-bit sigset, padded to 128 bytes to match Linux kernel layout.
+/// sigset region of the ucontext. The active mask is `bits` (offset 0 of
+/// this struct). On riscv64 Linux the ucontext is laid out so that
+/// `uc_mcontext` begins at byte 176: uc_flags(8) + uc_link(8) +
+/// uc_stack(24) = 40, then this sigset region occupies 136 bytes
+/// (40 + 136 = 176). musl/glibc read+write the live mask at offset 40
+/// and the saved mcontext (incl. PC) at offset 176, so this padding is
+/// load-bearing — the pthread_cancel handler reads the interrupted PC
+/// from 176(ucontext) and writes the redirect target back there.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct KSigSet {
     pub bits: u64,
-    pub _pad: [u8; 120],
+    pub _pad: [u8; 128],
 }
 impl Default for KSigSet {
-    fn default() -> Self { Self { bits: 0, _pad: [0u8; 120] } }
+    fn default() -> Self { Self { bits: 0, _pad: [0u8; 128] } }
 }
 
 /// What the kernel writes for `struct ucontext` on the rt_sigframe.
-/// Matches Linux generic ucontext (asm-generic/ucontext.h) field order.
+/// Matches Linux generic ucontext (asm-generic/ucontext.h) field order:
+/// uc_sigmask comes BEFORE uc_mcontext, and the sigset padding places
+/// uc_mcontext at offset 176 (the offset musl's SA_SIGINFO handlers
+/// hardcode for the saved register file).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct KUContext {
     pub uc_flags: u64,
     pub uc_link: u64,
     pub uc_stack: KStackT,
-    pub uc_mcontext: KMContext,
     pub uc_sigmask: KSigSet,
+    pub uc_mcontext: KMContext,
 }
 
 /// siginfo_t (128 bytes). We populate si_signo, si_errno, si_code,
@@ -460,6 +470,14 @@ pub struct RtSigFrame {
     pub info: KSigInfo,
     pub uc: KUContext,
 }
+
+// Lock the ABI: musl/glibc SA_SIGINFO handlers read the saved register
+// file (and PC) from offset 176 of the ucontext. If this ever drifts,
+// pthread_cancel / swapcontext silently break, so fail the build instead.
+const _: () = {
+    assert!(core::mem::offset_of!(KUContext, uc_mcontext) == 176);
+    assert!(core::mem::offset_of!(KUContext, uc_sigmask) == 40);
+};
 
 impl Default for RtSigFrame {
     fn default() -> Self {
@@ -732,8 +750,7 @@ fn deliver_user_handler(
                 size_of::<KSigInfo>() // siginfo
                 + 8                   // uc_flags
                 + 8                   // uc_link
-                + size_of::<KStackT>() // uc_stack
-                + size_of::<KMContext>(); // uc_mcontext
+                + size_of::<KStackT>(); // uc_stack (uc_sigmask now precedes uc_mcontext)
             let _ = task.copy_out_bytes(
                 frame_addr + sigmask_off,
                 &prev.to_le_bytes(),

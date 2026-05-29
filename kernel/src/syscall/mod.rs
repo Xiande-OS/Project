@@ -248,7 +248,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
 
 static SYSCALL_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-fn syscall_trace_enabled() -> bool {
+pub fn syscall_trace_enabled() -> bool {
     SYSCALL_TRACE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
@@ -2326,28 +2326,50 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     // QEMU virt mtime ticks at 10 MHz: 1 tick = 100 ns.
     let total_ticks = (sec as u64).saturating_mul(10_000_000)
         + (nsec as u64) / 100;
-    let now = riscv::register::time::read64();
-    let target = now.saturating_add(total_ticks);
-    if target <= now {
+    if total_ticks == 0 {
         return 0;
     }
-    // Block instead of busy-spinning. Without this a polling sleeper
-    // (busybox `timeout` does nanosleep+kill in a tight loop) pinned
-    // the CPU and the actual wrapped command never got scheduled.
-    // We pre-write a0 = 0 before marking Waiting so that when the
-    // scheduler resumes us the trap return uses our value (the dispatch
-    // loop skips the post-syscall a0 write for Waiting tasks). sepc
-    // already points past ecall, so we do NOT rewind.
-    if syscall_trace_enabled() {
-        crate::println!(
-            "[nanosleep pid={}] sec={} nsec={} ticks={} now={} target={}",
-            task.pid, sec, nsec, total_ticks, now, target,
-        );
+    let now = riscv::register::time::read64();
+
+    // Preserve the deadline across re-entry. We block by rewinding sepc to
+    // the `ecall` and marking Waiting; the syscall re-runs on each wake.
+    // Recomputing `target` from a fresh `now` each time would extend the
+    // sleep forever, so the first entry installs the deadline and re-entries
+    // read it back (same pattern as sys_rt_sigtimedwait).
+    let deadline = crate::task::sleeper_deadline(task.pid).unwrap_or_else(|| {
+        let d = now.saturating_add(total_ticks);
+        crate::task::sleep_until(task.pid, d);
+        d
+    });
+
+    if now >= deadline {
+        crate::task::forget_sleeper(task.pid);
+        return 0;
     }
-    crate::task::sleep_until(task.pid, target);
+
+    // Rewind sepc to the `ecall` so the syscall re-runs on each wake and,
+    // crucially, so that when check_signals delivers a handler the saved
+    // PC sits inside musl's cancellation-point window [__cp_begin,
+    // __cp_end). That lets musl's SIGCANCEL handler redirect execution
+    // into __cancel — without it, pthread_cancel of a thread blocked in
+    // sleep() livelocks (the handler keeps firing past __cp_end, never
+    // acting). The deadline is preserved across re-entry above so the
+    // restart doesn't extend the sleep.
     unsafe {
-        (*task.tf_ptr()).x[9] = 0;
+        (*task.tf_ptr()).sepc -= 4;
     }
+
+    // If a deliverable signal is already pending, do NOT mark Waiting —
+    // check_signals only runs for Ready/Running tasks, so blocking now
+    // would strand a pending SIGCANCEL forever. Stay runnable; the
+    // scheduler delivers the handler this round (saved PC = the ecall).
+    use crate::signal::*;
+    let pending = task.signals.pending.load(core::sync::atomic::Ordering::SeqCst);
+    let mask = task.signals.mask.load(core::sync::atomic::Ordering::SeqCst);
+    if pending & !(mask & !unblockable_mask()) != 0 {
+        return 0;
+    }
+    crate::task::sleep_until(task.pid, deadline);
     *task.state.lock() = crate::task::TaskState::Waiting;
     0
 }
