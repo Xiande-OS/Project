@@ -2663,6 +2663,11 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
         (mode_default, 0, 0, (0, 0), (0, 0), (0, 0))
     };
     s.st_mode = (type_bits | (mode_bits & 0o7777)) as u32;
+    // Report a real device number for /dev/* char devices. glibc's daemon()
+    // checks st_rdev == makedev(1,3) for /dev/null, so 0 makes it ENODEV.
+    if let Some(d) = inode.as_any().downcast_ref::<crate::fs::devfs::DevNode>() {
+        s.st_rdev = d.kind.rdev();
+    }
     s.st_uid = uid;
     s.st_gid = gid;
     s.st_atime = atime.0;
@@ -2782,6 +2787,11 @@ fn sys_statx(dfd: i32, path: usize, _flags: i32, _mask: u32, buf: usize) -> isiz
         FileType::Pipe => 0o010600,
         FileType::Symlink => 0o120777,
     };
+    if let Some(d) = inode.as_any().downcast_ref::<crate::fs::devfs::DevNode>() {
+        let rdev = d.kind.rdev();
+        st.stx_rdev_major = (rdev >> 8) as u32;
+        st.stx_rdev_minor = (rdev & 0xff) as u32;
+    }
     st.stx_size = inode.size();
     st.stx_blocks = (inode.size() + 511) / 512;
     st.stx_ino = (Arc::as_ptr(&inode) as *const () as usize) as u64;

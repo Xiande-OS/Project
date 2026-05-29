@@ -13,6 +13,22 @@ pub enum DevKind {
     Random,
 }
 
+impl DevKind {
+    /// Linux device number (major<<8 | minor) reported via st_rdev. glibc's
+    /// daemon() verifies /dev/null is `makedev(1,3)` (== 259) — not just a
+    /// char device — so a zero rdev makes daemon() fail with ENODEV and
+    /// `iperf3 -s -D` never starts. Use the canonical Linux numbers.
+    pub fn rdev(self) -> u64 {
+        match self {
+            DevKind::Null => (1 << 8) | 3,   // /dev/null  1:3  = 259
+            DevKind::Zero => (1 << 8) | 5,   // /dev/zero  1:5
+            DevKind::Full => (1 << 8) | 7,   // /dev/full  1:7
+            DevKind::Random => (1 << 8) | 8, // /dev/random 1:8 (urandom is 1:9; close enough)
+            DevKind::Tty => (5 << 8) | 0,    // /dev/tty   5:0
+        }
+    }
+}
+
 pub struct DevNode {
     pub kind: DevKind,
 }
