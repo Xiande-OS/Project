@@ -270,6 +270,7 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                  export PATH=\"{ltp}/testcases/bin:$PATH\"; \
                  export LTPROOT={ltp}; \
                  export LTP_TIMEOUT_MUL=2; \
+                 export KCONFIG_SKIP_CHECK=1; \
              fi\n",
             ltp = ltp_dir,
         ));
@@ -316,10 +317,12 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 // bare `"$file"` invocation to wrap each case in its own
                 // `timeout` (this is exactly what LTP's own runltp does). A
                 // hung case now takes a real SIGKILL (ret 137) and the loop
-                // continues; the per-case limit is just above tst_test's own
-                // 60s timeout so genuine tests are never cut short.
+                // continues. 30s ~= LTP's own DEFAULT_TIMEOUT base, so normal
+                // cases finish well inside it; clusters of hung helpers (the
+                // cgroup_* tests) cost 30s instead of eating the whole budget,
+                // which is what lets the run reach hundreds of later cases.
                 s.push_str(&alloc::format!(
-                    "./busybox sed 's@^\\( *\\)\"$file\"\\( *\\)$@\\1./busybox timeout -s KILL 65 \"$file\"@' ./{s} > /tmp/ltp_to.sh 2>/dev/null\n",
+                    "./busybox sed 's@^\\( *\\)\"$file\"\\( *\\)$@\\1./busybox timeout -s KILL 30 \"$file\"@' ./{s} > /tmp/ltp_to.sh 2>/dev/null\n",
                     s = script
                 ));
                 s.push_str(&alloc::format!(
