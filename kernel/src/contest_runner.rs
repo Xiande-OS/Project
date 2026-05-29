@@ -222,9 +222,9 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
             // pkill them between groups so each network group starts clean.
             if matches!(group, "iperf" | "netperf" | "lmbench") {
                 s.push_str(
-                    "./busybox pkill -9 -x iperf3 2>/dev/null\n\
-                     ./busybox pkill -9 -x netserver 2>/dev/null\n\
-                     ./busybox pkill -9 -x netperf 2>/dev/null\n",
+                    "./busybox pkill -9 iperf3 2>/dev/null\n\
+                     ./busybox pkill -9 netserver 2>/dev/null\n\
+                     ./busybox pkill -9 netperf 2>/dev/null\n",
                 );
             }
         }
