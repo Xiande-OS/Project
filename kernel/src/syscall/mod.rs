@@ -198,6 +198,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_LINKAT => sys_linkat(a0 as i32, a1, a2 as i32, a3, a4 as i32),
         nr::SYS_SYMLINKAT => sys_symlinkat(a0, a1 as i32, a2),
         nr::SYS_CLONE => sys_clone(a0, a1, a2, a3, a4),
+        nr::SYS_CLONE3 => sys_clone3(a0, a1),
         nr::SYS_EXECVE => sys_execve(a0, a1, a2),
         nr::SYS_WAIT4 => sys_wait4(a0 as i32, a1, a2 as i32),
         nr::SYS_WAITID => sys_waitid(a0 as i32, a1 as i32, a2, a3 as i32),
@@ -3216,6 +3217,44 @@ fn sys_clone(flags: usize, child_sp: usize, ptid: usize, tls: usize, ctid: usize
         // Out of physical memory during address-space copy. Return
         // ENOMEM so userland's fork() fails gracefully instead of the
         // kernel panicking and dropping every downstream test group.
+        None => -12, // ENOMEM
+    }
+}
+
+/// clone3(struct clone_args *uargs, size_t size). glibc's pthread_create
+/// uses this in preference to clone(2). Translate the clone_args struct
+/// into the classic clone() parameters and reuse `clone_current`.
+///
+/// clone3 differs from clone: `stack` is the lowest address of the child
+/// stack (child sp = stack + stack_size), and the exit signal is its own
+/// field rather than the low byte of flags.
+fn sys_clone3(uargs: usize, size: usize) -> isize {
+    // Linux struct clone_args (prefix we use):
+    //   0:flags 8:pidfd 16:child_tid 24:parent_tid 32:exit_signal
+    //   40:stack 48:stack_size 56:tls
+    if size < 64 {
+        return -22; // EINVAL — too small to carry stack/tls
+    }
+    let task = current_task();
+    let Some(buf) = task.copy_in_bytes(uargs, core::cmp::min(size, 88)) else {
+        return -14; // EFAULT
+    };
+    let rd = |off: usize| -> u64 {
+        u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+    };
+    let flags = rd(0) as usize;
+    let child_tid = rd(16) as usize;
+    let parent_tid = rd(24) as usize;
+    let exit_signal = rd(32) as usize;
+    let stack = rd(40) as usize;
+    let stack_size = rd(48) as usize;
+    let tls = rd(56) as usize;
+    let child_sp = if stack != 0 { stack + stack_size } else { 0 };
+    // Fold the exit signal into the low byte so clone_current's SIGCHLD /
+    // wait bookkeeping matches the clone() convention.
+    let cl_flags = (flags & !0xff) | (exit_signal & 0xff);
+    match crate::task::clone_current(cl_flags, child_sp, parent_tid, child_tid, tls) {
+        Some(new_task) => new_task.pid as isize,
         None => -12, // ENOMEM
     }
 }
