@@ -3269,6 +3269,18 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, val2: usize, uaddr2: usize, val3: 
     crate::sync::futex::do_futex(uaddr, op, val, val2, uaddr2, val3)
 }
 
+/// Fallible zeroed buffer. Returns None instead of panicking when the heap
+/// cannot satisfy the request — a fragmented or exhausted kernel heap must
+/// fail the syscall with ENOMEM, never abort the whole kernel (which would
+/// kill the entire contest run). Used for the large, file-sized allocations
+/// in execve / mmap that grow with the binary being loaded.
+fn try_zeroed_buf(len: usize) -> Option<alloc::vec::Vec<u8>> {
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    v.try_reserve_exact(len).ok()?;
+    v.resize(len, 0);
+    Some(v)
+}
+
 fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
     let Some(path) = copy_path(path_addr) else {
         return EFAULT;
@@ -3294,7 +3306,9 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
         return -13; // EACCES
     }
     let size = inode.size() as usize;
-    let mut elf_image = alloc::vec![0u8; size];
+    // Fallible: a fragmented/exhausted heap must fail this exec with ENOMEM,
+    // not panic the kernel (which kills the entire test run).
+    let Some(mut elf_image) = try_zeroed_buf(size) else { return -12 };
     if let Err(e) = inode.read_at(0, &mut elf_image) {
         return err_to_isize(e);
     }
@@ -3346,7 +3360,7 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
             }
         };
         let interp_size = interp_inode.size() as usize;
-        let mut interp_image = alloc::vec![0u8; interp_size];
+        let Some(mut interp_image) = try_zeroed_buf(interp_size) else { return -12 };
         if let Err(e) = interp_inode.read_at(0, &mut interp_image) {
             return err_to_isize(e);
         }
@@ -3657,7 +3671,7 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
         let Some(file) = task.fd_table.lock().get(fd) else {
             return EBADF;
         };
-        let mut buf = alloc::vec![0u8; aligned];
+        let Some(mut buf) = try_zeroed_buf(aligned) else { return -12 };
         match file.inode.read_at(off as u64, &mut buf) {
             Ok(_) => Some(buf),
             Err(e) => return err_to_isize(e),
