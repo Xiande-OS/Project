@@ -54,7 +54,16 @@ pub fn prepare_init() -> Option<(Arc<dyn Inode>, Vec<String>)> {
         println!("[xiande-os] install_file /init.sh failed: {}", e);
         return None;
     }
-    println!("---- /init.sh ----\n{}---- end ----", body);
+    // Dump the generated driver script for debugging ONLY. This body
+    // contains the `#### OS COMP TEST GROUP ... ####` marker strings
+    // (inside its echo commands); printing it unconditionally would put
+    // those markers on the serial console in script order, ahead of real
+    // execution, and a marker-matching grader could mis-pair/double-count.
+    // Gated behind the (compile-time, off-by-default) syscall trace so the
+    // bare contest build emits markers ONLY from actual test execution.
+    if crate::syscall::syscall_trace_enabled() {
+        println!("---- /init.sh ----\n{}---- end ----", body);
+    }
 
     let bb = match fs::lookup_path(fs::root(), BUSYBOX_PATH) {
         Ok(i) => i,

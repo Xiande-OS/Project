@@ -676,10 +676,12 @@ fn deliver_default_terminate(task: &Arc<Task>, signo: i32, core: bool) {
     let status = (signo & 0x7f) | if core { 0x80 } else { 0 };
     task.exit_code.store(status, Ordering::Relaxed);
     *task.state.lock() = TaskState::Zombie;
-    crate::println!(
-        "[exit] pid={} killed by signal {}{}",
-        task.pid, signo, if core { " (core)" } else { "" },
-    );
+    if crate::syscall::syscall_trace_enabled() {
+        crate::println!(
+            "[exit] pid={} killed by signal {}{}",
+            task.pid, signo, if core { " (core)" } else { "" },
+        );
+    }
 
     // POSIX: a fatal unhandled signal terminates the *whole* thread
     // group, not just one thread. Walk the tgid and zombie-fy any
