@@ -914,7 +914,7 @@ pub fn execve_current_with_path(
     exe_path: &str,
 ) -> Result<(), i32> {
     let task = current_task();
-    let mut ms = MemorySet::new();
+    let mut ms = MemorySet::try_new().ok_or(-12i32)?; // ENOMEM
     map_kernel_into(&mut ms);
     let elf = crate::loader::load_elf(elf_image, &mut ms).map_err(|_| -22i32)?;
     let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);

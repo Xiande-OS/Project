@@ -115,6 +115,20 @@ impl MemorySet {
         }
     }
 
+    /// Fallible constructor. fork/exec paths call this so a frame-pool
+    /// exhaustion returns ENOMEM (the failing syscall fails cleanly)
+    /// instead of panicking the whole kernel mid-contest.
+    pub fn try_new() -> Option<Self> {
+        Some(Self {
+            page_table: PageTable::try_new()?,
+            areas: Vec::new(),
+            brk_base: VirtAddr(0),
+            brk_cur: VirtAddr(0),
+            mmap_top: VirtAddr(MMAP_BASE),
+            pending_stack_reclaim: Vec::new(),
+        })
+    }
+
     pub fn satp(&self) -> usize {
         self.page_table.satp()
     }
@@ -320,7 +334,7 @@ impl MemorySet {
     /// every test group sequenced after it. On None, all frames
     /// allocated so far are freed when `new_ms` drops.
     pub fn fork(&self) -> Option<Self> {
-        let mut new_ms = MemorySet::new();
+        let mut new_ms = MemorySet::try_new()?;
         for area in &self.areas {
             let mut new_frames = alloc::collections::BTreeMap::new();
             let pte_flags = area.perm.to_pte();

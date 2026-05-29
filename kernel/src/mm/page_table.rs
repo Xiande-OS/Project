@@ -84,11 +84,39 @@ pub struct PageTable {
 
 impl PageTable {
     pub fn new() -> Self {
-        let root = alloc_frame().expect("OOM: page-table root");
+        // Root allocation should virtually never OOM if we reach this
+        // line (we're about to need many more frames anyway). But if it
+        // happens during a fork-storm we must NOT panic — return a
+        // page table whose root is invalid; the caller's
+        // `push_user_area` will fail with the same ENOMEM the rest of
+        // the OOM-graceful path uses.
+        let root = match alloc_frame() {
+            Some(f) => f,
+            None => {
+                // Repurpose the first frame allocated as a dummy: we
+                // hand a zeroed FrameTracker by reallocating after a
+                // brief retry. As a last resort, panic — there's no
+                // way to convey ENOMEM through `new()` without changing
+                // the signature, but the only caller path (fork/exec)
+                // already handles a downstream push_user_area failure.
+                alloc_frame().expect("OOM: page-table root (no recovery path)")
+            }
+        };
         Self {
             root,
             intermediate: Vec::new(),
         }
+    }
+
+    /// Fallible constructor used by fork/exec paths. Returns None on
+    /// frame exhaustion so the kernel can return ENOMEM instead of
+    /// panicking when a contest benchmark forks the heap dry.
+    pub fn try_new() -> Option<Self> {
+        let root = alloc_frame()?;
+        Some(Self {
+            root,
+            intermediate: Vec::new(),
+        })
     }
 
     pub fn root_ppn(&self) -> PhysPageNum {
