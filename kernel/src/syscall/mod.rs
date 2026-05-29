@@ -3871,9 +3871,12 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
     if (prot & PROT_EXEC) != 0 {
         perm |= crate::mm::memory_set::VmPerm::X;
     }
-    if prot == 0 {
-        perm |= crate::mm::memory_set::VmPerm::R | crate::mm::memory_set::VmPerm::W;
-    }
+    // PROT_NONE (prot == 0) stays inaccessible: perm is U-only, so to_pte()
+    // installs a non-leaf PTE that translate() rejects. The page faults on
+    // user access (guard page) and copy_in/out returns EFAULT for a kernel
+    // access — which is what LTP's tst_get_bad_addr relies on. musl's
+    // reserve-with-PROT_NONE-then-mprotect pattern still works because the
+    // frames are allocated up-front and mprotect just rewrites their PTEs.
 
     const MAP_FIXED: i32 = 0x10;
     let mut ms = task.memory_set_mut();
