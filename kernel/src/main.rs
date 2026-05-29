@@ -141,8 +141,54 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         td.place_inode("lib64", lib64_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
         let tmp_dir = fs::tmpfs::TmpfsDir::new_root();
         td.place_inode("tmp", tmp_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
+        // /etc dir: populated below via fs::install_file (after the dir is in
+        // place). LTP cases call getpwnam("nobody"), getpwnam("root"),
+        // getgrnam("nobody") in setup; without these they TBROK with ENOENT
+        // before doing any real work. ~50+ cases gated.
+        let etc_dir = fs::tmpfs::TmpfsDir::new_root();
+        td.place_inode("etc", etc_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
+        // /root and /home empty dirs — getpwnam("root") reports /root as
+        // home; some LTP cases chdir there or create files under it.
+        let root_dir = fs::tmpfs::TmpfsDir::new_root();
+        td.place_inode("root", root_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
+        let home_dir = fs::tmpfs::TmpfsDir::new_root();
+        td.place_inode("home", home_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
+        // /var/log/lastlog and friends — some glibc utils touch these.
+        let var_dir = fs::tmpfs::TmpfsDir::new_root();
+        td.place_inode("var", var_dir as alloc::sync::Arc<dyn fs::Inode>).ok();
     }
     fs::install_file("/lib", "ld-musl-riscv64.so.1", ld_musl_blob()).unwrap();
+    // Populate /etc now that the dir exists. Plain text content; LTP cases
+    // call getpwnam("nobody"/"root") and getgrnam("nobody") in setup.
+    let _ = fs::install_file(
+        "/etc", "passwd",
+        b"root:x:0:0:root:/root:/bin/sh\n\
+nobody:x:65534:65534:nobody:/:/bin/sh\n\
+bin:x:1:1:bin:/bin:/bin/sh\n\
+daemon:x:2:2:daemon:/:/bin/sh\n",
+    );
+    let _ = fs::install_file(
+        "/etc", "group",
+        b"root:x:0:\n\
+nobody:x:65534:\n\
+bin:x:1:\n\
+daemon:x:2:\n\
+nogroup:x:65533:\n",
+    );
+    let _ = fs::install_file(
+        "/etc", "shadow",
+        b"root::0:0:99999:7:::\nnobody::0:0:99999:7:::\n",
+    );
+    let _ = fs::install_file("/etc", "hostname", b"xiande\n");
+    let _ = fs::install_file(
+        "/etc", "hosts",
+        b"127.0.0.1 localhost\n::1 localhost\n",
+    );
+    let _ = fs::install_file("/etc", "resolv.conf", b"nameserver 127.0.0.1\n");
+    let _ = fs::install_file(
+        "/etc", "nsswitch.conf",
+        b"passwd: files\ngroup: files\nshadow: files\nhosts: files\n",
+    );
     // POSIX shared-memory mount point at /dev/shm.
     if let Ok(dev_dir) = fs::root().lookup("dev") {
         if let Some(d) = fs::tmpfs::downcast_dir(&dev_dir) {

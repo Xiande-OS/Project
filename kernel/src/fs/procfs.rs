@@ -118,6 +118,15 @@ impl Inode for ProcPidDir {
             "cwd" => Ok(ProcGenFile::new(move || gen_cwd(pid))),
             "comm" => Ok(ProcGenFile::new(move || gen_comm(pid))),
             "fd" => Ok(Arc::new(ProcFdDir { pid }) as Arc<dyn Inode>),
+            // LTP's cgroup/taint/kconfig probes open /proc/self/mounts,
+            // /proc/self/cmdline, etc. The "self" path resolves to here, so
+            // mirror the global proc files that some cases happen to read
+            // through /proc/<pid>/... instead of /proc/<name>.
+            "mounts" => Ok(ProcGenFile::new(gen_mounts)),
+            "cgroup" => Ok(ProcGenFile::new(|| b"0::/\n".to_vec())),
+            "limits" => Ok(ProcGenFile::new(gen_limits)),
+            "oom_score" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            "oom_score_adj" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
             _ => Err(ENOENT),
         }
     }
@@ -135,8 +144,22 @@ impl Inode for ProcPidDir {
             ("cwd".into(), FileType::Regular),
             ("comm".into(), FileType::Regular),
             ("fd".into(), FileType::Directory),
+            ("mounts".into(), FileType::Regular),
+            ("cgroup".into(), FileType::Regular),
+            ("limits".into(), FileType::Regular),
+            ("oom_score".into(), FileType::Regular),
+            ("oom_score_adj".into(), FileType::Regular),
         ])
     }
+}
+
+fn gen_limits() -> Vec<u8> {
+    // Plausible defaults; LTP cases use this to discover RLIMIT_NOFILE etc.
+    b"Limit                     Soft Limit           Hard Limit           Units\n\
+      Max open files            1024                 4096                 files\n\
+      Max processes             4096                 4096                 processes\n\
+      Max stack size            8388608              16777216             bytes\n"
+        .to_vec()
 }
 
 /// /proc/<pid>/fd directory: lookup "<n>" gives a regular file whose contents
@@ -227,12 +250,16 @@ impl Inode for ProcRoot {
             "stat" => Ok(ProcGenFile::new(gen_proc_stat)),
             "loadavg" => Ok(ProcGenFile::new(gen_loadavg)),
             "cmdline" => Ok(ProcGenFile::new(|| b"console=ttyS0\n".to_vec())),
+            // /proc/sys/kernel/{tainted,pid_max,...} — LTP cgroup/taint/kconfig
+            // probes need these or they TBROK before doing any real work.
+            "sys" => Ok(Arc::new(ProcSysDir) as Arc<dyn Inode>),
             _ => Err(ENOENT),
         }
     }
     fn list(&self) -> Result<Vec<(String, FileType)>> {
         let mut out: Vec<(String, FileType)> = alloc::vec![
             ("self".into(), FileType::Directory),
+            ("sys".into(), FileType::Directory),
             ("cpuinfo".into(), FileType::Regular),
             ("meminfo".into(), FileType::Regular),
             ("mounts".into(), FileType::Regular),
@@ -599,6 +626,141 @@ fn gen_proc_stat() -> Vec<u8> {
 
 fn gen_loadavg() -> Vec<u8> {
     b"0.00 0.00 0.00 1/1 1\n".to_vec()
+}
+
+// ----- /proc/sys/kernel/<file> -----
+
+pub struct ProcSysDir;
+impl Inode for ProcSysDir {
+    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> FileType { FileType::Directory }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        match name {
+            "kernel" => Ok(Arc::new(ProcSysKernelDir) as Arc<dyn Inode>),
+            "fs" => Ok(Arc::new(ProcSysFsDir) as Arc<dyn Inode>),
+            _ => Err(ENOENT),
+        }
+    }
+    fn list(&self) -> Result<Vec<(String, FileType)>> {
+        Ok(alloc::vec![
+            ("kernel".into(), FileType::Directory),
+            ("fs".into(), FileType::Directory),
+        ])
+    }
+}
+
+pub struct ProcSysKernelDir;
+impl Inode for ProcSysKernelDir {
+    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> FileType { FileType::Directory }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        match name {
+            // LTP's tst_taint.c reads this — TBROK without it.
+            "tainted" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            // tst_pid.c reads pid_max — TBROK without it (capget02, etc).
+            "pid_max" => Ok(ProcGenFile::new(|| b"32768\n".to_vec())),
+            "osrelease" => Ok(ProcGenFile::new(|| b"6.6.0-xiande\n".to_vec())),
+            "ostype" => Ok(ProcGenFile::new(|| b"Linux\n".to_vec())),
+            "hostname" => Ok(ProcGenFile::new(|| b"xiande\n".to_vec())),
+            "domainname" => Ok(ProcGenFile::new(|| b"(none)\n".to_vec())),
+            "random" => Ok(Arc::new(ProcSysKernelRandomDir) as Arc<dyn Inode>),
+            "sem" => Ok(ProcGenFile::new(|| b"32000\t1024000000\t500\t32000\n".to_vec())),
+            "shmall" => Ok(ProcGenFile::new(|| b"18446744073692774399\n".to_vec())),
+            "shmmax" => Ok(ProcGenFile::new(|| b"18446744073692774399\n".to_vec())),
+            "shmmni" => Ok(ProcGenFile::new(|| b"4096\n".to_vec())),
+            "msgmax" => Ok(ProcGenFile::new(|| b"8192\n".to_vec())),
+            "msgmnb" => Ok(ProcGenFile::new(|| b"16384\n".to_vec())),
+            "msgmni" => Ok(ProcGenFile::new(|| b"32000\n".to_vec())),
+            "ngroups_max" => Ok(ProcGenFile::new(|| b"65536\n".to_vec())),
+            "threads-max" => Ok(ProcGenFile::new(|| b"63095\n".to_vec())),
+            "cap_last_cap" => Ok(ProcGenFile::new(|| b"40\n".to_vec())),
+            "yama" => Ok(Arc::new(ProcSysKernelYamaDir) as Arc<dyn Inode>),
+            _ => Err(ENOENT),
+        }
+    }
+    fn list(&self) -> Result<Vec<(String, FileType)>> {
+        Ok(alloc::vec![
+            ("tainted".into(), FileType::Regular),
+            ("pid_max".into(), FileType::Regular),
+            ("osrelease".into(), FileType::Regular),
+            ("ostype".into(), FileType::Regular),
+            ("hostname".into(), FileType::Regular),
+            ("domainname".into(), FileType::Regular),
+            ("random".into(), FileType::Directory),
+            ("sem".into(), FileType::Regular),
+            ("shmall".into(), FileType::Regular),
+            ("shmmax".into(), FileType::Regular),
+            ("shmmni".into(), FileType::Regular),
+            ("msgmax".into(), FileType::Regular),
+            ("msgmnb".into(), FileType::Regular),
+            ("msgmni".into(), FileType::Regular),
+            ("ngroups_max".into(), FileType::Regular),
+            ("threads-max".into(), FileType::Regular),
+            ("cap_last_cap".into(), FileType::Regular),
+            ("yama".into(), FileType::Directory),
+        ])
+    }
+}
+
+pub struct ProcSysKernelRandomDir;
+impl Inode for ProcSysKernelRandomDir {
+    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> FileType { FileType::Directory }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        match name {
+            "uuid" => Ok(ProcGenFile::new(|| b"00000000-0000-0000-0000-000000000000\n".to_vec())),
+            "boot_id" => Ok(ProcGenFile::new(|| b"00000000-0000-0000-0000-000000000000\n".to_vec())),
+            "entropy_avail" => Ok(ProcGenFile::new(|| b"256\n".to_vec())),
+            "poolsize" => Ok(ProcGenFile::new(|| b"256\n".to_vec())),
+            _ => Err(ENOENT),
+        }
+    }
+    fn list(&self) -> Result<Vec<(String, FileType)>> {
+        Ok(alloc::vec![
+            ("uuid".into(), FileType::Regular),
+            ("boot_id".into(), FileType::Regular),
+            ("entropy_avail".into(), FileType::Regular),
+            ("poolsize".into(), FileType::Regular),
+        ])
+    }
+}
+
+pub struct ProcSysKernelYamaDir;
+impl Inode for ProcSysKernelYamaDir {
+    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> FileType { FileType::Directory }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        match name {
+            "ptrace_scope" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            _ => Err(ENOENT),
+        }
+    }
+    fn list(&self) -> Result<Vec<(String, FileType)>> {
+        Ok(alloc::vec![("ptrace_scope".into(), FileType::Regular)])
+    }
+}
+
+pub struct ProcSysFsDir;
+impl Inode for ProcSysFsDir {
+    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> FileType { FileType::Directory }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        match name {
+            "file-max" => Ok(ProcGenFile::new(|| b"9223372036854775807\n".to_vec())),
+            "file-nr" => Ok(ProcGenFile::new(|| b"0\t0\t9223372036854775807\n".to_vec())),
+            "nr_open" => Ok(ProcGenFile::new(|| b"1073741816\n".to_vec())),
+            "pipe-max-size" => Ok(ProcGenFile::new(|| b"1048576\n".to_vec())),
+            _ => Err(ENOENT),
+        }
+    }
+    fn list(&self) -> Result<Vec<(String, FileType)>> {
+        Ok(alloc::vec![
+            ("file-max".into(), FileType::Regular),
+            ("file-nr".into(), FileType::Regular),
+            ("nr_open".into(), FileType::Regular),
+            ("pipe-max-size".into(), FileType::Regular),
+        ])
+    }
 }
 
 // ----- Mount -----
