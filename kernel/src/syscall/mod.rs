@@ -568,6 +568,24 @@ fn resolve_at(dfd: i32, path: &str) -> Option<Arc<dyn Inode>> {
     fs::lookup_path(start, path).ok()
 }
 
+/// Like `resolve_at` but preserves the actual error code (so callers can
+/// tell ENOTDIR from ENOENT, which libc-test/utime relies on).
+fn resolve_at_with_err(dfd: i32, path: &str) -> core::result::Result<Arc<dyn Inode>, i32> {
+    let task = current_task();
+    let start = if dfd == AT_FDCWD || path.starts_with('/') {
+        let cwd = task.cwd.lock().clone();
+        fs::lookup_path(fs::root(), &cwd).map_err(|e| e)?
+    } else {
+        task.fd_table
+            .lock()
+            .get(dfd)
+            .ok_or(EBADF as i32)?
+            .inode
+            .clone()
+    };
+    fs::lookup_path(start, path)
+}
+
 fn resolve_at_parent(dfd: i32, path: &str) -> Option<(Arc<dyn Inode>, String)> {
     let task = current_task();
     let start = if dfd == AT_FDCWD || path.starts_with('/') {
@@ -2125,8 +2143,12 @@ fn sys_utimensat(dfd: i32, path: usize, times: usize, _flags: i32) -> isize {
         file.inode.clone()
     } else {
         let Some(p) = copy_path(path) else { return EFAULT };
-        let Some(i) = resolve_at(dfd, &p) else { return ENOENT };
-        i
+        // Preserve ENOTDIR vs ENOENT distinction so libc-test/utime can
+        // see the expected "tried to descend through a non-dir component".
+        match resolve_at_with_err(dfd, &p) {
+            Ok(i) => i,
+            Err(e) => return e as isize,
+        }
     };
 
     let now_mtime = riscv::register::time::read64();

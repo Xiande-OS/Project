@@ -142,9 +142,16 @@ pub fn sys_bind(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
     let Some(bytes) = task.copy_in_bytes(addr_ptr, SOCKADDR_IN_SIZE) else {
         return EFAULT;
     };
-    let Some(sa) = parse_sockaddr_in(&bytes) else {
+    let Some(mut sa) = parse_sockaddr_in(&bytes) else {
         return EAFNOSUPPORT;
     };
+
+    // bind(..., port=0) means "let the kernel pick an ephemeral port".
+    // libc-test/socket.c relies on this for both UDP and TCP. Pick the
+    // port before stashing it in `bound` so getsockname() reports it.
+    if sa.port == 0 {
+        sa.port = crate::net::loopback::alloc_ephemeral();
+    }
 
     let res = with_socket(fd, |s| {
         s.state.lock().bound = Some(sa);
@@ -736,24 +743,24 @@ fn write_endpoint(addr_ptr: usize, len_ptr: usize, sa: SockAddrIn) -> isize {
 
 pub fn sys_getsockname(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
     let res = with_socket(fd, |s| {
-        // Loopback sockets bypass smoltcp, so the smoltcp handle has no
-        // local endpoint. Use the recorded bound/local address instead —
-        // iperf3 calls getsockname on the data socket and aborts on a
-        // bogus result.
+        // Prefer the recorded bind address whenever we have one — covers
+        // loopback fast-path sockets (no smoltcp endpoint at all) and
+        // plain bound-but-not-connected TCP sockets that haven't been
+        // pushed through tcp_listen yet (libc-test/socket relies on
+        // getsockname returning the ephemeral port chosen by bind so the
+        // follow-up connect actually targets the listener).
         {
             let st = s.state.lock();
-            if st.loopback.is_some() || st.udp_end.is_some() {
-                if let Some(b) = st.bound {
-                    let addr = if b.addr.0 == [0, 0, 0, 0] {
-                        Ipv4Address::new(127, 0, 0, 1)
-                    } else {
-                        b.addr
-                    };
-                    return Some((addr, b.port));
-                }
-                if let Some(lb) = st.loopback.as_ref() {
-                    return Some((Ipv4Address::new(127, 0, 0, 1), lb.local_port));
-                }
+            if let Some(b) = st.bound {
+                let addr = if b.addr.0 == [0, 0, 0, 0] {
+                    Ipv4Address::new(127, 0, 0, 1)
+                } else {
+                    b.addr
+                };
+                return Some((addr, b.port));
+            }
+            if let Some(lb) = st.loopback.as_ref() {
+                return Some((Ipv4Address::new(127, 0, 0, 1), lb.local_port));
             }
         }
         match s.kind {
