@@ -5,6 +5,15 @@ use core::fmt;
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SIZE_BITS: usize = 12;
 
+/// Offset added to a physical address to form a kernel-dereferenceable
+/// pointer. riscv64 runs the kernel identity-mapped (PA == VA); on
+/// loongarch64 the kernel reaches all of physical memory through the DMW0
+/// cached direct-map window based at 0x9000_0000_0000_0000.
+#[cfg(target_arch = "riscv64")]
+pub const KERNEL_PHYS_OFFSET: usize = 0;
+#[cfg(target_arch = "loongarch64")]
+pub const KERNEL_PHYS_OFFSET: usize = 0x9000_0000_0000_0000;
+
 /// Number of bits in a Sv39 virtual address (39).
 pub const SV39_VA_BITS: usize = 39;
 /// Mask covering the 56-bit physical address space.
@@ -39,13 +48,13 @@ impl PhysAddr {
         self.0 & (PAGE_SIZE - 1)
     }
     pub fn as_mut_ptr<T>(self) -> *mut T {
-        self.0 as *mut T
+        (self.0 + KERNEL_PHYS_OFFSET) as *mut T
     }
     /// Reinterpret this physical address as a kernel-accessible pointer.
-    /// M1 runs identity-mapped (no high-half), so PA == VA for the
-    /// kernel. When M2+ moves to high-half this becomes `PA + PHYS_OFFSET`.
+    /// riscv64 runs identity-mapped (PA == VA); loongarch64 adds the DMW0
+    /// window offset (`KERNEL_PHYS_OFFSET`) so the cached direct map is used.
     pub fn kernel_ptr<T>(self) -> *mut T {
-        self.0 as *mut T
+        (self.0 + KERNEL_PHYS_OFFSET) as *mut T
     }
 }
 

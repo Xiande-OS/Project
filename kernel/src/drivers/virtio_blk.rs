@@ -68,7 +68,14 @@ static BLK: Once<Arc<BlockDevice>> = Once::new();
 
 /// QEMU virt's virtio-mmio bank lives at 0x1000_1000 .. 0x1000_9000 with
 /// 0x1000-spaced slots. We scan them and grab the first block device.
+#[allow(unreachable_code)]
 pub fn init() -> Option<Arc<BlockDevice>> {
+    // The loongarch64 `virt` machine exposes virtio over PCI, not the
+    // RISC-V virtio-mmio bank scanned below; these fixed MMIO addresses
+    // fault on LA. PCI enumeration is a separate bring-up step.
+    #[cfg(target_arch = "loongarch64")]
+    return None;
+
     const BASES: &[usize] = &[
         0x1000_1000,
         0x1000_2000,

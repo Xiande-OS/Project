@@ -27,7 +27,13 @@ static NET: Once<Arc<NetDev>> = Once::new();
 
 /// Scan the virtio-mmio bank for a Network device. Returns the wrapper or
 /// None if no virtio-net is present.
+#[allow(unreachable_code)]
 pub fn init() -> Option<Arc<NetDev>> {
+    // virtio-net on loongarch64 `virt` is PCI, not the RISC-V mmio bank
+    // scanned below; the fixed MMIO addresses fault on LA. Not yet wired.
+    #[cfg(target_arch = "loongarch64")]
+    return None;
+
     const BASES: &[usize] = &[
         0x1000_1000,
         0x1000_2000,

@@ -141,7 +141,7 @@ impl PageTable {
         let indices = vpn.indices();
         let mut ppn = self.root.ppn;
         for (lvl, &idx) in indices.iter().enumerate() {
-            let pte = unsafe { &mut *(ppn.base().0 as *mut Pte).add(idx) };
+            let pte = unsafe { &mut *(ppn.base().kernel_ptr::<Pte>()).add(idx) };
             if lvl == 2 {
                 return Some(pte);
             }
@@ -164,7 +164,7 @@ impl PageTable {
         let indices = vpn.indices();
         let mut ppn = self.root.ppn;
         for (lvl, &idx) in indices.iter().enumerate() {
-            let pte = unsafe { &*(ppn.base().0 as *const Pte).add(idx) };
+            let pte = unsafe { &*(ppn.base().kernel_ptr::<Pte>() as *const Pte).add(idx) };
             if !pte.is_valid() {
                 return None;
             }

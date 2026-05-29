@@ -27,6 +27,9 @@ extern "C" {
 
 pub fn init() {
     heap::init();
-    let kend = PhysAddr(__kernel_end as usize);
+    // `__kernel_end` is a linked (virtual) address; on loongarch64 that is
+    // a DMW0 window address, so strip the window offset to get the physical
+    // end of the kernel image. On riscv64 the offset is 0 (identity map).
+    let kend = PhysAddr(__kernel_end as usize - address::KERNEL_PHYS_OFFSET);
     frame::init(kend, PhysAddr(MEMORY_END));
 }

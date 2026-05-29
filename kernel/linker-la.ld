@@ -2,10 +2,12 @@
  * xiande-os kernel linker script — LoongArch64.
  *
  * Memory layout (QEMU `virt`, direct-boot via -kernel):
- *   - RAM is reached through the firmware-established direct-map windows
- *     (DMW0 maps 0x9000_0000_0000_0000 -> PA 0, cached).
- *   - Kernel is linked/loaded in the DMW0 cached window at the high-half
- *     image of physical 0x0020_0000.
+ *   - QEMU enters the ELF at its (virtual) entry with DMW0 active, mapping
+ *     0x9000_0000_0000_0000 -> PA 0 cached.
+ *   - The QEMU `virt` machine splits RAM: 256 MiB low at PA 0, the rest
+ *     high at PA 0x9000_0000. Our kernel image (with its 256 MiB static
+ *     heap in .bss) does not fit in the low region, so we link/load it in
+ *     the high-RAM window: VA 0x9000_0000_9000_0000 == PA 0x9000_0000.
  *
  * This mirrors the riscv64 linker.ld section layout; only OUTPUT_ARCH,
  * OUTPUT_FORMAT and BASE_ADDRESS differ.
@@ -15,7 +17,7 @@ OUTPUT_ARCH(loongarch)
 OUTPUT_FORMAT("elf64-loongarch")
 ENTRY(_start)
 
-BASE_ADDRESS = 0x9000000000200000;
+BASE_ADDRESS = 0x9000000090000000;
 
 SECTIONS
 {

@@ -151,7 +151,8 @@ pub fn copy_in_via(ms: &MemorySet, va: usize, len: usize) -> Option<Vec<u8>> {
         let chunk = core::cmp::min(PAGE_SIZE - page_off, end - cursor);
         let pa = ms.translate(VirtAddr(page_va))?;
         let src = unsafe {
-            core::slice::from_raw_parts((pa.0 + page_off) as *const u8, chunk)
+            let ptr = crate::mm::PhysAddr(pa.0 + page_off).kernel_ptr::<u8>();
+            core::slice::from_raw_parts(ptr as *const u8, chunk)
         };
         out.extend_from_slice(src);
         cursor += chunk;
@@ -169,7 +170,8 @@ pub fn copy_out_via(ms: &MemorySet, va: usize, bytes: &[u8]) -> Option<()> {
         let chunk = core::cmp::min(PAGE_SIZE - page_off, end - cursor);
         let pa = ms.translate(VirtAddr(page_va))?;
         let dst = unsafe {
-            core::slice::from_raw_parts_mut((pa.0 + page_off) as *mut u8, chunk)
+            let ptr = crate::mm::PhysAddr(pa.0 + page_off).kernel_ptr::<u8>();
+            core::slice::from_raw_parts_mut(ptr, chunk)
         };
         dst.copy_from_slice(&bytes[written..written + chunk]);
         written += chunk;
