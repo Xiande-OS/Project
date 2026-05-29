@@ -148,6 +148,11 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SCHED_SETSCHEDULER => 0,
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         nr::SYS_CLOCK_GETRES => sys_clock_getres(a0, a1),
+        // clock_nanosleep: route to nanosleep. We ignore the clockid +
+        // TIMER_ABSTIME flag; callers (musl pthread_cond_timedwait, etc.)
+        // mostly use it for relative sleeps and a missing-syscall ENOSYS
+        // here makes them fall back to a noisy retry loop.
+        nr::SYS_CLOCK_NANOSLEEP => sys_nanosleep(a2, a3),
         // epoll stubs: empty event-set, never readies. cyclictest +
         // others fall back to polling timers instead of hanging on
         // ENOSYS.
