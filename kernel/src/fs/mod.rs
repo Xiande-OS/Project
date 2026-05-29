@@ -135,6 +135,7 @@ pub const ENOTDIR: i32 = -20;
 pub const EISDIR: i32 = -21;
 pub const EINVAL: i32 = -22;
 pub const ENOSPC: i32 = -28;
+pub const EMFILE: i32 = -24;
 pub const ESPIPE: i32 = -29;
 pub const ENOSYS: i32 = -38;
 
@@ -280,6 +281,11 @@ impl File {
 pub struct FdTable {
     pub table: Mutex<Vec<Option<Arc<File>>>>,
     pub cloexec: Mutex<Vec<bool>>,
+    /// Soft cap on the number of open fds (RLIMIT_NOFILE). alloc() returns
+    /// EMFILE once we'd cross this many live fds. setrlimit updates this so
+    /// libc-test/rlimit_open_files terminates instead of opening fds
+    /// forever. Default mirrors `default_rlimit(NOFILE).cur = 1024`.
+    pub soft_max: core::sync::atomic::AtomicUsize,
 }
 
 impl FdTable {
@@ -290,6 +296,7 @@ impl FdTable {
         Self {
             table: Mutex::new(alloc::vec![Some(stdin), Some(stdout), Some(stderr)]),
             cloexec: Mutex::new(alloc::vec![false, false, false]),
+            soft_max: core::sync::atomic::AtomicUsize::new(1024),
         }
     }
 
@@ -299,6 +306,9 @@ impl FdTable {
         Self {
             table: Mutex::new(t.clone()),
             cloexec: Mutex::new(c.clone()),
+            soft_max: core::sync::atomic::AtomicUsize::new(
+                self.soft_max.load(core::sync::atomic::Ordering::Relaxed),
+            ),
         }
     }
 
@@ -326,8 +336,12 @@ impl FdTable {
     pub fn alloc(&self, file: Arc<File>, cloexec: bool) -> Result<i32> {
         let mut t = self.table.lock();
         let mut c = self.cloexec.lock();
+        let cap = self.soft_max.load(core::sync::atomic::Ordering::Relaxed);
         for i in 0..t.len() {
             if t[i].is_none() {
+                if i >= cap {
+                    return Err(EMFILE);
+                }
                 t[i] = Some(file);
                 if c.len() <= i {
                     c.resize(i + 1, false);
@@ -337,6 +351,9 @@ impl FdTable {
             }
         }
         let fd = t.len();
+        if fd >= cap {
+            return Err(EMFILE);
+        }
         t.push(Some(file));
         c.push(cloexec);
         Ok(fd as i32)

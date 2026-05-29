@@ -1759,9 +1759,27 @@ fn default_rlimit(resource: u32) -> Rlimit {
     }
 }
 
-fn sys_prlimit64(_pid: i32, resource: u32, new_lim: usize, old_lim: usize) -> isize {
+/// Per-process rlimit overrides — a sparse table keyed by resource id.
+/// libc-test/rlimit_open_files setrlimit's RLIMIT_NOFILE to 42 and reads
+/// it back; without storage we'd keep returning the default (1024,4096)
+/// and the test spins forever opening fds. We don't actually enforce
+/// the limit in the fd allocator; just remember the user's setting so
+/// the round-trip set/get matches.
+static RLIMIT_OVERRIDES: spin::Mutex<
+    alloc::collections::BTreeMap<(i32, u32), (u64, u64)>,
+> = spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+fn rlimit_for(pid: i32, resource: u32) -> Rlimit {
+    if let Some(&(c, m)) = RLIMIT_OVERRIDES.lock().get(&(pid, resource)) {
+        return Rlimit { cur: c, max: m };
+    }
+    default_rlimit(resource)
+}
+
+fn sys_prlimit64(pid: i32, resource: u32, new_lim: usize, old_lim: usize) -> isize {
     let task = current_task();
-    let cur = default_rlimit(resource);
+    let target_pid = if pid == 0 { task.pid } else { pid };
+    let cur = rlimit_for(target_pid, resource);
     if old_lim != 0 {
         let bytes = unsafe {
             core::slice::from_raw_parts(&cur as *const _ as *const u8, 16)
@@ -1770,8 +1788,22 @@ fn sys_prlimit64(_pid: i32, resource: u32, new_lim: usize, old_lim: usize) -> is
             return EFAULT;
         }
     }
-    // Pretend the new limit succeeded; we don't actually enforce.
-    let _ = new_lim;
+    if new_lim != 0 {
+        let Some(buf) = task.copy_in_bytes(new_lim, 16) else { return EFAULT; };
+        let c = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+        let m = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+        // Lowering the max past the existing one is allowed (we're root).
+        RLIMIT_OVERRIDES.lock().insert((target_pid, resource), (c, m));
+        // Enforce RLIMIT_NOFILE in the fd allocator so the
+        // open-until-EMFILE pattern actually terminates.
+        if resource == RLIMIT_NOFILE && (pid == 0 || target_pid == task.pid) {
+            let cap = if c > 65536 { 65536 } else { c as usize };
+            task.fd_table
+                .lock()
+                .soft_max
+                .store(cap, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
     0
 }
 
@@ -1779,8 +1811,8 @@ fn sys_getrlimit(resource: u32, buf: usize) -> isize {
     sys_prlimit64(0, resource, 0, buf)
 }
 
-fn sys_setrlimit(_resource: u32, _buf: usize) -> isize {
-    0
+fn sys_setrlimit(resource: u32, buf: usize) -> isize {
+    sys_prlimit64(0, resource, buf, 0)
 }
 
 fn sys_truncate(path: usize, length: u64) -> isize {
