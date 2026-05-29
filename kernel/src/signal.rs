@@ -706,10 +706,21 @@ fn deliver_user_handler(
     // unwind needs to step across this signal frame. musl is unaffected
     // (it just rt_sigreturns from there as before). If the app explicitly
     // installed its own restorer, honour it.
-    let restorer = if act.restorer == 0 {
-        crate::vdso::sigreturn_entry()
-    } else {
+    let restorer = if act.restorer != 0 {
         act.restorer
+    } else {
+        // riscv64: the vDSO's __vdso_rt_sigreturn (same `li a7,139; ecall`
+        // body but with .cfi_signal_frame CFI for glibc's forced unwind).
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::vdso::sigreturn_entry()
+        }
+        // loongarch64: the embedded vDSO is a RISC-V image, so use the
+        // per-process LA restorer page (`li.w $a7,139; syscall 0`).
+        #[cfg(target_arch = "loongarch64")]
+        {
+            SIG_RESTORER_VA
+        }
     };
 
     // Compute the sp for the handler. If SA_ONSTACK and an enabled

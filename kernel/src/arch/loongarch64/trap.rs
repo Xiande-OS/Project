@@ -285,24 +285,36 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             }
             _ if from_user => {
                 let badv = csrrd(0x7);
+                let task = crate::task::current_task();
+                // PIL/PIS/PIF (load/store/fetch page faults) on a VA that is
+                // actually mapped in the page table are spurious: the general
+                // exception fired against a stale TLB entry (a single ASID
+                // space is shared, so a sibling's entry can shadow ours).
+                // Drop the stale entry and re-run the instruction; the retry
+                // misses the TLB and the refill walker reloads the live PTE.
+                if matches!(ecode, 0x01 | 0x02 | 0x03)
+                    && task
+                        .memory_set
+                        .lock()
+                        .translate(crate::mm::VirtAddr(badv))
+                        .is_some()
+                {
+                    crate::arch::flush_tlb_all();
+                    return crate::task::schedule_next_after_trap(tf as *mut _);
+                }
                 crate::println!(
-                    "[user fault pid={}] ecode={:#x}\n  era  = {:#x}\n  badv = {:#x}\n  prmd = {:#x}",
+                    "[user fault pid={}] ecode={:#x} era={:#x} badv={:#x} prmd={:#x}",
                     crate::task::current_pid(),
                     ecode,
                     tf.era,
                     badv,
                     tf.prmd
                 );
-                crate::println!(
-                    "  ra={:#x} sp={:#x} a0={:#x} a1={:#x} a7={:#x}",
-                    tf.r[1], tf.r[3], tf.r[4], tf.r[5], tf.r[11]
-                );
                 let signo = match ecode {
                     0x0D | 0x0E => crate::signal::SIGILL, // INE / IPE
                     0x09 => crate::signal::SIGBUS,        // ALE (alignment)
                     _ => crate::signal::SIGSEGV,          // PIL/PIS/PIF/PME/PNR/PNX/PPI/ADE
                 };
-                let task = crate::task::current_task();
                 let _ = crate::signal::raise_signal(&task, signo);
             }
             _ => {
