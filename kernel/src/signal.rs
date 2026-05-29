@@ -15,15 +15,18 @@
 //!   sp_low  ──────────────────────────────────
 //!           siginfo_t   (128 bytes, set fully)
 //!           ucontext {
-//!             uc_flags    : u64
-//!             uc_link     : *ucontext (we leave 0)
-//!             uc_stack    : stack_t (24 bytes)
-//!             uc_mcontext : sigcontext  { gregs[32] (u64), fpregs (528 bytes, zeroed) }
-//!             uc_sigmask  : sigset_t (128 bytes -- we use 8 + 120 pad)
+//!             uc_flags    : u64                         @ 0
+//!             uc_link     : *ucontext (we leave 0)      @ 8
+//!             uc_stack    : stack_t (24 bytes)          @ 16
+//!             uc_sigmask  : sigset_t (8 + 128 pad)      @ 40
+//!             uc_mcontext : sigcontext { gregs[32], fpregs(528) } @ 176
 //!           }
 //!   sp_high ──────────────────────────────────
 //!
-//! On rt_sigreturn we restore tf from `gregs` and sig_mask from uc_sigmask.
+//! uc_mcontext MUST start at byte 176 — musl/glibc SA_SIGINFO handlers
+//! (notably pthread_cancel's) read+write the saved PC there. A const
+//! offset_of assert below enforces it. On rt_sigreturn we restore tf
+//! from `gregs` and sig_mask from uc_sigmask.
 
 use alloc::sync::Arc;
 use core::mem::size_of;
