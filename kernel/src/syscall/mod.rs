@@ -89,6 +89,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_BRK => sys_brk(a0),
         nr::SYS_SET_TID_ADDRESS => sys_set_tid_address(a0),
         nr::SYS_SET_ROBUST_LIST => 0,
+        // get_robust_list: stub. musl's pthread_mutexattr_setrobust probes
+        // for robust-futex support via this syscall and converts ENOSYS
+        // into ENOTSUP. Returning 0 (success) lets it set the bit; the
+        // owner-died notification path isn't implemented but the
+        // setrobust call itself stops failing.
+        nr::SYS_GET_ROBUST_LIST => 0,
         nr::SYS_RT_SIGACTION => sys_rt_sigaction(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGRETURN => {

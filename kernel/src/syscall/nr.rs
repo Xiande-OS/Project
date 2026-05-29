@@ -46,6 +46,7 @@ pub const SYS_UMASK: usize = 166;
 pub const SYS_SET_TID_ADDRESS: usize = 96;
 pub const SYS_FUTEX: usize = 98;
 pub const SYS_SET_ROBUST_LIST: usize = 99;
+pub const SYS_GET_ROBUST_LIST: usize = 100;
 pub const SYS_NANOSLEEP: usize = 101;
 pub const SYS_GETITIMER: usize = 102;
 pub const SYS_SETITIMER: usize = 103;
