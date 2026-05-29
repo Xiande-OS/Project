@@ -3426,6 +3426,12 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
     }
     let task = current_task();
     let aligned = (len + crate::mm::PAGE_SIZE - 1) & !(crate::mm::PAGE_SIZE - 1);
+    if syscall_trace_enabled() {
+        crate::println!(
+            "[mmap pid={}] addr={:#x} len={:#x} prot={:#x} flags={:#x} fd={} off={:#x}",
+            task.pid, _addr, len, prot, flags, fd, off
+        );
+    }
 
     // If file-backed, read file content into a buffer first.
     let init = if (flags & MAP_ANONYMOUS) == 0 && fd >= 0 {
@@ -3461,7 +3467,18 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
         perm |= crate::mm::memory_set::VmPerm::R | crate::mm::memory_set::VmPerm::W;
     }
 
+    const MAP_FIXED: i32 = 0x10;
     let mut ms = task.memory_set_mut();
+    // MAP_FIXED: the caller demands this exact address (glibc's ld.so
+    // overlays each library PT_LOAD segment this way over a reserved
+    // span). Honor it precisely or the loader's relocations fault.
+    if (flags & MAP_FIXED) != 0 && _addr != 0 {
+        let start = ms.mmap_fixed(_addr, len, perm, init.as_deref());
+        if start.0 == usize::MAX {
+            return -12; // ENOMEM
+        }
+        return start.0 as isize;
+    }
     // Allocate from the dedicated mmap region so we never collide with
     // brk (which the user can grow/shrink at byte granularity). The
     // returned address is page-aligned, satisfying the 16-byte

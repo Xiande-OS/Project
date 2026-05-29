@@ -557,4 +557,36 @@ impl MemorySet {
         self.mmap_top = VirtAddr(end);
         VirtAddr(start)
     }
+
+    /// `mmap(... MAP_FIXED ...)`: map exactly at `va`, replacing whatever
+    /// was mapped in `[va, va+len)`. This is mandatory for the glibc
+    /// dynamic loader: it reserves a span with one file mmap, then
+    /// overlays each subsequent PT_LOAD segment with a MAP_FIXED mmap at
+    /// base+vaddr. If we placed those at mmap_top instead, the loader's
+    /// relocations would write to the gap and StorePageFault. Returns
+    /// `va` on success, usize::MAX (MAP_FAILED) on OOM.
+    pub fn mmap_fixed(
+        &mut self,
+        va: usize,
+        len: usize,
+        perm: VmPerm,
+        init: Option<&[u8]>,
+    ) -> VirtAddr {
+        let start = va & !(PAGE_SIZE - 1);
+        let aligned = (len + (va - start) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let end = start + aligned;
+        // Drop any existing mappings (and their frames) in the range so
+        // the overlay is clean — MAP_FIXED semantics replace, not error.
+        self.unmap_range(VirtAddr(start), aligned);
+        let area = VmArea::new(VirtAddr(start), VirtAddr(end), perm);
+        if self.push_user_area(area, init).is_err() {
+            return VirtAddr(usize::MAX);
+        }
+        // Keep mmap_top above any fixed mapping so later anonymous mmaps
+        // don't collide with a region the loader still expects to own.
+        if end > self.mmap_top.0 {
+            self.mmap_top = VirtAddr(end);
+        }
+        VirtAddr(va)
+    }
 }
