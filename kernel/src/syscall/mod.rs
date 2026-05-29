@@ -3813,7 +3813,6 @@ fn sys_tkill(tid: i32, sig: i32) -> isize {
 }
 
 fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> isize {
-    // We don't model threads-per-process distinctly; tgid is the same as tid.
     use crate::signal::*;
     let signo = sig as u32;
     if sig != 0 && !is_valid_signo(signo) {
@@ -3822,7 +3821,14 @@ fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> isize {
     let Some(t) = crate::task::task_by_pid(tid) else {
         return ESRCH;
     };
-    if tgid > 0 && t.pid != tgid {
+    // tgkill(tgid, tid): deliver to thread `tid`, which must belong to
+    // thread-group `tgid`. The membership check is on the target's TGID,
+    // NOT its PID — a worker thread has pid != tgid by definition. The
+    // old `t.pid != tgid` check returned ESRCH for every real pthread,
+    // breaking glibc's pthread_cancel/pthread_kill (which use
+    // tgkill(tgid, tid, SIGCANCEL)) and hanging the whole glibc pthread
+    // test set.
+    if tgid > 0 && t.tgid.load(core::sync::atomic::Ordering::Relaxed) != tgid {
         return ESRCH;
     }
     if sig == 0 {
