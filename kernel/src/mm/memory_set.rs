@@ -4,6 +4,7 @@
 //! (`VmArea`) and their owned physical frames. Drop frees the frames.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
@@ -62,7 +63,15 @@ pub struct VmArea {
     pub perm: VmPerm,
     /// VPN -> backing frame. Empty for pages that haven't been faulted in
     /// yet (we always eager-map in M3, so this is fully populated).
-    pub frames: BTreeMap<VirtPageNum, FrameTracker>,
+    /// Arc-wrapped so a MAP_SHARED area can hand the *same* physical frame
+    /// to a forked child (refcount > 1); private areas keep refcount 1 and
+    /// behave exactly like the old owned FrameTracker.
+    pub frames: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
+    /// MAP_SHARED|MAP_ANONYMOUS region: on fork() the child maps the same
+    /// physical frames instead of private copies, so writes are mutually
+    /// visible. LTP's tst_test framework passes results parent<->child
+    /// through exactly such a region.
+    pub shared: bool,
 }
 
 impl VmArea {
@@ -72,6 +81,7 @@ impl VmArea {
             vpn_end: va_end.ceil(),
             perm,
             frames: BTreeMap::new(),
+            shared: false,
         }
     }
 
@@ -192,7 +202,7 @@ impl MemorySet {
                 }
             }
             self.page_table.map(vpn, ppn, pte_flags);
-            area.frames.insert(vpn, frame);
+            area.frames.insert(vpn, Arc::new(frame));
         }
         self.areas.push(area);
         Ok(())
@@ -223,6 +233,7 @@ impl MemorySet {
             let a_start = area.vpn_start;
             let a_end = area.vpn_end;
             let perm = area.perm;
+            let a_shared = area.shared;
             let mut frames = area.frames;
 
             // Compute overlap.
@@ -245,6 +256,7 @@ impl MemorySet {
                     vpn_start: a_start,
                     vpn_end: cut_start,
                     perm,
+                    shared: a_shared,
                     frames: head_frames,
                 });
             }
@@ -254,6 +266,7 @@ impl MemorySet {
                     vpn_start: cut_end,
                     vpn_end: a_end,
                     perm,
+                    shared: a_shared,
                     frames,
                 });
             }
@@ -283,6 +296,7 @@ impl MemorySet {
             let a_start = area.vpn_start;
             let a_end = area.vpn_end;
             let a_perm = area.perm;
+            let a_shared = area.shared;
             let mut frames = area.frames;
 
             let cut_start = core::cmp::max(a_start, start_vpn);
@@ -295,6 +309,7 @@ impl MemorySet {
                     vpn_start: a_start,
                     vpn_end: cut_start,
                     perm: a_perm,
+                    shared: a_shared,
                     frames: head_frames,
                 });
             }
@@ -308,6 +323,7 @@ impl MemorySet {
                 vpn_start: cut_start,
                 vpn_end: cut_end,
                 perm,
+                shared: a_shared,
                 frames: mid_frames,
             });
             // Tail with old perm.
@@ -316,6 +332,7 @@ impl MemorySet {
                     vpn_start: cut_end,
                     vpn_end: a_end,
                     perm: a_perm,
+                    shared: a_shared,
                     frames,
                 });
             }
@@ -339,17 +356,26 @@ impl MemorySet {
             let mut new_frames = alloc::collections::BTreeMap::new();
             let pte_flags = area.perm.to_pte();
             for (&vpn, frame) in &area.frames {
-                let new_frame = super::frame::alloc()?; // None -> ENOMEM
-                let src = frame.ppn.as_byte_slice();
-                let dst = new_frame.ppn.as_byte_slice();
-                dst.copy_from_slice(src);
-                new_ms.page_table.map(vpn, new_frame.ppn, pte_flags);
-                new_frames.insert(vpn, new_frame);
+                if area.shared {
+                    // MAP_SHARED anon: child maps the SAME physical frame
+                    // (Arc bumps the refcount); the frame is freed only when
+                    // both address spaces drop it. Writes are mutually visible.
+                    new_ms.page_table.map(vpn, frame.ppn, pte_flags);
+                    new_frames.insert(vpn, Arc::clone(frame));
+                } else {
+                    let new_frame = super::frame::alloc()?; // None -> ENOMEM
+                    let src = frame.ppn.as_byte_slice();
+                    let dst = new_frame.ppn.as_byte_slice();
+                    dst.copy_from_slice(src);
+                    new_ms.page_table.map(vpn, new_frame.ppn, pte_flags);
+                    new_frames.insert(vpn, Arc::new(new_frame));
+                }
             }
             new_ms.areas.push(VmArea {
                 vpn_start: area.vpn_start,
                 vpn_end: area.vpn_end,
                 perm: area.perm,
+                shared: area.shared,
                 frames: new_frames,
             });
         }
@@ -520,7 +546,7 @@ impl MemorySet {
                     return self.brk_cur;
                 };
                 self.page_table.map(vpn, frame.ppn, pte_flags);
-                area.frames.insert(vpn, frame);
+                area.frames.insert(vpn, Arc::new(frame));
             }
             area.vpn_end = new_top_vpn;
         } else {
@@ -543,7 +569,7 @@ impl MemorySet {
     /// musl's mallocng (and friends) require — it asserts on 16-byte
     /// alignment of every malloc result, and a page-aligned region
     /// trivially satisfies that.
-    pub fn mmap_anon(&mut self, len: usize, perm: VmPerm, init: Option<&[u8]>) -> VirtAddr {
+    pub fn mmap_anon(&mut self, len: usize, perm: VmPerm, init: Option<&[u8]>, shared: bool) -> VirtAddr {
         let aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let mut start = self.mmap_top.0;
         // Never hand back a region overlapping the program break heap.
@@ -556,7 +582,8 @@ impl MemorySet {
             start = brk_hi;
         }
         let end = start + aligned;
-        let area = VmArea::new(VirtAddr(start), VirtAddr(end), perm);
+        let mut area = VmArea::new(VirtAddr(start), VirtAddr(end), perm);
+        area.shared = shared;
         if self.push_user_area(area, init).is_err() {
             // OOM — return the conventional MAP_FAILED sentinel. The
             // mmap syscall translates this to -ENOMEM. Don't advance

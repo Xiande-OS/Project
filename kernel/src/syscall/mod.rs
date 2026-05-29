@@ -3560,6 +3560,7 @@ fn sys_clock_getres(_clk: usize, ts: usize) -> isize {
 
 fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize) -> isize {
     const MAP_ANONYMOUS: i32 = 0x20;
+    const MAP_SHARED: i32 = 0x1;
     const PROT_READ: i32 = 1;
     const PROT_WRITE: i32 = 2;
     const PROT_EXEC: i32 = 4;
@@ -3625,7 +3626,11 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
     // brk (which the user can grow/shrink at byte granularity). The
     // returned address is page-aligned, satisfying the 16-byte
     // alignment that musl's mallocng asserts on every allocation.
-    let start = ms.mmap_anon(aligned, perm, init.as_deref());
+    // MAP_SHARED|MAP_ANONYMOUS must survive fork() as genuinely shared
+    // memory (LTP's tst_test framework passes results parent<->child
+    // through such a region; without sharing every test mis-reports).
+    let shared = (flags & MAP_SHARED) != 0 && (flags & MAP_ANONYMOUS) != 0;
+    let start = ms.mmap_anon(aligned, perm, init.as_deref(), shared);
     if start.0 == usize::MAX {
         return -12; // ENOMEM (mmap_anon hit frame exhaustion)
     }
