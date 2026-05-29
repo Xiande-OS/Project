@@ -1,18 +1,41 @@
-//! virtio-blk (MMIO transport) on top of the `virtio-drivers` crate.
+//! virtio-blk on top of the `virtio-drivers` crate.
+//!
+//! Two transports are supported, selected per architecture:
+//!   * riscv64 — the virtio-mmio bank scanned at fixed addresses.
+//!   * loongarch64 — virtio-pci, discovered via ECAM enumeration
+//!     (`crate::drivers::pci`).
+//! The block logic itself is transport-agnostic; only `init()` and the
+//! `BlockDevice` enum wrapper differ.
 
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 use spin::{Mutex, Once};
 use virtio_drivers::device::blk::VirtIOBlk;
-use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
-use virtio_drivers::transport::{DeviceType, Transport};
+use virtio_drivers::transport::mmio::MmioTransport;
+#[cfg(not(target_arch = "loongarch64"))]
+use virtio_drivers::transport::mmio::VirtIOHeader;
+use virtio_drivers::transport::DeviceType;
+#[cfg(not(target_arch = "loongarch64"))]
+use virtio_drivers::transport::Transport;
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 
-use crate::mm::{alloc_frame, FrameTracker, PAGE_SIZE};
+use crate::mm::address::KERNEL_PHYS_OFFSET;
+use crate::mm::{alloc_frame, PAGE_SIZE};
 
-/// Hal impl. We don't have a real DMA pool — the kernel heap + frame
-/// allocator give us identity-mapped pages, which the device can DMA
-/// from/to since our identity map gives PA==VA.
+/// Uncached DMW1 window base on loongarch64. Device MMIO (BAR regions)
+/// must be reached through this window so accesses bypass the cache.
+#[cfg(target_arch = "loongarch64")]
+const DMW1_UNCACHED: usize = 0x8000_0000_0000_0000;
+
+/// HAL backing the `virtio-drivers` crate.
+///
+/// The frame allocator hands out real physical frames; the kernel reaches
+/// them (and the heap) through the direct-map window described by
+/// `KERNEL_PHYS_OFFSET` (0 on riscv64 — identity-mapped; the cached DMW0
+/// window on loongarch64). Devices always see physical addresses, so the
+/// VA<->PA conversions below add/strip that offset. Because the offset is
+/// 0 on riscv64 these are exact no-ops there, leaving the RV path
+/// byte-for-byte unchanged.
 pub struct KernelHal;
 
 unsafe impl Hal for KernelHal {
@@ -20,15 +43,10 @@ unsafe impl Hal for KernelHal {
         pages: usize,
         _direction: BufferDirection,
     ) -> (PhysAddr, NonNull<u8>) {
-        // Allocate consecutive frames. The frame allocator's buddy
-        // gives 2^k-aligned runs.
-        let order = pages.next_power_of_two().trailing_zeros() as usize;
-        let _ = order;
-
-        // Use a Vec of FrameTrackers — for our small needs (rings),
-        // one or two pages are sufficient. Persist trackers in a Once.
-        // For simplicity here, just leak frames (the device lives for
-        // the whole kernel lifetime).
+        // Allocate `pages` contiguous frames. The buddy allocator returns
+        // 2^k-aligned runs; for our small ring needs the frames come back
+        // contiguous. Leak them — the device lives for the whole kernel
+        // lifetime.
         let mut first_pa = 0usize;
         for i in 0..pages {
             let frame = alloc_frame().expect("dma_alloc OOM");
@@ -40,7 +58,9 @@ unsafe impl Hal for KernelHal {
             }
             core::mem::forget(frame); // intentional leak; persistent ring buffer
         }
-        let va = first_pa; // identity-mapped
+        // Device sees the physical address; the kernel writes descriptors
+        // through the direct-map window.
+        let va = first_pa + KERNEL_PHYS_OFFSET;
         (first_pa, NonNull::new(va as *mut u8).unwrap())
     }
 
@@ -50,32 +70,83 @@ unsafe impl Hal for KernelHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
-        NonNull::new(paddr as *mut u8).unwrap()
+        // BAR regions read from PCI config space. riscv64 is identity
+        // mapped; loongarch64 must use the uncached DMW1 window.
+        #[cfg(target_arch = "loongarch64")]
+        {
+            return NonNull::new((paddr | DMW1_UNCACHED) as *mut u8).unwrap();
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            NonNull::new(paddr as *mut u8).unwrap()
+        }
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {
-        buffer.as_ptr() as *mut u8 as usize
+        // `buffer` is a kernel pointer (heap or direct-map). Convert back
+        // to the physical address the device needs. On riscv64 the offset
+        // is 0, so this is the identity the old code used.
+        (buffer.as_ptr() as *mut u8 as usize) - KERNEL_PHYS_OFFSET
     }
 
     unsafe fn unshare(_paddr: PhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {}
 }
 
+/// Transport-erased virtio-blk handle. The PCI variant only exists on
+/// loongarch64; riscv64 always uses the MMIO variant.
+enum BlkInner {
+    Mmio(VirtIOBlk<KernelHal, MmioTransport>),
+    #[cfg(target_arch = "loongarch64")]
+    Pci(VirtIOBlk<KernelHal, virtio_drivers::transport::pci::PciTransport>),
+}
+
+impl BlkInner {
+    fn capacity(&mut self) -> u64 {
+        match self {
+            BlkInner::Mmio(b) => b.capacity(),
+            #[cfg(target_arch = "loongarch64")]
+            BlkInner::Pci(b) => b.capacity(),
+        }
+    }
+    fn read_blocks(&mut self, sector: usize, buf: &mut [u8]) -> Result<(), ()> {
+        match self {
+            BlkInner::Mmio(b) => b.read_blocks(sector, buf).map_err(|_| ()),
+            #[cfg(target_arch = "loongarch64")]
+            BlkInner::Pci(b) => b.read_blocks(sector, buf).map_err(|_| ()),
+        }
+    }
+    fn write_blocks(&mut self, sector: usize, buf: &[u8]) -> Result<(), ()> {
+        match self {
+            BlkInner::Mmio(b) => b.write_blocks(sector, buf).map_err(|_| ()),
+            #[cfg(target_arch = "loongarch64")]
+            BlkInner::Pci(b) => b.write_blocks(sector, buf).map_err(|_| ()),
+        }
+    }
+}
+
 pub struct BlockDevice {
-    inner: Mutex<VirtIOBlk<KernelHal, MmioTransport>>,
+    inner: Mutex<BlkInner>,
 }
 
 static BLK: Once<Arc<BlockDevice>> = Once::new();
 
-/// QEMU virt's virtio-mmio bank lives at 0x1000_1000 .. 0x1000_9000 with
-/// 0x1000-spaced slots. We scan them and grab the first block device.
-#[allow(unreachable_code)]
+/// Probe for a virtio-blk device and register it. On riscv64 this scans
+/// the virtio-mmio bank; on loongarch64 it enumerates PCI.
 pub fn init() -> Option<Arc<BlockDevice>> {
-    // The loongarch64 `virt` machine exposes virtio over PCI, not the
-    // RISC-V virtio-mmio bank scanned below; these fixed MMIO addresses
-    // fault on LA. PCI enumeration is a separate bring-up step.
     #[cfg(target_arch = "loongarch64")]
-    return None;
+    {
+        return init_pci();
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        init_mmio()
+    }
+}
 
+/// riscv64 virtio-mmio bank scan. QEMU virt's bank lives at
+/// 0x1000_1000 .. 0x1000_9000 with 0x1000-spaced slots.
+#[cfg(not(target_arch = "loongarch64"))]
+fn init_mmio() -> Option<Arc<BlockDevice>> {
     const BASES: &[usize] = &[
         0x1000_1000,
         0x1000_2000,
@@ -110,10 +181,48 @@ pub fn init() -> Option<Arc<BlockDevice>> {
             }
         };
         let dev = Arc::new(BlockDevice {
-            inner: Mutex::new(blk),
+            inner: Mutex::new(BlkInner::Mmio(blk)),
         });
         BLK.call_once(|| dev.clone());
         crate::println!("[virtio-blk] online at {:#x}, capacity={} sectors", base, dev.capacity());
+        return Some(dev);
+    }
+    None
+}
+
+/// loongarch64 virtio-pci path: enumerate the ECAM, find the first block
+/// device, build a `PciTransport`, and wrap it.
+#[cfg(target_arch = "loongarch64")]
+fn init_pci() -> Option<Arc<BlockDevice>> {
+    use virtio_drivers::transport::pci::PciTransport;
+
+    let (mut root, devices) = crate::drivers::pci::enumerate()?;
+    for d in devices {
+        if d.dev_type != DeviceType::Block {
+            continue;
+        }
+        let transport = match PciTransport::new::<KernelHal>(&mut root, d.func) {
+            Ok(t) => t,
+            Err(e) => {
+                crate::println!("[virtio-blk] PciTransport {} failed: {:?}", d.func, e);
+                continue;
+            }
+        };
+        let blk = match VirtIOBlk::<KernelHal, _>::new(transport) {
+            Ok(b) => b,
+            Err(e) => {
+                crate::println!("[virtio-blk] init failed on {}: {:?}", d.func, e);
+                continue;
+            }
+        };
+        let dev = Arc::new(BlockDevice {
+            inner: Mutex::new(BlkInner::Pci(blk)),
+        });
+        BLK.call_once(|| dev.clone());
+        crate::println!(
+            "[virtio-blk] online on PCI {}, capacity={} sectors",
+            d.func, dev.capacity()
+        );
         return Some(dev);
     }
     None
@@ -123,6 +232,7 @@ pub fn get() -> Option<Arc<BlockDevice>> {
     BLK.get().cloned()
 }
 
+#[cfg(not(target_arch = "loongarch64"))]
 fn probe_device_id(base: usize) -> u32 {
     let magic = unsafe { core::ptr::read_volatile(base as *const u32) };
     if magic != 0x7472_6976 {
@@ -137,12 +247,10 @@ impl BlockDevice {
     }
 
     pub fn read_block(&self, sector: usize, buf: &mut [u8]) -> Result<(), ()> {
-        let mut blk = self.inner.lock();
-        blk.read_blocks(sector, buf).map_err(|_| ())
+        self.inner.lock().read_blocks(sector, buf)
     }
 
     pub fn write_block(&self, sector: usize, buf: &[u8]) -> Result<(), ()> {
-        let mut blk = self.inner.lock();
-        blk.write_blocks(sector, buf).map_err(|_| ())
+        self.inner.lock().write_blocks(sector, buf)
     }
 }
