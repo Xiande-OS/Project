@@ -148,12 +148,17 @@ pub fn do_futex(
     let task = current_task();
 
     match cmd {
-        FUTEX_WAIT => futex_wait(&task, uaddr, val, val2_or_timeout, u32::MAX),
+        // FUTEX_WAIT: timeout is RELATIVE.
+        FUTEX_WAIT => futex_wait(&task, uaddr, val, val2_or_timeout, u32::MAX, false),
+        // FUTEX_WAIT_BITSET: timeout is ABSOLUTE (in the clock selected by
+        // FUTEX_CLOCK_REALTIME; our CLOCK_REALTIME and CLOCK_MONOTONIC are
+        // both the boot-relative mtime, so either way the deadline is an
+        // absolute mtime value). glibc's pthread_cond_timedwait uses this.
         FUTEX_WAIT_BITSET => {
             if val3 == 0 {
                 return EINVAL;
             }
-            futex_wait(&task, uaddr, val, val2_or_timeout, val3)
+            futex_wait(&task, uaddr, val, val2_or_timeout, val3, true)
         }
         FUTEX_WAKE => futex_wake(&task, uaddr, val as i32, u32::MAX),
         FUTEX_WAKE_BITSET => {
@@ -182,7 +187,7 @@ pub fn do_futex(
 ///     re-runs on wake. The trampoline at the bottom (`finish_wait`) on the
 ///     resumption path inspects WAIT_RESULT and returns 0 / -EINTR /
 ///     -ETIMEDOUT accordingly.
-fn futex_wait(task: &Arc<Task>, uaddr: usize, val: u32, timeout_ptr: usize, bitset: u32) -> isize {
+fn futex_wait(task: &Arc<Task>, uaddr: usize, val: u32, timeout_ptr: usize, bitset: u32, absolute: bool) -> isize {
     // First check if we're resuming after a wake: WAIT_RESULT non-zero means
     // we already blocked once and are re-running this syscall.
     let prior = take_wait_result(task.pid);
@@ -210,17 +215,29 @@ fn futex_wait(task: &Arc<Task>, uaddr: usize, val: u32, timeout_ptr: usize, bits
         return EAGAIN;
     }
 
-    // Compute deadline (best-effort). FUTEX_WAIT uses *relative* timeout;
-    // BITSET variants use absolute. We treat them all as relative for the
-    // common pthread_mutex_timedlock path which is the only musl caller of
-    // bitset that cares.
+    // Compute the absolute deadline in mtime ticks. FUTEX_WAIT passes a
+    // *relative* timeout (deadline = now + ticks); FUTEX_WAIT_BITSET passes
+    // an *absolute* deadline already in our (boot-relative mtime) timebase,
+    // so the timespec converts straight to the deadline. Treating the
+    // absolute BITSET deadline as relative made `now + (now+10ms)` ≈ 2·now,
+    // so glibc's pthread_cond_timedwait(10ms) only "timed out" after another
+    // `now` worth of uptime — fine early in a run, but past the per-test
+    // watchdog once uptime grew (the flaky pthread_condattr_setclock hang).
+    let now = riscv::register::time::read64();
     let deadline_ticks = if let Some((s, ns)) = parse_timespec(task, timeout_ptr) {
         let ticks = ts_to_ticks(s, ns);
-        if ticks == 0 {
-            // 0 timespec → immediate timeout.
-            return ETIMEDOUT;
+        if absolute {
+            // Absolute deadline already passed → immediate timeout.
+            if ticks <= now {
+                return ETIMEDOUT;
+            }
+            ticks
+        } else {
+            if ticks == 0 {
+                return ETIMEDOUT; // 0 relative timespec → immediate timeout
+            }
+            now.saturating_add(ticks)
         }
-        riscv::register::time::read64().saturating_add(ticks)
     } else {
         0
     };
