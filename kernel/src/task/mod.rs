@@ -264,6 +264,7 @@ pub fn reap(pid: i32) {
     TABLE.lock().tasks.remove(&pid);
     crate::sync::futex::forget_task(pid);
     forget_itimer(pid);
+    crate::syscall::forget_creds(pid);
 }
 
 pub fn set_current_pid(pid: i32) {

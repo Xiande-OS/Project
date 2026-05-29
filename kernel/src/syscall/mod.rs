@@ -111,7 +111,13 @@ pub fn dispatch(tf: &mut TrapFrame) {
             crate::signal::do_sigreturn(&task, tf)
         }
         nr::SYS_IOCTL => sys_ioctl(a0 as i32, a1 as u32, a2),
-        nr::SYS_GETUID | nr::SYS_GETEUID | nr::SYS_GETGID | nr::SYS_GETEGID => 0,
+        nr::SYS_GETUID => creds_of(cur_tgid())[0] as isize,
+        nr::SYS_GETEUID => creds_of(cur_tgid())[1] as isize,
+        nr::SYS_GETGID => creds_of(cur_tgid())[2] as isize,
+        nr::SYS_GETEGID => creds_of(cur_tgid())[3] as isize,
+        // set*id family (setuid/setgid/setreuid/setregid/setresuid/setresgid):
+        // track per-tgid creds and succeed. Were ENOSYS -> LTP setup TBROK.
+        143 | 144 | 145 | 146 | 147 | 149 => sys_set_id(id, a0, a1, a2),
         // klogctl(2): stub so busybox dmesg / klogd don't error with ENOSYS.
         // Returns 0 for all actions — including SYSLOG_ACTION_READ_ALL (type 3),
         // which dmesg uses by default — meaning "empty kernel ring buffer".
@@ -1894,6 +1900,47 @@ fn rlimit_for(pid: i32, resource: u32) -> Rlimit {
         return Rlimit { cur: c, max: m };
     }
     default_rlimit(resource)
+}
+
+/// Per-(thread-group) credentials: [uid, euid, gid, egid], default all-root.
+/// LTP setup very commonly drops privilege (setuid/setgid/seteuid/setegid);
+/// when those returned ENOSYS the tests TBROK'd in setup ("setuid() failed:
+/// ENOSYS") before exercising anything. Track them per tgid so getuid/
+/// geteuid/... reflect a prior set, and always succeed.
+static CREDS: spin::Mutex<alloc::collections::BTreeMap<i32, [u32; 4]>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+fn cur_tgid() -> i32 {
+    current_task().tgid.load(core::sync::atomic::Ordering::Relaxed)
+}
+fn creds_of(tgid: i32) -> [u32; 4] {
+    CREDS.lock().get(&tgid).copied().unwrap_or([0, 0, 0, 0])
+}
+pub fn forget_creds(pid: i32) {
+    CREDS.lock().remove(&pid);
+}
+
+/// setuid(146)/setgid(144)/setreuid(145)/setregid(143)/setresuid(147)/
+/// setresgid(149). glibc's seteuid/setegid route through setresuid/setresgid.
+fn sys_set_id(nr: usize, a0: usize, a1: usize, _a2: usize) -> isize {
+    let tgid = cur_tgid();
+    let mut g = CREDS.lock();
+    let c = g.entry(tgid).or_insert([0, 0, 0, 0]);
+    let set = |slot: &mut u32, v: usize| {
+        if v as u32 != u32::MAX {
+            *slot = v as u32;
+        }
+    };
+    match nr {
+        146 => { c[0] = a0 as u32; c[1] = a0 as u32; } // setuid  -> real+eff uid
+        144 => { c[2] = a0 as u32; c[3] = a0 as u32; } // setgid  -> real+eff gid
+        145 => { set(&mut c[0], a0); set(&mut c[1], a1); } // setreuid
+        143 => { set(&mut c[2], a0); set(&mut c[3], a1); } // setregid
+        147 => { set(&mut c[0], a0); set(&mut c[1], a1); } // setresuid (saved ignored)
+        149 => { set(&mut c[2], a0); set(&mut c[3], a1); } // setresgid
+        _ => {}
+    }
+    0
 }
 
 fn sys_prlimit64(pid: i32, resource: u32, new_lim: usize, old_lim: usize) -> isize {
