@@ -322,7 +322,7 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 // cgroup_* tests) cost 30s instead of eating the whole budget,
                 // which is what lets the run reach hundreds of later cases.
                 s.push_str(&alloc::format!(
-                    "./busybox sed 's@^\\( *\\)\"$file\"\\( *\\)$@\\1./busybox timeout -s KILL 30 \"$file\"@' ./{s} > /tmp/ltp_to.sh 2>/dev/null\n",
+                    "./busybox sed 's@^\\( *\\)\"$file\"\\( *\\)$@\\1./busybox timeout -s KILL 10 \"$file\"@' ./{s} > /tmp/ltp_to.sh 2>/dev/null\n",
                     s = script
                 ));
                 s.push_str(&alloc::format!(
