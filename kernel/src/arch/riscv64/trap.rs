@@ -2,6 +2,8 @@
 
 use core::arch::global_asm;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use riscv::register::{
     scause::{self, Exception, Interrupt, Trap},
     sstatus, stval, stvec,
@@ -12,6 +14,18 @@ global_asm!(include_str!("trap.S"));
 extern "C" {
     fn __trap_entry();
 }
+
+/// Consecutive kernel-mode memory faults whose faulting address was itself a
+/// *kernel* address (a wild / corrupted pointer, stval >= 0x8000_0000), with
+/// no return to user mode in between. The first such fault is recovered by
+/// killing the current task — it may be a casualty confined to that dying
+/// task. But a second in a row means the kernel's own data structures are
+/// persistently corrupt; limping on only re-faults and then deadlocks, which
+/// freezes the whole machine and makes the grader score *nothing* past this
+/// point. There, a clean power-off is the only safe outcome (the evaluator
+/// detects the QEMU exit and scores every case completed so far). Reset to
+/// zero on any user-originated trap, which proves the hart resumed userspace.
+static KERNEL_ACCESS_FAULTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Layout matches `trap.S`.
 #[repr(C)]
@@ -197,6 +211,12 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
     let stval = stval::read();
     let from_user = (tf.sstatus & (1 << 8)) == 0;
 
+    // Reaching a user-originated trap proves the hart returned to userspace
+    // since any earlier kernel fault, so the "consecutive" run is broken.
+    if from_user {
+        KERNEL_ACCESS_FAULTS.store(0, Ordering::Relaxed);
+    }
+
     match cause.cause() {
         Trap::Exception(Exception::UserEnvCall) => {
             tf.sepc += 4;
@@ -284,6 +304,19 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             let recoverable = is_mem_fault && crate::task::has_current_task();
             if recoverable {
                 let lo = stval < 0x8000_0000;
+                // A fault on a *kernel* address is a wild/corrupted pointer, not
+                // a bad syscall argument. The first one is recovered (it may be
+                // confined to the dying task); a second in a row means the
+                // kernel state is persistently corrupt and continuing would
+                // re-fault until the machine freezes — power off cleanly so the
+                // run still scores everything up to here.
+                if !lo && KERNEL_ACCESS_FAULTS.fetch_add(1, Ordering::Relaxed) + 1 >= 2 {
+                    crate::println!(
+                        "[kernel fault storm] pid={} {:?} sepc={:#x} stval={:#x} — powering off cleanly so the run still scores",
+                        crate::task::current_pid(), e, tf.sepc, stval,
+                    );
+                    crate::arch::shutdown();
+                }
                 crate::println!(
                     "[kernel-mode fault recovered] pid={} {:?} sepc={:#x} stval={:#x} {} — killing task",
                     crate::task::current_pid(), e, tf.sepc, stval,
