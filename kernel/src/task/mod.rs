@@ -403,6 +403,48 @@ pub fn reap_orphan_zombies(except: i32) {
     }
 }
 
+/// Last-resort livelock breaker: terminate ONE task that is blocked
+/// (Waiting) with no living parent and which is NOT the caller. Used only by
+/// the scheduler's wedged spin-loop after it has spun a long time making no
+/// progress. A parentless Waiting task left by a SIGKILLed fork-storm can
+/// never be woken (no init to reap it, its waiter is gone), so it pins
+/// frames/kstack and keeps any_waiting() true forever. Killing it (SIGKILL
+/// semantics → Zombie, frees user frames) lets the genuinely-blocked waiter
+/// that depends on the freed memory proceed. Returns true if it terminated
+/// something. Deliberately conservative: only Waiting (parked, not doing
+/// work) tasks with a dead parent — never Ready/Running ones.
+pub fn kill_one_stuck_orphan(except: i32) -> bool {
+    let (cand, live): (Vec<(i32, i32)>, alloc::collections::BTreeSet<i32>) = {
+        let t = TABLE.lock();
+        let live = t.tasks.keys().copied().collect();
+        let cand = t
+            .tasks
+            .values()
+            .map(|task| (task.pid, task.ppid.load(Ordering::Relaxed)))
+            .collect();
+        (cand, live)
+    };
+    for (pid, ppid) in cand {
+        if pid == except || pid == 1 {
+            continue;
+        }
+        // Parent must be gone (true orphan); pid 1 (init) is never "gone".
+        if ppid == 1 || live.contains(&ppid) {
+            continue;
+        }
+        if let Some(task) = task_by_pid(pid) {
+            let waiting = *task.state.lock() == TaskState::Waiting;
+            if waiting {
+                crate::signal::kill_now(&task);
+                drop(task);
+                reap(pid);
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn set_current_pid(pid: i32) {
     CURRENT_PID.store(pid, Ordering::Relaxed);
 }
@@ -1278,6 +1320,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         //   - or there is provably nobody who could ever wake us, in
         //     which case panic with a state dump so the failure is
         //     visible instead of a silent hang.
+        let mut spins: u64 = 0;
         loop {
             {
         let now = crate::arch::now_ticks();
@@ -1288,6 +1331,32 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             if any_runnable_except(cur_pid) { break; }
             if let Some(t) = task_by_pid(cur_pid) {
                 if *t.state.lock() == TaskState::Ready { break; }
+            }
+            // Periodic orphan drain. A SIGKILLed fork-storm (fork_exec_loop,
+            // fork07, the cgroup cases) leaves orphans behind: zombies whose
+            // parent is gone, and — the case that wedges us here — tasks
+            // blocked in wait4() on children that will never be reaped. With
+            // no real init nobody collects them, so any_waiting() stays true
+            // and this loop spins forever. Reap zombie orphans (always safe),
+            // then, only once we've spun a while with no progress, terminate a
+            // *Waiting* orphan whose parent is dead. We never touch a Ready/
+            // Running orphan (it is doing real work — killing those is what
+            // broke the busybox group in an earlier attempt); a Waiting task
+            // is parked and, being parentless, unwakeable, so ending it frees
+            // its frames/kstack and lets the wedged waiter make progress.
+            spins = spins.wrapping_add(1);
+            if spins % 2048 == 0 {
+                reap_orphan_zombies(cur_pid);
+                if any_runnable_except(cur_pid) { break; }
+                if spins >= 16384 {
+                    if kill_one_stuck_orphan(cur_pid) {
+                        // Made progress (freed/woke something) — re-evaluate.
+                        if let Some(t) = task_by_pid(cur_pid) {
+                            if *t.state.lock() == TaskState::Ready { break; }
+                        }
+                        if any_runnable_except(cur_pid) { break; }
+                    }
+                }
             }
             // No-progress check: are there any other live tasks at
             // all, and do any of them have a deadline that could
