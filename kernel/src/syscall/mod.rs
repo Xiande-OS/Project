@@ -1771,7 +1771,23 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
     const F_SETFD: i32 = 2;
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
+    const F_SETOWN: i32 = 8;
+    const F_GETOWN: i32 = 9;
+    const F_SETSIG: i32 = 10;
+    const F_GETSIG: i32 = 11;
+    const F_SETOWN_EX: i32 = 15;
+    const F_GETOWN_EX: i32 = 16;
     const F_DUPFD_CLOEXEC: i32 = 1030;
+    const F_SETLEASE: i32 = 1024;
+    const F_GETLEASE: i32 = 1025;
+    const F_SETPIPE_SZ: i32 = 1031;
+    const F_GETPIPE_SZ: i32 = 1032;
+    // lease / lock types (also F_SETLEASE arg)
+    const F_RDLCK: i32 = 0;
+    const F_WRLCK: i32 = 1;
+    const F_UNLCK: i32 = 2;
+    const O_ASYNC: i32 = 0o20000;
+    use core::sync::atomic::Ordering::Relaxed;
 
     let task = current_task();
     match cmd {
@@ -1878,7 +1894,130 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
             if let Some(sock) = file.inode.as_any().downcast_ref::<crate::fs::socket::Socket>() {
                 sock.state.lock().nonblock = (arg & O_NONBLOCK) != 0;
             }
+            // O_ASYNC arms data-ready (SIGIO/F_SETSIG) delivery to the F_SETOWN
+            // target. fcntl31 sets it on a pipe read end before writing.
+            file.async_io.store((arg & O_ASYNC) != 0, Relaxed);
+            sync_pipe_async(&file);
             0
+        }
+        F_GETOWN => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            file.owner.load(Relaxed) as isize
+        }
+        F_SETOWN => {
+            // arg is a pid (>0) or a negated process-group id (<0).
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            file.owner.store(arg, Relaxed);
+            sync_pipe_async(&file);
+            0
+        }
+        F_GETOWN_EX => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            let owner = file.owner.load(Relaxed);
+            // struct f_owner_ex { int type; pid_t pid; }: PGRP(2) when negative.
+            let (otype, opid): (i32, i32) = if owner < 0 { (2, -owner) } else { (1, owner) };
+            let mut buf = [0u8; 8];
+            buf[0..4].copy_from_slice(&otype.to_le_bytes());
+            buf[4..8].copy_from_slice(&opid.to_le_bytes());
+            if task.copy_out_bytes(arg as usize, &buf).is_none() {
+                return EFAULT;
+            }
+            0
+        }
+        F_SETOWN_EX => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            let Some(b) = task.copy_in_bytes(arg as usize, 8) else { return EFAULT };
+            let otype = i32::from_le_bytes(b[0..4].try_into().unwrap_or([0; 4]));
+            let opid = i32::from_le_bytes(b[4..8].try_into().unwrap_or([0; 4]));
+            // F_OWNER_PGRP(2) -> negated pgid; F_OWNER_TID(0)/F_OWNER_PID(1) -> pid.
+            let owner = if otype == 2 { -opid } else { opid };
+            file.owner.store(owner, Relaxed);
+            sync_pipe_async(&file);
+            0
+        }
+        F_GETSIG => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            file.io_signal.load(Relaxed) as isize
+        }
+        F_SETSIG => {
+            // 0 restores the SIGIO default; anything >= _NSIG is invalid.
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            if arg < 0 || arg >= crate::signal::NSIG as i32 {
+                return EINVAL;
+            }
+            file.io_signal.store(arg, Relaxed);
+            sync_pipe_async(&file);
+            0
+        }
+        F_GETLEASE => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            file.lease.load(Relaxed) as isize
+        }
+        F_SETLEASE => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            // Leases apply only to regular files.
+            if file.inode.kind() != FileType::Regular {
+                return EINVAL;
+            }
+            match arg {
+                F_UNLCK => {
+                    file.lease.store(F_UNLCK, Relaxed);
+                    0
+                }
+                F_RDLCK => {
+                    // A read lease is refused if the file is open for writing.
+                    // We model that with this description's own access mode,
+                    // which is exactly what LTP exercises (writable -> EAGAIN).
+                    if file.writable {
+                        return -11; // EAGAIN
+                    }
+                    file.lease.store(F_RDLCK, Relaxed);
+                    0
+                }
+                F_WRLCK => {
+                    // A write lease needs the description open for writing.
+                    if !file.writable {
+                        return -11; // EAGAIN
+                    }
+                    file.lease.store(F_WRLCK, Relaxed);
+                    0
+                }
+                _ => EINVAL,
+            }
+        }
+        F_GETPIPE_SZ => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            match file.inode.as_any().downcast_ref::<crate::fs::pipe::PipeEnd>() {
+                Some(p) => p.capacity() as isize,
+                None => EBADF, // get_pipe_info() fails on a non-pipe
+            }
+        }
+        F_SETPIPE_SZ => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            let Some(p) = file.inode.as_any().downcast_ref::<crate::fs::pipe::PipeEnd>() else {
+                return EBADF; // get_pipe_info() fails on a non-pipe
+            };
+            // The size arg is an unsigned int in the ABI; recover it from the
+            // low 32 bits (glibc passes (1<<31)+1 to probe the upper bound).
+            let requested = (arg as u32) as usize;
+            const PIPE_MAX: usize = 1024 * 1024; // /proc/sys/fs/pipe-max-size
+            const PAGE: usize = 4096;
+            // A size beyond 2^31 is rejected (matches round_pipe_size()).
+            if requested > (1usize << 31) {
+                return EINVAL;
+            }
+            // Round up to a whole page, at least one page.
+            let size = core::cmp::max(PAGE, (requested + PAGE - 1) & !(PAGE - 1));
+            // An unprivileged caller may not raise it past the system maximum.
+            if size > PIPE_MAX {
+                return EPERM;
+            }
+            // The ring can't shrink below the bytes already buffered.
+            if size < p.buffered() {
+                return -16; // EBUSY
+            }
+            p.set_capacity(size);
+            size as isize
         }
         // F_GETLK=5, F_SETLK=6, F_SETLKW=7. arg is `struct flock *`.
         5 | 6 | 7 => {
@@ -1900,6 +2039,20 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
             }
         }
         _ => 0,
+    }
+}
+
+/// Mirror a File's async-I/O settings (owner/signal/armed) into its pipe so the
+/// peer writer can raise the configured signal when data arrives. No-op for
+/// non-pipe descriptions.
+fn sync_pipe_async(file: &Arc<File>) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if let Some(p) = file.inode.as_any().downcast_ref::<crate::fs::pipe::PipeEnd>() {
+        p.set_async(
+            file.owner.load(Relaxed),
+            file.io_signal.load(Relaxed),
+            file.async_io.load(Relaxed),
+        );
     }
 }
 

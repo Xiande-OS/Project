@@ -200,6 +200,16 @@ pub struct File {
     pub append: bool,
     /// For stdio fds 0/1/2 backed by the SBI console.
     pub is_console: bool,
+    /// fcntl(F_SETSIG): signal delivered for async I/O. 0 means the default
+    /// (SIGIO). fcntl31 sets this to SIGUSR1 and reads it back.
+    pub io_signal: core::sync::atomic::AtomicI32,
+    /// fcntl(F_SETOWN): the recipient of I/O-ready signals — a pid when >0, a
+    /// negated process-group id when <0, 0 for "no owner".
+    pub owner: core::sync::atomic::AtomicI32,
+    /// fcntl(F_SETFL, O_ASYNC): generate I/O-ready signals on this description.
+    pub async_io: core::sync::atomic::AtomicBool,
+    /// fcntl(F_SETLEASE): current lease (F_RDLCK=0, F_WRLCK=1, F_UNLCK=2).
+    pub lease: core::sync::atomic::AtomicI32,
 }
 
 impl File {
@@ -211,6 +221,10 @@ impl File {
             writable,
             append,
             is_console: false,
+            io_signal: core::sync::atomic::AtomicI32::new(0),
+            owner: core::sync::atomic::AtomicI32::new(0),
+            async_io: core::sync::atomic::AtomicBool::new(false),
+            lease: core::sync::atomic::AtomicI32::new(2),
         }
     }
 
@@ -222,6 +236,10 @@ impl File {
             writable: true,
             append: false,
             is_console: true,
+            io_signal: core::sync::atomic::AtomicI32::new(0),
+            owner: core::sync::atomic::AtomicI32::new(0),
+            async_io: core::sync::atomic::AtomicBool::new(false),
+            lease: core::sync::atomic::AtomicI32::new(2),
         }
     }
 
