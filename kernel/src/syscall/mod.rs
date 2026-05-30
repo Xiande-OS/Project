@@ -682,6 +682,59 @@ fn resolve_at_with_err(dfd: i32, path: &str) -> core::result::Result<Arc<dyn Ino
     fs::lookup_path(start, path)
 }
 
+/// Enforce search (execute, 0o1) permission on every directory component
+/// leading to `path`'s final element — POSIX path resolution requires X on
+/// each traversed directory. Done in the syscall layer (which has the creds)
+/// rather than in lookup_path_inner, so the VFS hot path is untouched. Root
+/// (euid 0) bypasses. Returns Ok(()) if all ancestors are searchable, or
+/// Err(EACCES) at the first that isn't. Cheap: only walks when euid != 0.
+/// access01/mkdir09 et al. create a no-X dir, drop to nobody, and require
+/// EACCES reaching anything inside it.
+fn check_search_perm(dfd: i32, path: &str) -> core::result::Result<(), isize> {
+    // Fast path: root searches everything.
+    if creds_of(cur_tgid())[1] == 0 {
+        return Ok(());
+    }
+    let task = current_task();
+    // Starting directory for resolution.
+    let mut dir = if dfd == AT_FDCWD || path.starts_with('/') {
+        let cwd = task.cwd.lock().clone();
+        match fs::lookup_path(fs::root(), &cwd) {
+            Ok(d) => d,
+            Err(_) => return Ok(()), // can't resolve base — let the real op fault
+        }
+    } else {
+        match task.fd_table.lock().get(dfd) {
+            Some(f) => f.inode.clone(),
+            None => return Ok(()),
+        }
+    };
+    // Walk every component EXCEPT the last (the target itself isn't traversed).
+    let comps: alloc::vec::Vec<&str> =
+        path.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+    if comps.len() < 2 {
+        return Ok(()); // no intermediate directory to traverse
+    }
+    for comp in &comps[..comps.len() - 1] {
+        if *comp == ".." {
+            continue;
+        }
+        // Must be able to search the current directory to descend into it.
+        if dir.kind() == FileType::Directory && !may_access(&dir, 0o1) {
+            return Err(-13); // EACCES
+        }
+        match dir.lookup(comp) {
+            Ok(next) => dir = next,
+            Err(_) => return Ok(()), // missing component — real op reports ENOENT
+        }
+    }
+    // Finally, the immediate parent directory must be searchable too.
+    if dir.kind() == FileType::Directory && !may_access(&dir, 0o1) {
+        return Err(-13); // EACCES
+    }
+    Ok(())
+}
+
 fn resolve_at_parent(dfd: i32, path: &str) -> Option<(Arc<dyn Inode>, String)> {
     let task = current_task();
     let start = if dfd == AT_FDCWD || path.starts_with('/') {
@@ -848,7 +901,7 @@ fn sys_pipe2(pipefd_ptr: usize, flags: i32) -> isize {
     0
 }
 
-fn sys_mkdirat(dfd: i32, path: usize, _mode: u32) -> isize {
+fn sys_mkdirat(dfd: i32, path: usize, mode: u32) -> isize {
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
@@ -860,7 +913,17 @@ fn sys_mkdirat(dfd: i32, path: usize, _mode: u32) -> isize {
         return -13; // EACCES
     }
     match parent.create(&name, FileType::Directory) {
-        Ok(_) => 0,
+        Ok(inode) => {
+            // Apply the requested mode (minus the standard 0o022 umask — we
+            // don't track per-process umask; SYS_UMASK is a 0o022 stub and
+            // the tests that care set umask(022) anyway). tmpfs create()
+            // defaults to 0o755, so without this a mkdir(path, 0444) stays
+            // searchable and permission tests that create a no-X directory
+            // (access01, mkdir09) never see the EACCES they expect.
+            let m = mode & !0o022 & 0o7777;
+            apply_mode(&inode, m);
+            0
+        }
         Err(e) => err_to_isize(e),
     }
 }
@@ -2898,6 +2961,11 @@ fn sys_faccessat(dfd: i32, path: usize, mode: i32) -> isize {
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
+    // A non-searchable directory in the path => EACCES (access01 drops to
+    // nobody and probes files inside a 0444 — no-X — directory).
+    if let Err(e) = check_search_perm(dfd, &path_str) {
+        return e;
+    }
     let Some(inode) = resolve_at(dfd, &path_str) else {
         return ENOENT;
     };
