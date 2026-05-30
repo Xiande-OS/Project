@@ -525,6 +525,12 @@ pub fn split_parent(cwd: Arc<dyn Inode>, path: &str) -> Result<(Arc<dyn Inode>, 
         Some(i) => (&path[..i], &path[i + 1..]),
         None => ("", path),
     };
+    // The final component is still subject to NAME_MAX (255). creat06/link04/
+    // mkdir all build an over-long final name and require ENAMETOOLONG rather
+    // than silently creating it.
+    if name.len() > 255 {
+        return Err(ENAMETOOLONG);
+    }
     let parent = if parent_path.is_empty() {
         cwd
     } else {

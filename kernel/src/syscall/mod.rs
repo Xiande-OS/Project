@@ -82,7 +82,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_FCHMOD => sys_fchmod(a0 as i32, a1 as u32),
         nr::SYS_FCHMODAT => sys_fchmodat(a0 as i32, a1, a2 as u32),
         nr::SYS_FCHOWN => sys_fchown(a0 as i32, a1 as u32, a2 as u32),
-        nr::SYS_FCHOWNAT => sys_fchownat(a0 as i32, a1, a2 as u32, a3 as u32),
+        nr::SYS_FCHOWNAT => sys_fchownat(a0 as i32, a1, a2 as u32, a3 as u32, a4 as i32),
         nr::SYS_UMASK => 0o022,
         nr::SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2 as i32),
         nr::SYS_FLOCK => sys_flock(a0 as i32, a1 as i32),
@@ -737,15 +737,20 @@ fn check_search_perm(dfd: i32, path: &str) -> core::result::Result<(), isize> {
     Ok(())
 }
 
-fn resolve_at_parent(dfd: i32, path: &str) -> Option<(Arc<dyn Inode>, String)> {
+/// Resolve the parent directory + final component for an *at-relative path,
+/// preserving the precise lookup errno (ENOTDIR / ENAMETOOLONG / ELOOP /
+/// ENOENT) instead of collapsing every failure to ENOENT. The open / mkdir /
+/// unlink / link / rename / symlink families all build "<file>/sub" or
+/// over-long / looping paths whose POSIX error must survive to the caller.
+fn resolve_at_parent(dfd: i32, path: &str) -> fs::Result<(Arc<dyn Inode>, String)> {
     let task = current_task();
     let start = if dfd == AT_FDCWD || path.starts_with('/') {
         let cwd = task.cwd.lock().clone();
-        fs::lookup_path(fs::root(), &cwd).ok()?
+        fs::lookup_path(fs::root(), &cwd)?
     } else {
-        task.fd_table.lock().get(dfd)?.inode.clone()
+        task.fd_table.lock().get(dfd).ok_or(-9i32)?.inode.clone()
     };
-    fs::split_parent(start, path).ok()
+    fs::split_parent(start, path)
 }
 
 fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
@@ -791,15 +796,21 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
         };
     }
 
-    let inode = match resolve_at(dfd, &path_str) {
-        Some(i) => {
+    let inode = match resolve_at_with_err(dfd, &path_str) {
+        Ok(i) => {
             if excl && create {
                 return -17; // EEXIST
             }
-            // Permission check on an existing file: opening for read needs R,
-            // for write needs W. Root bypasses (may_access handles euid 0).
-            // Directories may always be opened O_RDONLY (for getdents).
-            if i.kind() != FileType::Directory {
+            // Opening an existing directory for writing is EISDIR (creat06
+            // creats a directory and expects EISDIR). A read-only open of a
+            // directory stays valid (getdents).
+            if i.kind() == FileType::Directory {
+                if writable {
+                    return -21; // EISDIR
+                }
+            } else {
+                // Permission check on an existing file: opening for read needs
+                // R, for write needs W. Root bypasses (may_access handles euid 0).
                 let mut want = 0u32;
                 if readable { want |= 0o4; }
                 if writable { want |= 0o2; }
@@ -812,12 +823,16 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
             }
             i
         }
-        None => {
+        // Only a genuinely-absent final component leads to creation; a path
+        // that hit a non-dir / over-long / looping component reports that
+        // precise error even under O_CREAT (creat06's ENOTDIR/ELOOP cases).
+        Err(e) if e == ENOENT as i32 => {
             if !create {
                 return ENOENT;
             }
-            let Some((parent, name)) = resolve_at_parent(dfd, &path_str) else {
-                return ENOENT;
+            let (parent, name) = match resolve_at_parent(dfd, &path_str) {
+                Ok(v) => v,
+                Err(e) => return err_to_isize(e),
             };
             // Creating a file requires write permission on the parent
             // directory — creat04 drops to nobody and expects EACCES here.
@@ -825,10 +840,14 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
                 return -13; // EACCES
             }
             match parent.create(&name, FileType::Regular) {
-                Ok(i) => i,
+                Ok(i) => {
+                    stamp_creator(&i);
+                    i
+                }
                 Err(e) => return err_to_isize(e),
             }
         }
+        Err(e) => return e as isize, // ENOTDIR / ENAMETOOLONG / ELOOP
     };
 
     let file = Arc::new(File::from_inode(inode, readable, writable, append));
@@ -907,8 +926,9 @@ fn sys_mkdirat(dfd: i32, path: usize, mode: u32) -> isize {
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
-    let Some((parent, name)) = resolve_at_parent(dfd, &path_str) else {
-        return ENOENT;
+    let (parent, name) = match resolve_at_parent(dfd, &path_str) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
     };
     // mkdir requires write permission on the parent directory (root bypasses).
     if !may_access(&parent, 0o2) {
@@ -916,6 +936,7 @@ fn sys_mkdirat(dfd: i32, path: usize, mode: u32) -> isize {
     }
     match parent.create(&name, FileType::Directory) {
         Ok(inode) => {
+            stamp_creator(&inode);
             // Apply the requested mode (minus the standard 0o022 umask — we
             // don't track per-process umask; SYS_UMASK is a 0o022 stub and
             // the tests that care set umask(022) anyway). tmpfs create()
@@ -2637,6 +2658,68 @@ fn apply_owner(inode: &Arc<dyn Inode>, uid: u32, gid: u32) {
     }
 }
 
+/// May the caller chown/chgrp this inode? Linux rules: changing the *owner*
+/// needs CAP_CHOWN (root here); changing the *group* needs ownership of the
+/// file plus the target group being one the caller belongs to. Root bypasses.
+/// chown04 drops to nobody and expects EPERM on every owner/group change.
+fn chown_permitted(inode: &Arc<dyn Inode>, uid: u32, gid: u32) -> bool {
+    let c = creds_of(cur_tgid());
+    let euid = c[1];
+    if euid == 0 {
+        return true; // CAP_CHOWN
+    }
+    let (_, fuid, fgid) = inode_perm(inode);
+    // Non-root may never change the owner to a different uid.
+    if uid != u32::MAX && uid != fuid {
+        return false;
+    }
+    // Non-root may change the group only when it owns the file and the
+    // target gid is its effective or real group.
+    if gid != u32::MAX && gid != fgid {
+        if euid != fuid {
+            return false;
+        }
+        if gid != c[3] && gid != c[2] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Stamp a freshly created inode with the creator's effective uid/gid, the
+/// way Linux assigns ownership at creation. Without this, a file made by an
+/// unprivileged process (e.g. a test that dropped to nobody) would be owned
+/// by uid 0 and the owner could then neither chmod nor chgrp it. The contest
+/// itself runs as root (euid 0) so root-created files keep uid/gid 0 exactly
+/// as before — only dropped-privilege creators see their own identity.
+fn stamp_creator(inode: &Arc<dyn Inode>) {
+    let c = creds_of(cur_tgid());
+    let (euid, egid) = (c[1], c[3]);
+    if euid == 0 && egid == 0 {
+        return; // root: leave the default 0/0 untouched (no-op for the contest)
+    }
+    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+        let mut m = f.meta.lock();
+        m.uid = euid;
+        m.gid = egid;
+    } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
+        let mut m = d.meta.lock();
+        m.uid = euid;
+        m.gid = egid;
+    }
+}
+
+/// May the caller chmod this inode? Only the file's owner or root (CAP_FOWNER).
+/// chmod06 drops to nobody and expects EPERM.
+fn chmod_permitted(inode: &Arc<dyn Inode>) -> bool {
+    let c = creds_of(cur_tgid());
+    if c[1] == 0 {
+        return true; // root / CAP_FOWNER
+    }
+    let (_, fuid, _) = inode_perm(inode);
+    c[1] == fuid
+}
+
 fn apply_times(inode: &Arc<dyn Inode>, atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) {
     if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
         let mut m = f.meta.lock();
@@ -2658,7 +2741,23 @@ fn sys_fchmod(fd: i32, mode: u32) -> isize {
 
 fn sys_fchmodat(dfd: i32, path: usize, mode: u32) -> isize {
     let Some(p) = copy_path(path) else { return EFAULT };
-    let Some(i) = resolve_at(dfd, &p) else { return ENOENT };
+    // Classic fchmodat has no AT_EMPTY_PATH: an empty path is ENOENT.
+    if p.is_empty() {
+        return ENOENT;
+    }
+    // A non-searchable directory in the prefix => EACCES (chmod06 case 2).
+    if let Err(e) = check_search_perm(dfd, &p) {
+        return e;
+    }
+    // Resolution errors (ENOTDIR/ENAMETOOLONG/ELOOP/ENOENT) must survive.
+    let i = match resolve_at_with_err(dfd, &p) {
+        Ok(i) => i,
+        Err(e) => return e as isize,
+    };
+    // Only the owner or root may change mode (chmod06 case 1 => EPERM).
+    if !chmod_permitted(&i) {
+        return -1; // EPERM
+    }
     apply_mode(&i, mode);
     0
 }
@@ -2670,9 +2769,36 @@ fn sys_fchown(fd: i32, uid: u32, gid: u32) -> isize {
     0
 }
 
-fn sys_fchownat(dfd: i32, path: usize, uid: u32, gid: u32) -> isize {
+fn sys_fchownat(dfd: i32, path: usize, uid: u32, gid: u32, flags: i32) -> isize {
+    const AT_EMPTY_PATH: i32 = 0x1000;
     let Some(p) = copy_path(path) else { return EFAULT };
-    let Some(i) = resolve_at(dfd, &p) else { return ENOENT };
+    if p.is_empty() {
+        // Empty path operates on dfd itself only with AT_EMPTY_PATH; else
+        // it is ENOENT (chown04 case "when file does not exist").
+        if flags & AT_EMPTY_PATH != 0 {
+            let task = current_task();
+            let Some(f) = task.fd_table.lock().get(dfd) else { return EBADF };
+            if !chown_permitted(&f.inode, uid, gid) {
+                return -1; // EPERM
+            }
+            apply_owner(&f.inode, uid, gid);
+            return 0;
+        }
+        return ENOENT;
+    }
+    // Search permission on the prefix (chown04 EACCES cases).
+    if let Err(e) = check_search_perm(dfd, &p) {
+        return e;
+    }
+    // Resolution errors (ENOTDIR/ENAMETOOLONG/ELOOP/ENOENT) must survive.
+    let i = match resolve_at_with_err(dfd, &p) {
+        Ok(i) => i,
+        Err(e) => return e as isize,
+    };
+    // chown needs CAP_CHOWN / ownership (chown04 EPERM case).
+    if !chown_permitted(&i, uid, gid) {
+        return -1; // EPERM
+    }
     apply_owner(&i, uid, gid);
     0
 }
@@ -2963,13 +3089,19 @@ fn sys_faccessat(dfd: i32, path: usize, mode: i32) -> isize {
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
+    // An empty path is ENOENT (access04 case 2).
+    if path_str.is_empty() {
+        return ENOENT;
+    }
     // A non-searchable directory in the path => EACCES (access01 drops to
     // nobody and probes files inside a 0444 — no-X — directory).
     if let Err(e) = check_search_perm(dfd, &path_str) {
         return e;
     }
-    let Some(inode) = resolve_at(dfd, &path_str) else {
-        return ENOENT;
+    // Preserve ENOTDIR/ENAMETOOLONG/ELOOP from resolution (access04 cases).
+    let inode = match resolve_at_with_err(dfd, &path_str) {
+        Ok(i) => i,
+        Err(e) => return e as isize,
     };
     // R_OK=4, W_OK=2, X_OK=1, F_OK=0. Any bit outside that set is invalid.
     if mode & !0o7 != 0 {
@@ -3008,8 +3140,9 @@ fn sys_unlinkat(dfd: i32, path: usize, _flag: i32) -> isize {
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
-    let Some((parent, name)) = resolve_at_parent(dfd, &path_str) else {
-        return ENOENT;
+    let (parent, name) = match resolve_at_parent(dfd, &path_str) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
     };
     // Removing a directory entry requires write permission on the parent
     // directory (root bypasses). unlink08 drops to nobody and expects EACCES.
@@ -4257,11 +4390,13 @@ fn sys_renameat2(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _
     let Some(new_str) = copy_path(new_path) else {
         return EFAULT;
     };
-    let Some((old_parent, old_name)) = resolve_at_parent(old_dfd, &old_str) else {
-        return ENOENT;
+    let (old_parent, old_name) = match resolve_at_parent(old_dfd, &old_str) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
     };
-    let Some((new_parent, new_name)) = resolve_at_parent(new_dfd, &new_str) else {
-        return ENOENT;
+    let (new_parent, new_name) = match resolve_at_parent(new_dfd, &new_str) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
     };
 
     // Pull the inode out, then re-insert under the new name + parent.
@@ -4293,12 +4428,38 @@ fn sys_linkat(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _fla
     let Some(new_str) = copy_path(new_path) else {
         return EFAULT;
     };
-    let Some(src_inode) = resolve_at(old_dfd, &old_str) else {
+    // An empty source or target name is ENOENT (link04 empty-string cases).
+    if old_str.is_empty() || new_str.is_empty() {
         return ENOENT;
+    }
+    // Search permission must hold along both path prefixes (link04 EACCES).
+    if let Err(e) = check_search_perm(old_dfd, &old_str) {
+        return e;
+    }
+    if let Err(e) = check_search_perm(new_dfd, &new_str) {
+        return e;
+    }
+    // Resolve the source, preserving ENOTDIR/ENAMETOOLONG/ELOOP/ENOENT.
+    let src_inode = match resolve_at_with_err(old_dfd, &old_str) {
+        Ok(i) => i,
+        Err(e) => return e as isize,
     };
-    let Some((new_parent, new_name)) = resolve_at_parent(new_dfd, &new_str) else {
-        return ENOENT;
+    // Hard-linking a directory is not allowed for ordinary link().
+    if src_inode.kind() == FileType::Directory {
+        return -1; // EPERM
+    }
+    let (new_parent, new_name) = match resolve_at_parent(new_dfd, &new_str) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
     };
+    // Need write permission on the target directory to add an entry.
+    if !may_access(&new_parent, 0o2) {
+        return -13; // EACCES
+    }
+    // The new name must not already exist (link04 expects EEXIST).
+    if new_parent.lookup(&new_name).is_ok() {
+        return -17; // EEXIST
+    }
     if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
         match td.place_inode(&new_name, src_inode) {
             Ok(()) => 0,
@@ -4317,7 +4478,10 @@ fn sys_linkat(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _fla
 fn sys_symlinkat(target: usize, new_dfd: i32, linkpath: usize) -> isize {
     let Some(target_s) = copy_path(target) else { return EFAULT };
     let Some(link_s) = copy_path(linkpath) else { return EFAULT };
-    let Some((parent, name)) = resolve_at_parent(new_dfd, &link_s) else { return ENOENT };
+    let (parent, name) = match resolve_at_parent(new_dfd, &link_s) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
+    };
     match parent.symlink(&name, &target_s) {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
