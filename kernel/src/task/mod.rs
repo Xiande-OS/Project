@@ -353,6 +353,7 @@ pub fn reap(pid: i32) {
     crate::sync::futex::forget_task(pid);
     forget_itimer(pid);
     crate::syscall::forget_creds(pid);
+    crate::syscall::forget_sched(pid);
 }
 
 /// Reap orphan zombies — Zombie tasks whose parent is no longer in the table

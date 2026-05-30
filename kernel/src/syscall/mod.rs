@@ -176,8 +176,14 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_CAPSET => sys_capset(a0, a1),
         nr::SYS_SCHED_GETAFFINITY => sys_sched_getaffinity(a0 as i32, a1, a2),
         nr::SYS_SCHED_SETAFFINITY => 0,
-        nr::SYS_SCHED_GETPARAM | nr::SYS_SCHED_GETSCHEDULER => 0,
-        nr::SYS_SCHED_SETSCHEDULER => 0,
+        nr::SYS_SCHED_GETSCHEDULER => sys_sched_getscheduler(a0 as i32),
+        nr::SYS_SCHED_GETPARAM => sys_sched_getparam(a0 as i32, a1),
+        nr::SYS_SCHED_SETPARAM => sys_sched_setparam(a0 as i32, a1),
+        nr::SYS_SCHED_SETSCHEDULER => {
+            sys_sched_setscheduler(a0 as i32, a1 as i32, a2)
+        }
+        nr::SYS_SCHED_GET_PRIORITY_MAX => sys_sched_get_priority_max(a0 as i32),
+        nr::SYS_SCHED_GET_PRIORITY_MIN => sys_sched_get_priority_min(a0 as i32),
         nr::SYS_SETPRIORITY => sys_setpriority(a0 as i32, a1 as i32, a2 as i32),
         nr::SYS_GETPRIORITY => sys_getpriority(a0 as i32, a1 as i32),
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
@@ -2597,6 +2603,140 @@ fn sys_getpriority(which: i32, who: i32) -> isize {
     let key = (which, prio_key_who(which, who));
     let nice = NICE_VALUES.lock().get(&key).copied().unwrap_or(0);
     (20 - nice) as isize
+}
+
+const SCHED_OTHER: i32 = 0;
+const SCHED_FIFO: i32 = 1;
+const SCHED_RR: i32 = 2;
+const SCHED_BATCH: i32 = 3;
+const SCHED_IDLE: i32 = 5;
+
+/// Per-pid scheduling policy + realtime priority. We don't run a realtime
+/// scheduler, but the sched_* group requires these to validate and round-trip.
+static SCHED_POLICY: spin::Mutex<alloc::collections::BTreeMap<i32, (i32, i32)>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+/// Drop a reaped pid's stored policy so a recycled pid starts fresh.
+pub fn forget_sched(pid: i32) {
+    SCHED_POLICY.lock().remove(&pid);
+}
+
+/// Resolve a sched_* `pid` argument: negative is EINVAL, 0 is the caller, and
+/// any other value must name a live task (else ESRCH).
+fn sched_resolve_pid(pid: i32) -> Result<i32, isize> {
+    if pid < 0 {
+        return Err(EINVAL);
+    }
+    if pid == 0 {
+        return Ok(current_task().pid);
+    }
+    if crate::task::task_by_pid(pid).is_some() {
+        Ok(pid)
+    } else {
+        Err(ESRCH)
+    }
+}
+
+fn sched_policy_valid(policy: i32) -> bool {
+    matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE)
+}
+
+/// SCHED_FIFO/RR take a priority in 1..=99; the rest require exactly 0.
+fn sched_prio_ok(policy: i32, prio: i32) -> bool {
+    match policy {
+        SCHED_FIFO | SCHED_RR => (1..=99).contains(&prio),
+        _ => prio == 0,
+    }
+}
+
+fn sys_sched_setscheduler(pid: i32, policy: i32, param: usize) -> isize {
+    if !sched_policy_valid(policy) {
+        return EINVAL;
+    }
+    let rpid = match sched_resolve_pid(pid) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let task = current_task();
+    let Some(buf) = task.copy_in_bytes(param, 4) else { return EFAULT; };
+    let prio = i32::from_le_bytes(buf[..4].try_into().unwrap_or([0; 4]));
+    if !sched_prio_ok(policy, prio) {
+        return EINVAL;
+    }
+    // A realtime policy requires privilege (no RLIMIT_RTPRIO budget modelled).
+    if (policy == SCHED_FIFO || policy == SCHED_RR) && current_euid() != 0 {
+        return EPERM;
+    }
+    SCHED_POLICY.lock().insert(rpid, (policy, prio));
+    0
+}
+
+fn sys_sched_getscheduler(pid: i32) -> isize {
+    match sched_resolve_pid(pid) {
+        Ok(rpid) => SCHED_POLICY
+            .lock()
+            .get(&rpid)
+            .map(|&(p, _)| p)
+            .unwrap_or(SCHED_OTHER) as isize,
+        Err(e) => e,
+    }
+}
+
+fn sys_sched_getparam(pid: i32, param: usize) -> isize {
+    // Linux rejects a NULL param up front with EINVAL (before EFAULT for other
+    // bad addresses), which sched_getparam03 pins down.
+    if param == 0 {
+        return EINVAL;
+    }
+    let rpid = match sched_resolve_pid(pid) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let prio = SCHED_POLICY.lock().get(&rpid).map(|&(_, pr)| pr).unwrap_or(0);
+    if current_task().copy_out_bytes(param, &prio.to_le_bytes()).is_none() {
+        return EFAULT;
+    }
+    0
+}
+
+fn sys_sched_setparam(pid: i32, param: usize) -> isize {
+    if param == 0 {
+        return EINVAL;
+    }
+    let rpid = match sched_resolve_pid(pid) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let task = current_task();
+    let Some(buf) = task.copy_in_bytes(param, 4) else { return EFAULT; };
+    let prio = i32::from_le_bytes(buf[..4].try_into().unwrap_or([0; 4]));
+    let policy = SCHED_POLICY.lock().get(&rpid).map(|&(p, _)| p).unwrap_or(SCHED_OTHER);
+    if !sched_prio_ok(policy, prio) {
+        return EINVAL;
+    }
+    let mut g = SCHED_POLICY.lock();
+    g.entry(rpid).or_insert((SCHED_OTHER, 0)).1 = prio;
+    0
+}
+
+fn sys_sched_get_priority_max(policy: i32) -> isize {
+    if !sched_policy_valid(policy) {
+        return EINVAL;
+    }
+    match policy {
+        SCHED_FIFO | SCHED_RR => 99,
+        _ => 0,
+    }
+}
+
+fn sys_sched_get_priority_min(policy: i32) -> isize {
+    if !sched_policy_valid(policy) {
+        return EINVAL;
+    }
+    match policy {
+        SCHED_FIFO | SCHED_RR => 1,
+        _ => 0,
+    }
 }
 
 fn sys_truncate(path: usize, length: u64) -> isize {
