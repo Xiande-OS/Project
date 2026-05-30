@@ -360,6 +360,29 @@ pub fn raise_signal(target: &Arc<Task>, signo: u32) -> bool {
     // it. Cascading SIGKILL collapses the orphan tree at the same
     // moment busybox-timeout fires its outer SIGKILL on sh.
     if signo == SIGKILL {
+        // Fan SIGKILL out to every thread in the target's group. Threads are
+        // siblings (they share the tgid) — NOT descendants — so the cascade
+        // below misses them. A multithreaded case like ebizzy parks its
+        // leader in pthread_join while worker threads spin in a tight
+        // mmap/munmap loop; the leader re-blocks before it can ever deliver
+        // the kill, and the running siblings otherwise never receive it, so
+        // the process outlives the per-case timeout (and the loop eventually
+        // exhausts memory). Posting SIGKILL to each sibling lets whichever
+        // thread runs next terminate the whole group via check_signals ->
+        // deliver_default_terminate.
+        let tgid = target.tgid.load(Ordering::Relaxed);
+        for t in crate::task::all_tasks() {
+            if t.pid != target.pid && t.tgid.load(Ordering::Relaxed) == tgid {
+                t.signals.pending.fetch_or(sigbit(SIGKILL), Ordering::SeqCst);
+                {
+                    let mut s = t.state.lock();
+                    if *s == TaskState::Waiting {
+                        *s = TaskState::Ready;
+                    }
+                }
+                crate::sync::futex::interrupt_wait(t.pid);
+            }
+        }
         let target_pid = target.pid;
         let descendants = collect_descendants(target_pid);
         for d in descendants {
