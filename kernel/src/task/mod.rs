@@ -86,6 +86,10 @@ pub struct Task {
     pub cwd: Arc<Mutex<String>>,
     pub state: Mutex<TaskState>,
     pub exit_code: AtomicI32,
+    /// Signal delivered to the parent when this task (a process leader) exits.
+    /// SIGCHLD for fork; a clone/clone3 may request another (clone301 uses
+    /// SIGUSR2); 0 means none (a CLONE_THREAD member).
+    pub exit_signal: AtomicI32,
     pub children: Mutex<Vec<i32>>,
     /// argv joined with NUL separators, NUL terminated. Used by /proc/<pid>/cmdline.
     pub cmdline: Mutex<Vec<u8>>,
@@ -795,6 +799,7 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
         cwd: Arc::new(Mutex::new(String::from("/"))),
         state: Mutex::new(TaskState::Running),
         exit_code: AtomicI32::new(0),
+        exit_signal: AtomicI32::new(crate::signal::SIGCHLD as i32),
         children: Mutex::new(Vec::new()),
         cmdline: Mutex::new(Vec::new()),
         exe_path: Mutex::new(String::new()),
@@ -1063,6 +1068,11 @@ pub fn clone_current(
         cwd,
         state: Mutex::new(TaskState::Ready),
         exit_code: AtomicI32::new(0),
+        // The exit signal lives in the low byte of the clone flags (SIGCHLD
+        // for fork). A CLONE_THREAD member reports 0 (no parent signal).
+        exit_signal: AtomicI32::new(
+            if flags & CLONE_THREAD != 0 { 0 } else { (flags & 0xff) as i32 },
+        ),
         children: Mutex::new(Vec::new()),
         cmdline: Mutex::new(parent.cmdline.lock().clone()),
         exe_path: Mutex::new(parent.exe_path.lock().clone()),

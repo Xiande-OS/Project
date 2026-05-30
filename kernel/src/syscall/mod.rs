@@ -4185,7 +4185,13 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
                     *s = crate::task::TaskState::Ready;
                 }
             }
-            let _ = crate::signal::raise_signal(&parent, crate::signal::SIGCHLD);
+            // Deliver the exit signal the child was cloned with — SIGCHLD for
+            // fork, but clone/clone3 may pick another (clone301 uses SIGUSR2);
+            // 0 means none.
+            let sig = task.exit_signal.load(core::sync::atomic::Ordering::Relaxed);
+            if sig != 0 {
+                let _ = crate::signal::raise_signal(&parent, sig as u32);
+            }
         }
     }
 
@@ -4361,8 +4367,22 @@ fn sys_clone3(uargs: usize, size: usize) -> isize {
     // Fold the exit signal into the low byte so clone_current's SIGCHLD /
     // wait bookkeeping matches the clone() convention.
     let cl_flags = (flags & !0xff) | (exit_signal & 0xff);
+    let pidfd_ptr = rd(8) as usize;
     match crate::task::clone_current(cl_flags, child_sp, parent_tid, child_tid, tls) {
-        Some(new_task) => new_task.pid as isize,
+        Some(new_task) => {
+            // CLONE_PIDFD: hand the parent a pidfd referring to the new child
+            // and write its number to *clone_args.pidfd (clone301 then drives
+            // pidfd_send_signal through it).
+            const CLONE_PIDFD: usize = 0x1000;
+            if flags & CLONE_PIDFD != 0 {
+                let pfd: Arc<dyn Inode> = Arc::new(PidFd { pid: new_task.pid });
+                let file = Arc::new(crate::fs::File::from_inode(pfd, true, false, false));
+                if let Ok(fd) = current_task().fd_table.lock().alloc(file, false) {
+                    let _ = current_task().copy_out_bytes(pidfd_ptr, &(fd as i32).to_le_bytes());
+                }
+            }
+            new_task.pid as isize
+        }
         None => -12, // ENOMEM
     }
 }
