@@ -2341,6 +2341,7 @@ pub fn forget_creds(pid: i32) {
     CREDS.lock().remove(&pid);
     SAVED_IDS.lock().remove(&pid);
     FS_IDS.lock().remove(&pid);
+    SUPP_GROUPS.lock().remove(&pid);
 }
 
 /// A forked child gets its own thread-group id, so it must inherit the
@@ -2364,6 +2365,10 @@ pub fn inherit_creds(parent_tgid: i32, child_tgid: i32) {
     let fs = FS_IDS.lock().get(&parent_tgid).copied();
     if let Some(f) = fs {
         FS_IDS.lock().insert(child_tgid, f);
+    }
+    let groups = SUPP_GROUPS.lock().get(&parent_tgid).cloned();
+    if let Some(g) = groups {
+        SUPP_GROUPS.lock().insert(child_tgid, g);
     }
 }
 
@@ -3810,6 +3815,75 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     }
     crate::task::sleep_until(task.pid, deadline);
     *task.state.lock() = crate::task::TaskState::Waiting;
+    0
+}
+
+// ---------- supplementary groups + getcpu ----------
+
+/// Supplementary group list per thread-group (default empty). getgroups/
+/// setgroups round-trip it; the contest runs as root so the permission gate
+/// only bites tests that drop privilege.
+static SUPP_GROUPS: spin::Mutex<alloc::collections::BTreeMap<i32, alloc::vec::Vec<u32>>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+const NGROUPS_MAX: i32 = 65536;
+
+fn sys_getgroups(size: i32, list: usize) -> isize {
+    if size < 0 {
+        return EINVAL;
+    }
+    let groups = SUPP_GROUPS.lock().get(&cur_tgid()).cloned().unwrap_or_default();
+    let n = groups.len() as isize;
+    if size == 0 {
+        return n; // query the count without writing
+    }
+    if (size as usize) < groups.len() {
+        return EINVAL;
+    }
+    let mut buf = alloc::vec::Vec::with_capacity(groups.len() * 4);
+    for g in &groups {
+        buf.extend_from_slice(&g.to_le_bytes());
+    }
+    if !buf.is_empty() && current_task().copy_out_bytes(list, &buf).is_none() {
+        return EFAULT;
+    }
+    n
+}
+
+fn sys_setgroups(size: i32, list: usize) -> isize {
+    // Argument bounds first (EINVAL), then privilege (EPERM), then the copy
+    // (EFAULT) — matching the kernel's order, which setgroups02 pins down.
+    if size < 0 || size > NGROUPS_MAX {
+        return EINVAL;
+    }
+    if current_euid() != 0 {
+        return EPERM;
+    }
+    let mut groups = alloc::vec::Vec::new();
+    if size > 0 {
+        if list == 0 {
+            return EFAULT;
+        }
+        let Some(buf) = current_task().copy_in_bytes(list, size as usize * 4) else {
+            return EFAULT;
+        };
+        for i in 0..size as usize {
+            groups.push(u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap()));
+        }
+    }
+    SUPP_GROUPS.lock().insert(cur_tgid(), groups);
+    0
+}
+
+fn sys_getcpu(cpu: usize, node: usize, _tcache: usize) -> isize {
+    // Single-CPU: always CPU 0, NUMA node 0.
+    let task = current_task();
+    if cpu != 0 && task.copy_out_bytes(cpu, &0u32.to_le_bytes()).is_none() {
+        return EFAULT;
+    }
+    if node != 0 && task.copy_out_bytes(node, &0u32.to_le_bytes()).is_none() {
+        return EFAULT;
+    }
     0
 }
 
