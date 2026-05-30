@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
 
 use crate::arch::TrapFrame;
@@ -142,7 +142,11 @@ impl Task {
 }
 
 pub fn copy_in_via(ms: &MemorySet, va: usize, len: usize) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(len);
+    // Fallible reserve: a user can pass a gigantic count to write()/writev()
+    // etc.; allocating it unconditionally panics the kernel via the alloc
+    // error handler. Fail the copy (caller maps None -> EFAULT) instead.
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
     let mut cursor = va;
     let end = va.checked_add(len)?;
     while cursor < end {
@@ -265,6 +269,54 @@ pub fn reap(pid: i32) {
     crate::sync::futex::forget_task(pid);
     forget_itimer(pid);
     crate::syscall::forget_creds(pid);
+}
+
+/// Reap orphan zombies — Zombie tasks whose parent is no longer in the table
+/// (dead), so nobody will ever wait4() them. A killed fork-storm test (the
+/// LTP cgroup `fork_processes`/`cgroup_regression_*` cases each fork or
+/// mount in a tight infinite loop) leaves behind the children that were
+/// in-flight when its `timeout` SIGKILL landed; those orphans pin kstack /
+/// task slots forever. After ~the cgroup cluster the table is bloated enough
+/// that later fork()s fail (ENOMEM) and every subsequent LTP case breaks
+/// ("$(basename ...)" returns empty, tests can't spawn). On a normal init
+/// these are reaped by pid 1; our contest `sh` loop only wait4()s its own
+/// direct children, so reap them here. Capped per call so the sweep stays
+/// cheap; the caller only invokes it when the table has grown large.
+/// Trap counter to rate-limit the orphan-zombie sweep (see scheduler).
+static REAP_SWEEP_TICK: AtomicU64 = AtomicU64::new(0);
+
+pub fn reap_orphan_zombies(except: i32) {
+    // Snapshot (pid, ppid) and the live-pid set under the table lock, then
+    // release it before touching per-task state locks (TABLE-then-state would
+    // invert the scheduler's state-then-TABLE order).
+    let (pairs, live): (Vec<(i32, i32)>, alloc::collections::BTreeSet<i32>) = {
+        let t = TABLE.lock();
+        let live = t.tasks.keys().copied().collect();
+        let pairs = t
+            .tasks
+            .values()
+            .map(|task| (task.pid, task.ppid.load(Ordering::Relaxed)))
+            .collect();
+        (pairs, live)
+    };
+    let mut n = 0;
+    for (pid, ppid) in pairs {
+        if pid == except || live.contains(&ppid) {
+            continue; // self, or parent still alive (it may wait4 us)
+        }
+        // Parent is gone. Reap only if this task really is a Zombie.
+        if let Some(task) = task_by_pid(pid) {
+            let is_zombie = *task.state.lock() == TaskState::Zombie;
+            drop(task);
+            if is_zombie {
+                reap(pid);
+                n += 1;
+                if n >= 64 {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 pub fn set_current_pid(pid: i32) {
@@ -1056,6 +1108,20 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     // Reap any detached threads (CLONE_THREAD) that died last round.
     // We can't reap the current pid even if dead — kstack still in use.
     crate::syscall::drain_self_reap_list(cur_pid);
+
+    // Sweep orphan zombies (parent dead, nobody will wait4 them) when the
+    // table has bloated past a normal working set. A killed LTP fork-storm
+    // (cgroup `fork_processes`/`cgroup_regression_*`) leaves orphans that
+    // pin kstacks and make every table scan O(n); left alone they exhaust
+    // task slots and later fork()s fail, breaking the rest of the suite.
+    // Rate-limited (every 32 traps) and size-gated so steady-state cost is
+    // nil — it only fires while a backlog exists, and stops once drained.
+    {
+        let n = REAP_SWEEP_TICK.fetch_add(1, Ordering::Relaxed);
+        if n % 32 == 0 && TABLE.lock().tasks.len() > 128 {
+            reap_orphan_zombies(cur_pid);
+        }
+    }
 
     // Run signal delivery for the current task before considering a switch.
     // Doing this before scheduling means terminating-by-signal flows through

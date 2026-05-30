@@ -397,12 +397,43 @@ fn sys_writev(fd: i32, iov: usize, count: usize) -> isize {
     total
 }
 
+/// Hard ceiling on a single read/getrandom kernel bounce buffer. A user can
+/// ask read() for gigabytes; allocating that on the kernel heap blows the
+/// alloc-error handler and panics the whole kernel. We cap the bounce buffer
+/// and let the syscall return a short count — `read()` is explicitly allowed
+/// to return fewer bytes than requested, so callers loop. The allocation is
+/// fallible (try_reserve, halving on failure) so even the capped size can't
+/// panic on a fragmented heap.
+const MAX_IO_BOUNCE: usize = 16 * 1024 * 1024;
+
+/// Allocate a zeroed I/O bounce buffer of at most `MAX_IO_BOUNCE` bytes
+/// without ever panicking. On a fragmented/low heap it degrades to a smaller
+/// buffer (down to a page) so the caller still makes progress via a short op.
+fn io_bounce_buf(len: usize) -> alloc::vec::Vec<u8> {
+    if len == 0 {
+        return alloc::vec::Vec::new();
+    }
+    let mut want = len.min(MAX_IO_BOUNCE);
+    loop {
+        let mut v = alloc::vec::Vec::new();
+        if v.try_reserve_exact(want).is_ok() {
+            v.resize(want, 0);
+            return v;
+        }
+        if want <= 4096 {
+            // Heap is critically low; best-effort page so we don't spin.
+            return alloc::vec![0u8; want];
+        }
+        want /= 2;
+    }
+}
+
 fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
-    let mut tmp = alloc::vec![0u8; len];
+    let mut tmp = io_bounce_buf(len);
     // Drive the network stack so RX queue is current before we attempt the
     // read. Cheap when there's nothing to do.
     crate::net::poll();
@@ -527,7 +558,7 @@ fn sys_readv(fd: i32, iov: usize, count: usize) -> isize {
         if v.len == 0 {
             continue;
         }
-        let mut tmp = alloc::vec![0u8; v.len];
+        let mut tmp = io_bounce_buf(v.len);
         match file.read(&mut tmp) {
             Ok(n) => {
                 if n == 0 {
@@ -579,7 +610,7 @@ fn sys_pread(fd: i32, buf: usize, len: usize, off: u64) -> isize {
     let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
-    let mut tmp = alloc::vec![0u8; len];
+    let mut tmp = io_bounce_buf(len);
     match file.inode.read_at(off, &mut tmp) {
         Ok(n) => {
             if task.copy_out_bytes(buf, &tmp[..n]).is_none() {
@@ -1585,7 +1616,7 @@ fn sys_preadv(fd: i32, iov: usize, count: usize, off: u64) -> isize {
     let mut cur_off = off;
     for v in iovs {
         if v.len == 0 { continue; }
-        let mut tmp = alloc::vec![0u8; v.len];
+        let mut tmp = io_bounce_buf(v.len);
         match file.inode.read_at(cur_off, &mut tmp) {
             Ok(n) => {
                 if n == 0 { break; }
@@ -2204,6 +2235,11 @@ fn sys_pselect6(
     if nfds == 0 {
         return 0;
     }
+    // Clamp nfds the way Linux clamps to the fd-table size: a bogus huge nfds
+    // (fuzzers pass 2^30) would otherwise make the fd_set byte length —
+    // (nfds+7)/8 — hundreds of MB and panic the kernel allocator. Clamping
+    // down never exceeds the caller's real fd_set, so legit calls are exact.
+    let nfds = nfds.min(4096);
     let task = current_task();
     // Parse timeout. Three regimes:
     //   * timeout == NULL  → block forever (timeout_ticks=None, zero_timeout=false)
@@ -3753,7 +3789,7 @@ fn sys_uname(addr: usize) -> isize {
 
 fn sys_getrandom(buf: usize, len: usize, _flags: usize) -> isize {
     let task = current_task();
-    let mut out = alloc::vec![0u8; len];
+    let mut out = io_bounce_buf(len);
     let mut x: u64 = crate::arch::now_ticks()
         .wrapping_mul(2862933555777941757);
     for b in out.iter_mut() {

@@ -189,10 +189,17 @@ fn load_segment(
     let va_end_raw = va + mem_sz;
     let va_end = VirtAddr((va_end_raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
 
-    let total = va_end.0 - va_start.0;
-    let mut buf = Vec::with_capacity(total);
-    buf.resize(total, 0);
+    // Only buffer the leading page gap + the actual file bytes. The rest of
+    // the segment (.bss: mem_sz - file_sz) is provided by alloc_frame, which
+    // hands back zeroed frames — so we must NOT allocate a `total`-sized
+    // (mem_sz) heap copy here. A binary with a large .bss (some LTP cases
+    // declare a 128 MiB BSS) would otherwise try a 128 MiB infallible kernel
+    // allocation and panic the whole kernel during execve. Fallible too.
     let file_avail = core::cmp::min(file_sz, image.len().saturating_sub(file_off));
+    let head = page_offset + file_avail;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(head).map_err(|_| "OOM: ELF segment head")?;
+    buf.resize(head, 0);
     buf[page_offset..page_offset + file_avail]
         .copy_from_slice(&image[file_off..file_off + file_avail]);
 

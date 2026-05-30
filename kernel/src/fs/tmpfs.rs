@@ -8,7 +8,7 @@ use spin::Mutex;
 
 use core::any::Any;
 
-use super::{devfs, FileType, Inode, Result, EEXIST, EINVAL, ENOENT};
+use super::{devfs, FileType, Inode, Result, EEXIST, EINVAL, ENOENT, ENOSPC};
 
 pub struct TmpfsFile {
     data: Mutex<Vec<u8>>,
@@ -76,14 +76,30 @@ impl Inode for TmpfsFile {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         let mut data = self.data.lock();
         let off = offset as usize;
-        if off + buf.len() > data.len() {
-            data.resize(off + buf.len(), 0);
+        let end = off.checked_add(buf.len()).ok_or(EINVAL)?;
+        if end > data.len() {
+            // Grow the heap-backed file FALLIBLY. A tmpfs file lives in the
+            // kernel heap; the Vec's amortized doubling means a 64 MiB file
+            // tries to grow to a 128 MiB block, and an infallible resize trips
+            // the alloc-error handler and panics the whole kernel when that
+            // block isn't available (LTP fills a multi-hundred-MB temp file).
+            // Reserve fallibly and surface ENOSPC instead — the in-memory fs
+            // is simply full.
+            let need = end - data.len();
+            data.try_reserve(need).map_err(|_| ENOSPC)?;
+            data.resize(end, 0);
         }
-        data[off..off + buf.len()].copy_from_slice(buf);
+        data[off..end].copy_from_slice(buf);
         Ok(buf.len())
     }
     fn truncate(&self, len: u64) -> Result<()> {
-        self.data.lock().resize(len as usize, 0);
+        let mut data = self.data.lock();
+        let new_len = len as usize;
+        if new_len > data.len() {
+            let need = new_len - data.len();
+            data.try_reserve(need).map_err(|_| ENOSPC)?;
+        }
+        data.resize(new_len, 0);
         Ok(())
     }
 }
