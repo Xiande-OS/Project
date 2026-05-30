@@ -168,6 +168,7 @@ pub const SYS_TIMERFD_GETTIME: usize = 87;
 pub const SYS_PRCTL: usize = 167;
 pub const SYS_CAPGET: usize = 90;
 pub const SYS_CAPSET: usize = 91;
+pub const SYS_PERSONALITY: usize = 92;
 pub const SYS_SCHED_GETAFFINITY: usize = 123;
 pub const SYS_SCHED_SETAFFINITY: usize = 122;
 pub const SYS_SCHED_GETPARAM: usize = 121;

@@ -179,6 +179,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_PRCTL => sys_prctl(a0 as i32, a1, a2, a3, a4),
         nr::SYS_CAPGET => sys_capget(a0, a1),
         nr::SYS_CAPSET => sys_capset(a0, a1),
+        nr::SYS_PERSONALITY => sys_personality(a0 as u32),
         nr::SYS_SCHED_GETAFFINITY => sys_sched_getaffinity(a0 as i32, a1, a2),
         nr::SYS_SCHED_SETAFFINITY => 0,
         nr::SYS_SCHED_GETSCHEDULER => sys_sched_getscheduler(a0 as i32),
@@ -3158,6 +3159,28 @@ fn sys_sched_get_priority_min(policy: i32) -> isize {
         SCHED_FIFO | SCHED_RR => 1,
         _ => 0,
     }
+}
+
+/// Per-process execution domain (personality(2)). Default 0 (PER_LINUX).
+static PERSONALITY: spin::Mutex<alloc::collections::BTreeMap<i32, u32>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+pub fn forget_personality(pid: i32) {
+    PERSONALITY.lock().remove(&pid);
+}
+
+/// personality(persona): query with 0xffffffff (return current, no change),
+/// otherwise set the execution domain and return the previous value. We don't
+/// alter any behaviour from it, but the value must round-trip (personality01
+/// sets every known persona; personality02 reads then restores).
+fn sys_personality(persona: u32) -> isize {
+    let tgid = cur_tgid();
+    let mut g = PERSONALITY.lock();
+    let cur = g.get(&tgid).copied().unwrap_or(0);
+    if persona != 0xffff_ffff {
+        g.insert(tgid, persona);
+    }
+    cur as isize
 }
 
 /// sched_rr_get_interval(pid, tp): report the round-robin time quantum. We
