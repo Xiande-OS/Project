@@ -898,7 +898,29 @@ fn sys_close(fd: i32) -> isize {
             }
         }
     }
+    // POSIX: closing *any* fd referring to a file releases every record
+    // (fcntl) lock this process holds on that file — even if other fds to it
+    // remain open. fcntl15 closes a duplicated/independent fd and expects the
+    // lock to be gone. Capture the inode before the close, drop the locks
+    // after it succeeds.
+    let key = task
+        .fd_table
+        .lock()
+        .get(fd)
+        .map(|f| Arc::as_ptr(&f.inode) as *const () as usize);
     let r = task.fd_table.lock().close(fd);
+    if r.is_ok() {
+        if let Some(k) = key {
+            let pid = task.pid;
+            let mut table = FLOCK_RANGES.lock();
+            if let Some(v) = table.get_mut(&k) {
+                v.retain(|lr| lr.pid != pid);
+                if v.is_empty() {
+                    table.remove(&k);
+                }
+            }
+        }
+    }
     match r {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
