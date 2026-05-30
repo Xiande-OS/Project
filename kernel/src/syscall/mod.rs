@@ -855,6 +855,10 @@ fn sys_mkdirat(dfd: i32, path: usize, _mode: u32) -> isize {
     let Some((parent, name)) = resolve_at_parent(dfd, &path_str) else {
         return ENOENT;
     };
+    // mkdir requires write permission on the parent directory (root bypasses).
+    if !may_access(&parent, 0o2) {
+        return -13; // EACCES
+    }
     match parent.create(&name, FileType::Directory) {
         Ok(_) => 0,
         Err(e) => err_to_isize(e),
@@ -2937,6 +2941,11 @@ fn sys_unlinkat(dfd: i32, path: usize, _flag: i32) -> isize {
     let Some((parent, name)) = resolve_at_parent(dfd, &path_str) else {
         return ENOENT;
     };
+    // Removing a directory entry requires write permission on the parent
+    // directory (root bypasses). unlink08 drops to nobody and expects EACCES.
+    if !may_access(&parent, 0o2) {
+        return -13; // EACCES
+    }
     match parent.unlink(&name) {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
