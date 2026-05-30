@@ -4259,6 +4259,12 @@ fn sys_clock_settime(clk: usize, tp: usize) -> isize {
         return EFAULT;
     };
     let target_sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let target_nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    // The timespec must be normalized: tv_sec >= 0 and tv_nsec in [0, 1e9)
+    // (clock_settime02 probes tv_sec=-1, tv_nsec=-1 and tv_nsec=1e9+1).
+    if target_sec < 0 || target_nsec < 0 || target_nsec >= 1_000_000_000 {
+        return EINVAL;
+    }
     let mtime = crate::arch::now_ticks();
     let now_sec = (mtime / 10_000_000) as i64;
     WALL_OFFSET_SECS.store(target_sec - now_sec, core::sync::atomic::Ordering::Relaxed);
@@ -4337,17 +4343,13 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
     if (prot & PROT_EXEC) != 0 {
         perm |= crate::mm::memory_set::VmPerm::X;
     }
-    if prot == 0 {
-        // musl/busybox reserve an arena with mmap(PROT_NONE) and then write
-        // into it (the malloc/heap allocator relies on the region being
-        // usable without an explicit mprotect — see commit 513af62 which
-        // made PROT_NONE truly inaccessible and stalled the whole musl LTP
-        // run at bbr02 on the first busybox heap write). Keep the region R|W
-        // so those programs work. (The EFAULT-on-bad-pointer behaviour LTP's
-        // tst_get_bad_addr wants is being re-added separately via a VmArea
-        // permission check on the copy path, which doesn't break this.)
-        perm |= crate::mm::memory_set::VmPerm::R | crate::mm::memory_set::VmPerm::W;
-    }
+    // PROT_NONE (prot == 0): leave the VmArea logically inaccessible (U only,
+    // no R/W). to_pte() still backs it with a usable R|W leaf so the owner's
+    // reserve-then-write pattern works (musl mallocng arenas, busybox heap),
+    // but the kernel copy path refuses a pointer into it — so a syscall handed
+    // such a guard address returns EFAULT (LTP's tst_get_bad_addr, which
+    // clock_gettime02 / clock_settime02 / capget02 and many "bad pointer =>
+    // EFAULT" subtests rely on). No extra perm bits are added here.
 
     const MAP_FIXED: i32 = 0x10;
     let mut ms = task.memory_set_mut();

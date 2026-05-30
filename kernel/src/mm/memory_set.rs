@@ -53,6 +53,16 @@ impl VmPerm {
         if self.contains(Self::U) {
             f |= PteFlags::U;
         }
+        // A user region with no R/W/X is a PROT_NONE reservation. RISC-V has
+        // no valid leaf with all of R/W/X clear (that encoding is a non-leaf
+        // pointer), and we have no demand-fault handler, so back it with a
+        // real R|W leaf: the owning process can reserve-then-write it (musl
+        // mallocng arenas, busybox heap). The *logical* VmPerm stays U-only,
+        // so the kernel copy path (perm_at) still refuses a syscall handed a
+        // pointer into it — EFAULT, which LTP's tst_get_bad_addr relies on.
+        if self.contains(Self::U) && !self.intersects(Self::R | Self::W | Self::X) {
+            f |= PteFlags::R | PteFlags::W;
+        }
         f
     }
 }
