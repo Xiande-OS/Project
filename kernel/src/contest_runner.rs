@@ -331,7 +331,7 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 // whole run wedges. setsid puts the case in a fresh group so its
                 // group signals stay contained to the case + its children.
                 s.push_str(&alloc::format!(
-                    "./busybox sed 's@^\\( *\\)\"$file\"\\( *\\)$@\\1./busybox setsid ./busybox timeout -s KILL 10 \"$file\"@' ./{s} > /tmp/ltp_to.sh 2>/dev/null\n",
+                    "./busybox sed 's@^\\( *\\)\"$file\"\\( *\\)$@\\1./busybox setsid ./busybox timeout -s KILL 10 \"$file\" < /dev/null@' ./{s} > /tmp/ltp_to.sh 2>/dev/null\n",
                     s = script
                 ));
                 s.push_str(&alloc::format!(
