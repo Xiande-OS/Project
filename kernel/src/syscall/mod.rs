@@ -2517,22 +2517,32 @@ fn apply_mode(inode: &Arc<dyn Inode>, mode: u32) {
     }
 }
 
+/// POSIX rule for the setuid/setgid bits after a successful chown: the
+/// set-user-ID bit is always cleared; the set-group-ID bit is cleared ONLY
+/// when the file is group-executable (S_IXGRP, 0o010). A setgid file that is
+/// not group-executable is a mandatory-locking marker and keeps its setgid
+/// bit. chown02 checks both — testfile1 (0o6770, group-exec) -> 0o0770 and
+/// testfile2 (0o2700, not group-exec) -> 0o2700.
+fn chown_clear_mode(mode: u32) -> u32 {
+    let mut m = mode & !0o4000; // always clear setuid
+    if m & 0o010 != 0 {
+        m &= !0o2000; // group-executable: clear setgid too
+    }
+    m
+}
+
 fn apply_owner(inode: &Arc<dyn Inode>, uid: u32, gid: u32) {
-    // chown(-1) (== u32::MAX) leaves that field unchanged. A successful chown
-    // also clears the set-user-ID and set-group-ID bits (S_ISUID|S_ISGID =
-    // 0o6000), which chown02 verifies (it sets 0o6770 then expects 0o0770
-    // back). Linux only keeps the setgid bit when the file isn't group-
-    // executable; LTP's files are, so always clearing both is correct here.
+    // chown(-1) (== u32::MAX) leaves that field unchanged.
     if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
         let mut m = f.meta.lock();
         if uid != u32::MAX { m.uid = uid; }
         if gid != u32::MAX { m.gid = gid; }
-        m.mode &= !0o6000;
+        m.mode = chown_clear_mode(m.mode);
     } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
         let mut m = d.meta.lock();
         if uid != u32::MAX { m.uid = uid; }
         if gid != u32::MAX { m.gid = gid; }
-        m.mode &= !0o6000;
+        m.mode = chown_clear_mode(m.mode);
     }
 }
 
