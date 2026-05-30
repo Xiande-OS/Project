@@ -212,6 +212,22 @@ impl MemorySet {
         self.page_table.translate(va)
     }
 
+    /// The declared VmArea permission covering `va`, if any. Used by the
+    /// kernel's copy_in/copy_out to honor a region's *declared* protection
+    /// even when the hardware page is mapped more permissively. In
+    /// particular a mmap(PROT_NONE) guard page (perm == U only, no R/W) is
+    /// mapped R|W at the PTE level so the owning process's reserve-then-write
+    /// pattern works — but a syscall handed such an address must still fail
+    /// with EFAULT, which LTP's tst_get_bad_addr relies on. Returns None if
+    /// no area covers the address (also a fault).
+    pub fn perm_at(&self, va: VirtAddr) -> Option<VmPerm> {
+        let vpn = va.floor();
+        self.areas
+            .iter()
+            .find(|a| a.contains(vpn))
+            .map(|a| a.perm)
+    }
+
     /// Real munmap: unmap every page in `[va, va+len)`. If a VmArea is
     /// fully covered, drop it (and all its frames). If partially covered,
     /// shrink or split it. PTEs in the range are cleared and the local TLB

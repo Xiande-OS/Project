@@ -170,6 +170,16 @@ pub fn copy_in_via(ms: &MemorySet, va: usize, len: usize) -> Option<Vec<u8>> {
         let page_va = cursor & !(PAGE_SIZE - 1);
         let page_off = cursor & (PAGE_SIZE - 1);
         let chunk = core::cmp::min(PAGE_SIZE - page_off, end - cursor);
+        // Honor the declared region protection: a read from a PROT_NONE
+        // guard page (covered by an area with no R bit) is EFAULT, even
+        // though the page is mapped R|W at the PTE level. If a VmArea
+        // covers the page it must grant R; if none covers it we fall through
+        // to translate() (kernel-internal mappings have no VmArea).
+        if let Some(p) = ms.perm_at(VirtAddr(page_va)) {
+            if !p.contains(VmPerm::R) {
+                return None;
+            }
+        }
         let pa = ms.translate(VirtAddr(page_va))?;
         let src = unsafe {
             let ptr = crate::mm::PhysAddr(pa.0 + page_off).kernel_ptr::<u8>();
@@ -189,6 +199,18 @@ pub fn copy_out_via(ms: &MemorySet, va: usize, bytes: &[u8]) -> Option<()> {
         let page_va = cursor & !(PAGE_SIZE - 1);
         let page_off = cursor & (PAGE_SIZE - 1);
         let chunk = core::cmp::min(PAGE_SIZE - page_off, end - cursor);
+        // Honor the declared region protection: a write to a PROT_NONE
+        // (or read-only) area is EFAULT, which is what LTP's tst_get_bad_addr
+        // (a 1-byte PROT_NONE mmap) relies on for clock_gettime02, capget02,
+        // and the many other "bad pointer => EFAULT" subtests. The page may
+        // be mapped R|W at the PTE level (so the owning process's own
+        // reserve-then-write still works); we reject based on the *declared*
+        // VmArea perm. No covering area -> fall through to translate().
+        if let Some(p) = ms.perm_at(VirtAddr(page_va)) {
+            if !p.contains(VmPerm::W) {
+                return None;
+            }
+        }
         let pa = ms.translate(VirtAddr(page_va))?;
         let dst = unsafe {
             let ptr = crate::mm::PhysAddr(pa.0 + page_off).kernel_ptr::<u8>();
