@@ -34,6 +34,23 @@ impl TaskStorage {
         })
     }
 
+    /// Fallible kstack allocation. A fork/thread storm deep into the LTP run
+    /// can exhaust the kernel heap; clone must then fail with EAGAIN, never
+    /// trip the infallible `Box::new` and panic the whole kernel.
+    fn try_boxed() -> Option<Box<Self>> {
+        let layout = core::alloc::Layout::new::<Self>();
+        // SAFETY: layout has non-zero size (KSTACK_SIZE > 0). alloc_zeroed
+        // returns null on failure, which we surface as None.
+        unsafe {
+            let ptr = alloc::alloc::alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                None
+            } else {
+                Some(Box::from_raw(ptr))
+            }
+        }
+    }
+
     fn kstack_top(&self) -> usize {
         self.buf.as_ptr() as usize + KSTACK_SIZE
     }
@@ -887,13 +904,17 @@ pub fn clone_current(
     let pgid = parent.pgid.load(Ordering::Relaxed);
     let sid = parent.sid.load(Ordering::Relaxed);
 
+    // Allocate the 64 KiB kstack fallibly: a thread/fork storm (ebizzy spawns
+    // workers in a tight loop) can drain the kernel heap, and clone must then
+    // return EAGAIN to userspace rather than panic the kernel via Box::new.
+    let kstack = TaskStorage::try_boxed()?;
     let task = Arc::new(Task {
         pid,
         tgid: AtomicI32::new(tgid),
         ppid: AtomicI32::new(ppid),
         pgid: AtomicI32::new(pgid),
         sid: AtomicI32::new(sid),
-        storage: UnsafeCell::new(TaskStorage::boxed()),
+        storage: UnsafeCell::new(kstack),
         memory_set,
         fd_table,
         cwd,
