@@ -25,12 +25,19 @@ const KSTACK_SIZE: usize = 64 * 1024;
 #[repr(C, align(16))]
 struct TaskStorage {
     buf: [u8; KSTACK_SIZE],
+    /// loongarch64 vector-unit (FP/LSX/LASX) save slot. The kernel is
+    /// soft-float, so a preempted task's live vector registers must be
+    /// parked here while another task runs (see `fp_context_switch`).
+    #[cfg(target_arch = "loongarch64")]
+    fp: crate::arch::loongarch64::fpu::FpContext,
 }
 
 impl TaskStorage {
     fn boxed() -> Box<Self> {
         Box::new(Self {
             buf: [0u8; KSTACK_SIZE],
+            #[cfg(target_arch = "loongarch64")]
+            fp: crate::arch::loongarch64::fpu::FpContext::new(),
         })
     }
 
@@ -57,6 +64,11 @@ impl TaskStorage {
 
     fn tf_ptr(&self) -> *mut TrapFrame {
         (self.kstack_top() - size_of::<TrapFrame>()) as *mut TrapFrame
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    fn fp_ptr(&self) -> *mut crate::arch::loongarch64::fpu::FpContext {
+        &self.fp as *const _ as *mut _
     }
 }
 
@@ -134,6 +146,12 @@ impl Task {
 
     pub fn kstack_top(&self) -> usize {
         unsafe { (*self.storage.get()).kstack_top() }
+    }
+
+    /// loongarch64: pointer to this task's parked vector-unit state.
+    #[cfg(target_arch = "loongarch64")]
+    pub fn fp_ptr(&self) -> *mut crate::arch::loongarch64::fpu::FpContext {
+        unsafe { (*self.storage.get()).fp_ptr() }
     }
 
     pub fn copy_in_bytes(&self, va: usize, len: usize) -> Option<Vec<u8>> {
@@ -825,7 +843,12 @@ fn setup_initial_stack(
     let random_bytes = [0x42u8; 16];
     copy_out_via(ms, random_va, &random_bytes).expect("write AT_RANDOM");
 
-    let platform = b"riscv64\0";
+    // AT_PLATFORM: the ISA string the C library may use to expand
+    // $PLATFORM in library search paths. Match the running architecture.
+    #[cfg(target_arch = "riscv64")]
+    let platform = b"riscv64\0".as_slice();
+    #[cfg(target_arch = "loongarch64")]
+    let platform = b"loongarch\0".as_slice();
     sp -= platform.len();
     let platform_va = sp;
     copy_out_via(ms, platform_va, platform).expect("write platform");
@@ -854,6 +877,17 @@ fn setup_initial_stack(
 
     sp &= !0xfusize;
 
+    // AT_HWCAP: CPU feature bitmap the C library reads to pick ifunc
+    // variants of its hot routines (memcpy/memset/str*). loongarch64 la464
+    // (what QEMU's `virt` emulates) carries CPUCFG|LAM|UAL|FPU|LSX|LASX, so
+    // glibc resolves to the vector implementations — which the kernel now
+    // permits in userspace (EUEN.SXE/ASXE, see boot.S). riscv64 advertises
+    // nothing here, matching the prior behaviour.
+    #[cfg(target_arch = "riscv64")]
+    const AT_HWCAP: usize = 0;
+    #[cfg(target_arch = "loongarch64")]
+    const AT_HWCAP: usize = 0x3f; // CPUCFG|LAM|UAL|FPU|LSX|LASX
+
     let mut auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
     // AT_SYSINFO_EHDR: base of the vDSO ELF. glibc parses its program
     // headers + .eh_frame from here so pthread_cancel's forced unwind can
@@ -875,7 +909,7 @@ fn setup_initial_stack(
         (12, 0),
         (13, 0),
         (14, 0),
-        (16, 0),
+        (16, AT_HWCAP),
         (17, 100),
         (23, 0),
         (25, random_va),
@@ -1098,6 +1132,15 @@ pub fn clone_current(
         core::ptr::write(task.tf_ptr(), new_tf);
     }
 
+    // loongarch64: the child inherits the parent's vector-unit state. We're
+    // running in the parent's clone syscall and the kernel is soft-float, so
+    // the live registers still hold the parent's values — snapshot them into
+    // the child's slot so it resumes with the same FP/LSX/LASX context.
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        crate::arch::loongarch64::fpu::save(task.fp_ptr());
+    }
+
     // CLONE_CHILD_CLEARTID — remember addr so exit clears it + futex_wakes.
     if flags & CLONE_CHILD_CLEARTID != 0 {
         *task.clear_child_tid.lock() = ctid;
@@ -1253,7 +1296,43 @@ pub fn run_user_loop(task: &Arc<Task>) -> ! {
 
 /// Called by the trap handler. Decides which task to return through and
 /// switches satp + current_pid accordingly. Returns the TF to load.
+///
+/// On loongarch64 this wraps the scheduler proper so the vector register
+/// file (FP/LSX/LASX) follows the task switch. The kernel is soft-float and
+/// leaves the file untouched, so when `pick_*` hands the CPU to a different
+/// task we park the outgoing task's live registers and load the incoming
+/// one's — without this, two vector workloads silently corrupt each other.
+#[cfg(target_arch = "loongarch64")]
 pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
+    let from_pid = current_pid();
+    let next_tf = schedule_next_after_trap_inner(current_tf);
+    let to_pid = current_pid();
+    if to_pid != from_pid {
+        fp_context_switch(from_pid, to_pid);
+    }
+    next_tf
+}
+
+/// loongarch64: park `from`'s live vector registers and load `to`'s. Safe to
+/// call after the scheduler has returned (no task-table lock held); the
+/// hardware register file still holds `from`'s values because nothing in the
+/// kernel touches it.
+#[cfg(target_arch = "loongarch64")]
+fn fp_context_switch(from_pid: i32, to_pid: i32) {
+    if let Some(from) = task_by_pid(from_pid) {
+        unsafe { crate::arch::loongarch64::fpu::save(from.fp_ptr()) };
+    }
+    if let Some(to) = task_by_pid(to_pid) {
+        unsafe { crate::arch::loongarch64::fpu::restore(to.fp_ptr()) };
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
+    schedule_next_after_trap_inner(current_tf)
+}
+
+fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     // Push/pull whatever the network stack has been doing while user-mode
     // ran. Only wake socket-blocked tasks if poll actually made progress;
     // otherwise the same task (e.g. iperf3 -s on accept) re-Ready'd itself
