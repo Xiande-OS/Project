@@ -132,12 +132,6 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SETFSGID => sys_setfsid(false, a0 as u32),
         nr::SYS_GETRESUID => sys_getresid(true, a0, a1, a2),
         nr::SYS_GETRESGID => sys_getresid(false, a0, a1, a2),
-        // getgroups(158)/setgroups(159): permissive stub. We don't track
-        // supplementary groups, so getgroups reports none (return 0) and
-        // setgroups accepts any list (return 0). Without this, chmod05 and
-        // other tests that call setgroups() in setup() TBROK with ENOSYS.
-        158 => 0,
-        159 => 0,
         // klogctl(2): stub so busybox dmesg / klogd don't error with ENOSYS.
         // Returns 0 for all actions — including SYSLOG_ACTION_READ_ALL (type 3),
         // which dmesg uses by default — meaning "empty kernel ring buffer".
@@ -1520,11 +1514,24 @@ fn sys_signalfd4(fd: i32, mask_addr: usize, _sizemask: usize, flags: i32) -> isi
 
 // ---------- waitid ----------
 
-fn sys_waitid(idtype: i32, id: i32, infop: usize, _options: i32) -> isize {
+fn sys_waitid(idtype: i32, id: i32, infop: usize, options: i32) -> isize {
+    // The option set must be a subset of the defined flags and include at
+    // least one of WEXITED/WSTOPPED/WCONTINUED — waitid02 passes WNOHANG alone
+    // and expects EINVAL.
+    const WNOHANG: i32 = 1;
+    const WSTOPPED: i32 = 2;
+    const WEXITED: i32 = 4;
+    const WCONTINUED: i32 = 8;
+    const WNOWAIT: i32 = 0x0100_0000;
+    const VALID: i32 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT;
+    if options & !VALID != 0 || options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
+        return EINVAL;
+    }
     let pid_filter = match idtype {
-        0 => -1,
-        1 => id,
-        2 => -id,
+        0 => -1,              // P_ALL
+        1 if id > 0 => id,    // P_PID
+        2 if id >= 0 => -id,  // P_PGID
+        1 | 2 => return EINVAL,
         _ => return EINVAL,
     };
     let r = sys_wait4(pid_filter, 0, 0);
