@@ -147,6 +147,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SETPGID => sys_setpgid(a0 as i32, a1 as i32),
         nr::SYS_SETSID => sys_setsid(),
         nr::SYS_UNAME => sys_uname(a0),
+        nr::SYS_SETHOSTNAME => sys_sethostname(a0, a1 as i64),
+        nr::SYS_SETDOMAINNAME => sys_setdomainname(a0, a1 as i64),
         nr::SYS_GETRANDOM => sys_getrandom(a0, a1, a2),
         nr::SYS_MMAP => sys_mmap(a0, a1, a2 as i32, a3 as i32, a4 as i32, a5),
         nr::SYS_MUNMAP => sys_munmap(a0, a1),
