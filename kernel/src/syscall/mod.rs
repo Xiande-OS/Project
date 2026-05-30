@@ -802,6 +802,16 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
             if excl && create {
                 return -17; // EEXIST
             }
+            // O_DIRECTORY: the target must be a directory, else ENOTDIR. LTP's
+            // tst_rmdir probes each entry with open(O_DIRECTORY|O_NOFOLLOW) to
+            // decide directory-vs-file; if a regular file opened "successfully"
+            // here, cleanup would recurse into it, opendir() would ENOTDIR, and
+            // the whole temp tree would be left behind — leaking tmpfs memory
+            // across cases until the run OOMs. (O_TMPFILE, handled above, also
+            // sets these bits but never reaches here.)
+            if (flags & O_DIRECTORY) != 0 && i.kind() != FileType::Directory {
+                return -20; // ENOTDIR
+            }
             // Opening an existing directory for writing is EISDIR (creat06
             // creats a directory and expects EISDIR). A read-only open of a
             // directory stays valid (getdents).
