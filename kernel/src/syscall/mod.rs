@@ -3529,13 +3529,22 @@ pub fn sys_kill_current(status: i32) -> isize {
 ///         |CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID
 ///   a1=child_sp, a2=&tid (==ptid), a3=tls, a4=&tid (==ctid)
 fn sys_clone(flags: usize, child_sp: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
-    match crate::task::clone_current(flags, child_sp, ptid, ctid, tls) {
-        Some(new_task) => new_task.pid as isize,
-        // Out of physical memory during address-space copy. Return
-        // ENOMEM so userland's fork() fails gracefully instead of the
-        // kernel panicking and dropping every downstream test group.
-        None => -12, // ENOMEM
+    if let Some(new_task) = crate::task::clone_current(flags, child_sp, ptid, ctid, tls) {
+        return new_task.pid as isize;
     }
+    // Out of memory during the address-space copy. Before giving up, sweep
+    // orphaned zombies left by SIGKILLed fork-storms (their Task/MemorySet
+    // Arcs pin both kernel heap and frames) and retry once. This is what
+    // keeps a later fork-heavy case (cve-2017-17052, fork07) from failing —
+    // and ultimately from exhausting the heap and faulting the kernel — just
+    // because an earlier killed test's orphans were never collected.
+    crate::task::reap_orphan_zombies(crate::task::current_pid());
+    if let Some(new_task) = crate::task::clone_current(flags, child_sp, ptid, ctid, tls) {
+        return new_task.pid as isize;
+    }
+    // Still no memory: fail gracefully with ENOMEM so userland's fork()
+    // returns an error instead of the kernel panicking.
+    -12 // ENOMEM
 }
 
 /// clone3(struct clone_args *uargs, size_t size). glibc's pthread_create
