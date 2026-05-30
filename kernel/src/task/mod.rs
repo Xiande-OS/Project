@@ -321,16 +321,34 @@ pub fn reap_orphan_zombies(except: i32) {
         if pid == except || live.contains(&ppid) {
             continue; // self, or parent still alive (it may wait4 us)
         }
-        // Parent is gone. Reap only if this task really is a Zombie.
+        // Parent is gone (orphan). On a normal system init (pid 1) would
+        // reparent and eventually reap it; we have no real init, and the
+        // contest `sh` only wait4()s its own direct children, so an orphan
+        // left behind by a SIGKILLed fork-storm (fork07 forks until ENOMEM,
+        // cgroup_regression_fork_processes, ...) is never collected.
         if let Some(task) = task_by_pid(pid) {
-            let is_zombie = *task.state.lock() == TaskState::Zombie;
-            drop(task);
-            if is_zombie {
-                reap(pid);
-                n += 1;
-                if n >= 64 {
-                    break;
+            let st = *task.state.lock();
+            match st {
+                TaskState::Zombie => {
+                    // Already dead — just remove the slot.
+                    drop(task);
+                    reap(pid);
+                    n += 1;
                 }
+                _ => {
+                    // A still-running/blocked orphan: its test is already
+                    // dead, so terminate it now (SIGKILL semantics release
+                    // its frames + kstack) and reap on the next sweep. This
+                    // is what stops fork07's orphaned children from pinning
+                    // the frame pool and wedging every later case.
+                    crate::signal::kill_now(&task);
+                    drop(task);
+                    reap(pid);
+                    n += 1;
+                }
+            }
+            if n >= 64 {
+                break;
             }
         }
     }
@@ -1199,6 +1217,7 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
         //   - or there is provably nobody who could ever wake us, in
         //     which case panic with a state dump so the failure is
         //     visible instead of a silent hang.
+        let mut spin_ticks: u64 = 0;
         loop {
             {
         let now = crate::arch::now_ticks();
@@ -1209,6 +1228,23 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             if any_runnable_except(cur_pid) { break; }
             if let Some(t) = task_by_pid(cur_pid) {
                 if *t.state.lock() == TaskState::Ready { break; }
+            }
+            // Orphan drain: a SIGKILLed fork-storm (fork07 forks until ENOMEM)
+            // leaves orphaned children that may themselves be blocked in
+            // wait4 (Waiting) on grandchildren. With no real init to reap
+            // them, nobody ever wakes them — `any_waiting()` keeps this loop
+            // from declaring deadlock, yet none of them can make progress, so
+            // we livelock here forever (the fork07 hang). Periodically sweep:
+            // kill+reap orphans whose parent is gone. Once the orphan tree is
+            // drained the current task either gets its child reaped (wait4
+            // returns) or the table empties and the no-progress check fires.
+            spin_ticks = spin_ticks.wrapping_add(1);
+            if spin_ticks % 4096 == 0 {
+                reap_orphan_zombies(cur_pid);
+                if any_runnable_except(cur_pid) { break; }
+                if let Some(t) = task_by_pid(cur_pid) {
+                    if *t.state.lock() == TaskState::Ready { break; }
+                }
             }
             // No-progress check: are there any other live tasks at
             // all, and do any of them have a deadline that could
