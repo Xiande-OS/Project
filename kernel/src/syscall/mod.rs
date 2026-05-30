@@ -872,7 +872,7 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
             }
             match parent.create(&name, FileType::Regular) {
                 Ok(i) => {
-                    stamp_creator(&i);
+                    stamp_creator(&i, &parent);
                     i
                 }
                 Err(e) => return err_to_isize(e),
@@ -967,7 +967,6 @@ fn sys_mkdirat(dfd: i32, path: usize, mode: u32) -> isize {
     }
     match parent.create(&name, FileType::Directory) {
         Ok(inode) => {
-            stamp_creator(&inode);
             // Apply the requested mode (minus the standard 0o022 umask — we
             // don't track per-process umask; SYS_UMASK is a 0o022 stub and
             // the tests that care set umask(022) anyway). tmpfs create()
@@ -976,6 +975,9 @@ fn sys_mkdirat(dfd: i32, path: usize, mode: u32) -> isize {
             // (access01, mkdir09) never see the EACCES they expect.
             let m = mode & !0o022 & 0o7777;
             apply_mode(&inode, m);
+            // After the mode is set, stamp ownership and let a set-gid parent
+            // pass its group + set-gid bit down to the new directory.
+            stamp_creator(&inode, &parent);
             0
         }
         Err(e) => err_to_isize(e),
@@ -1020,7 +1022,7 @@ fn sys_mknodat(dirfd: i32, path: usize, mode: u32, _dev: u64) -> isize {
     }
     match parent.create(&name, FileType::Regular) {
         Ok(i) => {
-            stamp_creator(&i);
+            stamp_creator(&i, &parent);
             apply_mode(&i, mode & 0o7777);
             0
         }
@@ -3042,20 +3044,32 @@ fn chown_permitted(inode: &Arc<dyn Inode>, uid: u32, gid: u32) -> bool {
 /// by uid 0 and the owner could then neither chmod nor chgrp it. The contest
 /// itself runs as root (euid 0) so root-created files keep uid/gid 0 exactly
 /// as before — only dropped-privilege creators see their own identity.
-fn stamp_creator(inode: &Arc<dyn Inode>) {
+fn stamp_creator(inode: &Arc<dyn Inode>, parent: &Arc<dyn Inode>) {
     let c = creds_of(cur_tgid());
     let (euid, egid) = (c[1], c[3]);
-    if euid == 0 && egid == 0 {
-        return; // root: leave the default 0/0 untouched (no-op for the contest)
+    // POSIX: a new node's group is the parent directory's group when the
+    // parent is set-gid, otherwise the creator's effective gid; a new
+    // *directory* under a set-gid parent also inherits the set-gid bit
+    // (creat08 verifies this).
+    let (pmode, _, pgid) = inode_perm(parent);
+    let setgid_dir = (pmode & 0o2000) != 0;
+    let gid = if setgid_dir { pgid } else { egid };
+    // Fast path: root creating in an ordinary directory keeps the default
+    // 0/0 exactly as before (the contest runs as root).
+    if euid == 0 && gid == 0 && !setgid_dir {
+        return;
     }
     if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
         let mut m = f.meta.lock();
         m.uid = euid;
-        m.gid = egid;
+        m.gid = gid;
     } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
         let mut m = d.meta.lock();
         m.uid = euid;
-        m.gid = egid;
+        m.gid = gid;
+        if setgid_dir {
+            m.mode |= 0o2000; // a new directory inherits the parent's set-gid bit
+        }
     }
 }
 
