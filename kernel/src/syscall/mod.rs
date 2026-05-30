@@ -3858,6 +3858,39 @@ fn sys_clone3(uargs: usize, size: usize) -> isize {
     let stack = rd(40) as usize;
     let stack_size = rd(48) as usize;
     let tls = rd(56) as usize;
+    // clone3 argument validation (clone302). Real callers — glibc/musl
+    // pthread_create (VM|FS|FILES|SIGHAND|THREAD|SETTLS), fork (exit_signal
+    // SIGCHLD, no stack) and vfork (VM|VFORK) — all satisfy these, so only the
+    // invalid combinations the test probes are rejected.
+    {
+        const CLONE_VM: usize = 0x100;
+        const CLONE_FS: usize = 0x200;
+        const CLONE_SIGHAND: usize = 0x800;
+        const CLONE_THREAD: usize = 0x10000;
+        const CLONE_NEWNS: usize = 0x20000;
+        const CSIGNAL: usize = 0xff;
+        // A shared signal-handler table implies a shared address space; a
+        // thread implies a shared signal-handler table.
+        if (flags & CLONE_SIGHAND != 0) && (flags & CLONE_VM == 0) {
+            return -22;
+        }
+        if (flags & CLONE_THREAD != 0) && (flags & CLONE_SIGHAND == 0) {
+            return -22;
+        }
+        // A new mount namespace cannot share the caller's filesystem info.
+        if (flags & CLONE_FS != 0) && (flags & CLONE_NEWNS != 0) {
+            return -22;
+        }
+        // exit_signal must be a valid signal number (fits in CSIGNAL).
+        if exit_signal & !CSIGNAL != 0 {
+            return -22;
+        }
+        // stack and stack_size must be consistent: both zero (inherit) or
+        // both set.
+        if (stack == 0) != (stack_size == 0) {
+            return -22;
+        }
+    }
     let child_sp = if stack != 0 { stack + stack_size } else { 0 };
     // Fold the exit signal into the low byte so clone_current's SIGCHLD /
     // wait bookkeeping matches the clone() convention.
