@@ -1021,7 +1021,14 @@ pub fn execve_current_with_path(
     let task = current_task();
     let mut ms = MemorySet::try_new().ok_or(-12i32)?; // ENOMEM
     map_kernel_into(&mut ms);
-    let elf = crate::loader::load_elf(elf_image, &mut ms).map_err(|_| -22i32)?;
+    let elf = crate::loader::load_elf(elf_image, &mut ms).map_err(|e| {
+        // Frame-pool exhaustion must surface as ENOMEM, not EINVAL. Returning
+        // EINVAL made execve("./busybox") look like "Invalid argument" once a
+        // memory-hog case (data_space, etc.) drained the pool, and busybox
+        // failing to start collapsed the whole LTP loop (every later case
+        // 126 with an empty name). ENOMEM is correct and recoverable.
+        if e.starts_with("OOM") { -12i32 } else { -22i32 }
+    })?;
     let user_sp_top = setup_initial_stack(&elf, &mut ms, argv, envp);
     crate::signal::install_restorer_page(&mut ms);
     crate::vdso::install(&mut ms);
