@@ -22,6 +22,7 @@ pub const SYS_FCHMODAT: usize = 53;
 pub const SYS_FCHOWNAT: usize = 54;
 pub const SYS_FCHOWN: usize = 55;
 pub const SYS_CHDIR: usize = 49;
+pub const SYS_CHROOT: usize = 51;
 pub const SYS_OPENAT: usize = 56;
 pub const SYS_CLOSE: usize = 57;
 pub const SYS_PIPE2: usize = 59;

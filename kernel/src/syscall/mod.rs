@@ -76,6 +76,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_STATX => sys_statx(a0 as i32, a1, a2 as i32, a3 as u32, a4),
         nr::SYS_GETCWD => sys_getcwd(a0, a1),
         nr::SYS_CHDIR => sys_chdir(a0),
+        nr::SYS_CHROOT => sys_chroot(a0),
         nr::SYS_MOUNT => sys_mount(a0, a1, a2, a3, a4),
         nr::SYS_UMOUNT2 => sys_umount2(a0, a1 as i32),
         nr::SYS_FACCESSAT | nr::SYS_FACCESSAT2 => sys_faccessat(a0 as i32, a1, a2 as i32),
@@ -3578,6 +3579,43 @@ fn sys_chdir(path: usize) -> isize {
         normalize_path(&alloc::format!("{}/{}", cur, path_str))
     };
     *current_task().cwd.lock() = new_cwd;
+    0
+}
+
+/// chroot(path). We validate it the way Linux does and gate it on
+/// CAP_SYS_CHROOT (root). The check order matters and is what chroot01/03/04
+/// pin down: resolve the path (ENOTDIR/ENOENT/ELOOP/ENAMETOOLONG/EFAULT),
+/// require the target be a directory the caller can search (MAY_EXEC =>
+/// EACCES, e.g. a 0222 dir for `nobody`), and only then require privilege
+/// (EPERM for an unprivileged caller of an otherwise-valid directory). We do
+/// not implement a per-process root pivot, so the success path is a no-op
+/// return 0 — enough for the call itself; we don't relocate "/".
+fn sys_chroot(path: usize) -> isize {
+    let Some(p) = copy_path(path) else { return EFAULT };
+    if p.is_empty() {
+        return ENOENT;
+    }
+    // Search permission along the path prefix (matches resolution-time EACCES).
+    if let Err(e) = check_search_perm(AT_FDCWD, &p) {
+        return e;
+    }
+    // Resolve, preserving the precise errno.
+    let inode = match resolve_at_with_err(AT_FDCWD, &p) {
+        Ok(i) => i,
+        Err(e) => return e as isize,
+    };
+    // chroot target must be a directory.
+    if inode.kind() != FileType::Directory {
+        return -20; // ENOTDIR
+    }
+    // Need execute/search permission on the target itself (chroot04: 0222).
+    if !may_access(&inode, 0o1) {
+        return -13; // EACCES
+    }
+    // Finally, CAP_SYS_CHROOT — only root may chroot (chroot01: nobody).
+    if creds_of(cur_tgid())[1] != 0 {
+        return -1; // EPERM
+    }
     0
 }
 
