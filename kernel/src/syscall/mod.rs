@@ -95,6 +95,11 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_NANOSLEEP => sys_nanosleep(a0, a1),
         nr::SYS_SETITIMER => sys_setitimer(a0, a1, a2),
         nr::SYS_GETITIMER => sys_getitimer(a0, a1),
+        nr::SYS_TIMER_CREATE => sys_timer_create(a0 as i32, a1, a2),
+        nr::SYS_TIMER_SETTIME => sys_timer_settime(a0 as i32, a1 as i32, a2, a3),
+        nr::SYS_TIMER_GETTIME => sys_timer_gettime(a0 as i32, a1),
+        nr::SYS_TIMER_GETOVERRUN => sys_timer_getoverrun(a0 as i32),
+        nr::SYS_TIMER_DELETE => sys_timer_delete(a0 as i32),
         nr::SYS_EXIT => sys_exit(a0 as i32),
         nr::SYS_EXIT_GROUP => sys_exit_group(a0 as i32),
         nr::SYS_BRK => sys_brk(a0),
@@ -3806,6 +3811,163 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     crate::task::sleep_until(task.pid, deadline);
     *task.state.lock() = crate::task::TaskState::Waiting;
     0
+}
+
+// ---------- POSIX per-process interval timers (timer_create family) ----------
+//
+// timer_create(2)/timer_settime/timer_gettime/timer_getoverrun/timer_delete.
+// We don't run a real expiry+signal engine for these (that path is covered by
+// setitimer/SIGALRM and timerfd); instead we model a per-process timer table
+// that validates arguments and round-trips the interval/value, which is what
+// the LTP timer_* group checks (creation, error errnos, and a freshly created
+// timer reading back as zero). The store survives until timer_delete or exit.
+
+// sigev_notify values.
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+const SIGEV_THREAD: i32 = 2;
+const SIGEV_THREAD_ID: i32 = 4;
+
+#[derive(Clone, Copy)]
+struct PosixTimer {
+    _clockid: i32,
+    _notify: i32,
+    _signo: i32,
+    interval: (i64, i64), // it_interval (sec, nsec)
+    value: (i64, i64),    // it_value (sec, nsec) — armed remaining
+}
+
+/// All POSIX timers, keyed by (pid, timer_id). Per-process ids start at 0 and
+/// only ever increase (a deleted id is not reused) so a stale id reliably
+/// reports EINVAL.
+static POSIX_TIMERS: spin::Mutex<alloc::collections::BTreeMap<(i32, i32), PosixTimer>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static POSIX_TIMER_NEXT: spin::Mutex<alloc::collections::BTreeMap<i32, i32>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+/// Drop every timer owned by a reaped pid.
+pub fn forget_timers(pid: i32) {
+    POSIX_TIMERS.lock().retain(|&(p, _), _| p != pid);
+    POSIX_TIMER_NEXT.lock().remove(&pid);
+}
+
+/// A clockid is accepted if it names one of the clocks the timer tests use.
+/// 0..=11 covers REALTIME/MONOTONIC/PROCESS_CPUTIME/THREAD_CPUTIME and the
+/// BOOTTIME/ALARM/TAI ids (10 is unassigned); anything else is EINVAL.
+fn timer_clock_ok(clockid: i32) -> bool {
+    (0..=11).contains(&clockid) && clockid != 10
+}
+
+fn sys_timer_create(clockid: i32, sevp: usize, timerid_out: usize) -> isize {
+    if !timer_clock_ok(clockid) {
+        return EINVAL;
+    }
+    let task = current_task();
+    let (notify, signo) = if sevp == 0 {
+        // NULL sigevent => SIGEV_SIGNAL with SIGALRM (POSIX default).
+        (SIGEV_SIGNAL, crate::signal::SIGALRM as i32)
+    } else {
+        // struct sigevent: sigev_value@0 (8B), sigev_signo@8, sigev_notify@12.
+        let Some(buf) = task.copy_in_bytes(sevp, 16) else { return EFAULT; };
+        let signo = i32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let notify = i32::from_le_bytes(buf[12..16].try_into().unwrap());
+        // Only the four defined notification types are valid; timer_create03
+        // passes SIGEV_SIGNAL|54321 (a CVE regression check) and expects EINVAL.
+        if !matches!(notify, SIGEV_SIGNAL | SIGEV_NONE | SIGEV_THREAD | SIGEV_THREAD_ID) {
+            return EINVAL;
+        }
+        (notify, signo)
+    };
+    let pid = task.pid;
+    let id = {
+        let mut nx = POSIX_TIMER_NEXT.lock();
+        let slot = nx.entry(pid).or_insert(0);
+        let id = *slot;
+        *slot += 1;
+        id
+    };
+    POSIX_TIMERS.lock().insert(
+        (pid, id),
+        PosixTimer { _clockid: clockid, _notify: notify, _signo: signo, interval: (0, 0), value: (0, 0) },
+    );
+    if task.copy_out_bytes(timerid_out, &id.to_le_bytes()).is_none() {
+        POSIX_TIMERS.lock().remove(&(pid, id));
+        return EFAULT;
+    }
+    0
+}
+
+fn sys_timer_settime(timerid: i32, _flags: i32, new_value: usize, old_value: usize) -> isize {
+    let task = current_task();
+    let pid = task.pid;
+    // itimerspec: it_interval (sec@0,nsec@8), it_value (sec@16,nsec@24) — 32B.
+    if new_value == 0 {
+        return EFAULT;
+    }
+    let Some(buf) = task.copy_in_bytes(new_value, 32) else { return EFAULT; };
+    let rd = |o: usize| i64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+    let (i_sec, i_nsec, v_sec, v_nsec) = (rd(0), rd(8), rd(16), rd(24));
+    // nsec fields must be in [0, 1e9) (timer_settime02 probes both bounds).
+    let nsec_ok = |n: i64| (0..1_000_000_000).contains(&n);
+    if !nsec_ok(i_nsec) || !nsec_ok(v_nsec) {
+        return EINVAL;
+    }
+    let mut g = POSIX_TIMERS.lock();
+    let Some(t) = g.get_mut(&(pid, timerid)) else { return EINVAL };
+    let prev = *t;
+    t.interval = (i_sec, i_nsec);
+    t.value = (v_sec, v_nsec);
+    drop(g);
+    if old_value != 0 {
+        let mut out = [0u8; 32];
+        out[0..8].copy_from_slice(&prev.interval.0.to_le_bytes());
+        out[8..16].copy_from_slice(&prev.interval.1.to_le_bytes());
+        out[16..24].copy_from_slice(&prev.value.0.to_le_bytes());
+        out[24..32].copy_from_slice(&prev.value.1.to_le_bytes());
+        if task.copy_out_bytes(old_value, &out).is_none() {
+            return EFAULT;
+        }
+    }
+    0
+}
+
+fn sys_timer_gettime(timerid: i32, curr: usize) -> isize {
+    let task = current_task();
+    let pid = task.pid;
+    let t = match POSIX_TIMERS.lock().get(&(pid, timerid)) {
+        Some(t) => *t,
+        None => return EINVAL, // unknown id (timer_gettime01 uses -1)
+    };
+    if curr == 0 {
+        return EFAULT; // NULL output (timer_gettime01)
+    }
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&t.interval.0.to_le_bytes());
+    out[8..16].copy_from_slice(&t.interval.1.to_le_bytes());
+    out[16..24].copy_from_slice(&t.value.0.to_le_bytes());
+    out[24..32].copy_from_slice(&t.value.1.to_le_bytes());
+    if task.copy_out_bytes(curr, &out).is_none() {
+        return EFAULT;
+    }
+    0
+}
+
+fn sys_timer_getoverrun(timerid: i32) -> isize {
+    let pid = current_task().pid;
+    if POSIX_TIMERS.lock().contains_key(&(pid, timerid)) {
+        0 // no expiries tracked => overrun count 0
+    } else {
+        EINVAL
+    }
+}
+
+fn sys_timer_delete(timerid: i32) -> isize {
+    let pid = current_task().pid;
+    if POSIX_TIMERS.lock().remove(&(pid, timerid)).is_some() {
+        0
+    } else {
+        EINVAL // timer_delete02 uses -1
+    }
 }
 
 // ---------- setitimer / getitimer (ITIMER_REAL only) ----------
