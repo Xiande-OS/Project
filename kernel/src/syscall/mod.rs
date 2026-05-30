@@ -174,6 +174,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SCHED_GETPARAM | nr::SYS_SCHED_GETSCHEDULER => 0,
         nr::SYS_SCHED_SETSCHEDULER => 0,
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
+        nr::SYS_CLOCK_SETTIME => sys_clock_settime(a0, a1),
+        nr::SYS_CLOCK_ADJTIME => sys_clock_adjtime(a0, a1),
         nr::SYS_CLOCK_GETRES => sys_clock_getres(a0, a1),
         // clock_nanosleep: route to nanosleep. We ignore the clockid +
         // TIMER_ABSTIME flag; callers (musl pthread_cond_timedwait, etc.)
@@ -4069,7 +4071,8 @@ fn sys_getrusage(_who: i32, addr: usize) -> isize {
 fn sys_gettimeofday(tv: usize) -> isize {
     let mtime = crate::arch::now_ticks();
     let tv_val = Timeval {
-        sec: (mtime / 10_000_000) as i64,
+        sec: (mtime / 10_000_000) as i64
+            + WALL_OFFSET_SECS.load(core::sync::atomic::Ordering::Relaxed),
         usec: ((mtime % 10_000_000) / 10) as i64,
     };
     write_struct(tv, &tv_val)
@@ -4082,16 +4085,63 @@ fn sys_gettimeofday(tv: usize) -> isize {
 /// MAX_CLOCKS / MAX_CLOCKS+1 and requires EINVAL.
 const MAX_CLOCK_ID: usize = 11;
 
+/// Wall-clock (CLOCK_REALTIME) offset in seconds, settable via clock_settime/
+/// settimeofday. Monotonic time is the raw timer; realtime = timer + offset.
+/// LTP's clock_settime01 sets the realtime clock and reads it back.
+static WALL_OFFSET_SECS: core::sync::atomic::AtomicI64 =
+    core::sync::atomic::AtomicI64::new(0);
+
 fn sys_clock_gettime(clk: usize, ts: usize) -> isize {
     if clk > MAX_CLOCK_ID {
         return EINVAL;
     }
     let mtime = crate::arch::now_ticks();
+    let mut secs = (mtime / 10_000_000) as i64;
+    // CLOCK_REALTIME(0)/REALTIME_COARSE(5)/REALTIME_ALARM(8) carry the
+    // settable wall offset; the monotonic family does not.
+    if matches!(clk, 0 | 5 | 8) {
+        secs += WALL_OFFSET_SECS.load(core::sync::atomic::Ordering::Relaxed);
+    }
     let ts_val = Timespec {
-        sec: (mtime / 10_000_000) as i64,
+        sec: secs,
         nsec: ((mtime % 10_000_000) * 100) as i64,
     };
     write_struct(ts, &ts_val)
+}
+
+/// clock_settime(clockid, const struct timespec*): set the realtime clock.
+/// We store it as an offset from the raw timer. Only CLOCK_REALTIME is
+/// settable; others return EINVAL. Non-root gets EPERM (clock_settime01 as
+/// root expects success).
+fn sys_clock_settime(clk: usize, tp: usize) -> isize {
+    if clk != 0 {
+        // Only CLOCK_REALTIME may be set; settable-clock tests pass clk 0.
+        return EINVAL;
+    }
+    if creds_of(cur_tgid())[1] != 0 {
+        return EPERM;
+    }
+    let task = current_task();
+    let Some(bytes) = task.copy_in_bytes(tp, 16) else {
+        return EFAULT;
+    };
+    let target_sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let mtime = crate::arch::now_ticks();
+    let now_sec = (mtime / 10_000_000) as i64;
+    WALL_OFFSET_SECS.store(target_sec - now_sec, core::sync::atomic::Ordering::Relaxed);
+    0
+}
+
+/// clock_adjtime(clockid, struct timex*): same as adjtimex but with a leading
+/// clockid argument. glibc's adjtimex() routes through this on riscv64, so
+/// without it adjtimex01-03 + clock_adjtime01-02 all TBROK with ENOSYS.
+/// Delegate to sys_adjtimex on the timex pointer (a1); only CLOCK_REALTIME is
+/// adjustable.
+fn sys_clock_adjtime(clk: usize, tx: usize) -> isize {
+    if clk != 0 {
+        return EINVAL;
+    }
+    sys_adjtimex(tx)
 }
 
 fn sys_clock_getres(clk: usize, ts: usize) -> isize {
