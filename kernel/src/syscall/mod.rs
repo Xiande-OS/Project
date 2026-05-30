@@ -3920,7 +3920,17 @@ fn sys_gettimeofday(tv: usize) -> isize {
     write_struct(tv, &tv_val)
 }
 
-fn sys_clock_gettime(_clk: usize, ts: usize) -> isize {
+/// Highest POSIX clock id we accept (CLOCK_TAI = 11). A clk above this —
+/// including a negative id like -1 (CLOCK_ID_BOGUS), which sign-extends to a
+/// huge usize — is rejected with EINVAL, matching Linux. clock_getres01
+/// probes clock_getres(-1) and requires EINVAL; clock_gettime02 probes
+/// MAX_CLOCKS / MAX_CLOCKS+1 and requires EINVAL.
+const MAX_CLOCK_ID: usize = 11;
+
+fn sys_clock_gettime(clk: usize, ts: usize) -> isize {
+    if clk > MAX_CLOCK_ID {
+        return EINVAL;
+    }
     let mtime = crate::arch::now_ticks();
     let ts_val = Timespec {
         sec: (mtime / 10_000_000) as i64,
@@ -3929,7 +3939,10 @@ fn sys_clock_gettime(_clk: usize, ts: usize) -> isize {
     write_struct(ts, &ts_val)
 }
 
-fn sys_clock_getres(_clk: usize, ts: usize) -> isize {
+fn sys_clock_getres(clk: usize, ts: usize) -> isize {
+    if clk > MAX_CLOCK_ID {
+        return EINVAL;
+    }
     if ts == 0 {
         return 0;
     }
