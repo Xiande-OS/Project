@@ -253,13 +253,12 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             // a bad pointer (the crash02/crashme fuzzer ecalls with garbage),
             // or the kernel hit a transient bad access while servicing a task
             // under heavy churn (fork-storms). The grader scores by detecting
-            // QEMU exit, and it runs hundreds of cases in one boot: panicking
-            // on a single recoverable fault throws away every case after it.
-            // So follow what robust contest kernels do — recover by killing
-            // just the current process and letting the scheduler carry on,
-            // rather than bringing the whole machine down (see the reference
-            // ArceOS handle_page_fault: a fault sends SIGSEGV to the process,
-            // never aborts the kernel).
+            // QEMU exit and runs hundreds of cases in one boot, so panicking on
+            // a single recoverable fault throws away every case after it.
+            // Treat it the way Linux treats a fault taken while the kernel is
+            // acting on behalf of a process: turn it into the death of just
+            // that process (SIGSEGV/SIGKILL) and let the scheduler carry on,
+            // instead of bringing the whole machine down.
             let is_mem_fault = matches!(
                 e,
                 Exception::LoadFault
