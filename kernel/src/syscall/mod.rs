@@ -123,6 +123,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         // set*id family (setuid/setgid/setreuid/setregid/setresuid/setresgid):
         // track per-tgid creds and succeed. Were ENOSYS -> LTP setup TBROK.
         143 | 144 | 145 | 146 | 147 | 149 => sys_set_id(id, a0, a1, a2),
+        nr::SYS_SETFSUID => sys_setfsid(true, a0 as u32),
+        nr::SYS_SETFSGID => sys_setfsid(false, a0 as u32),
         // getgroups(158)/setgroups(159): permissive stub. We don't track
         // supplementary groups, so getgroups reports none (return 0) and
         // setgroups accepts any list (return 0). Without this, chmod05 and
@@ -2331,6 +2333,7 @@ pub fn current_euid() -> u32 {
 pub fn forget_creds(pid: i32) {
     CREDS.lock().remove(&pid);
     SAVED_IDS.lock().remove(&pid);
+    FS_IDS.lock().remove(&pid);
 }
 
 /// Saved set-uid / set-gid, kept beside CREDS (which stays [ruid,euid,rgid,egid]
@@ -2340,6 +2343,40 @@ static SAVED_IDS: spin::Mutex<alloc::collections::BTreeMap<i32, (u32, u32)>> =
 
 fn saved_ids_of(tgid: i32) -> (u32, u32) {
     SAVED_IDS.lock().get(&tgid).copied().unwrap_or((0, 0))
+}
+
+/// Filesystem uid/gid, used for file-access checks. They follow the effective
+/// ids until overridden by setfsuid/setfsgid; we only need the value to
+/// round-trip, so it is stored lazily and seeded from the effective id.
+static FS_IDS: spin::Mutex<alloc::collections::BTreeMap<i32, (u32, u32)>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+/// setfsuid(2)/setfsgid(2). Both always return the *previous* fs id and never
+/// fail; an unprivileged caller may only select one of its real/effective/
+/// saved/current-fs ids, and the special value -1 just queries.
+fn sys_setfsid(is_uid: bool, val: u32) -> isize {
+    let tgid = cur_tgid();
+    let c = creds_of(tgid);
+    let (suid, sgid) = saved_ids_of(tgid);
+    let mut g = FS_IDS.lock();
+    let entry = g.entry(tgid).or_insert((c[1], c[3]));
+    let (cur, real, eff, saved) = if is_uid {
+        (entry.0, c[0], c[1], suid)
+    } else {
+        (entry.1, c[2], c[3], sgid)
+    };
+    let prev = cur;
+    if val != u32::MAX {
+        let allowed = c[1] == 0 || val == real || val == eff || val == saved || val == cur;
+        if allowed {
+            if is_uid {
+                entry.0 = val;
+            } else {
+                entry.1 = val;
+            }
+        }
+    }
+    prev as isize
 }
 
 /// setuid(146)/setgid(144)/setreuid(145)/setregid(143)/setresuid(147)/
