@@ -317,10 +317,12 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 // bare `"$file"` invocation to wrap each case in its own
                 // `timeout` (this is exactly what LTP's own runltp does). A
                 // hung case now takes a real SIGKILL (ret 137) and the loop
-                // continues. 30s ~= LTP's own DEFAULT_TIMEOUT base, so normal
-                // cases finish well inside it; clusters of hung helpers (the
-                // cgroup_* tests) cost 30s instead of eating the whole budget,
-                // which is what lets the run reach hundreds of later cases.
+                // continues. The cap is 5s: normal cases finish in
+                // milliseconds, so the only thing it cuts short is a case
+                // already destined for SIGKILL (a hung helper or a fork-storm
+                // cluster). Keeping it tight is what lets the run reach
+                // hundreds more cases before the outer guest-time budget — the
+                // real limit — expires.
                 // Run each case via `setsid` so it leads its OWN session /
                 // process group. Several LTP cases broadcast to their process
                 // group with kill(0, sig) (e.g. the cpu-controller tests signal
