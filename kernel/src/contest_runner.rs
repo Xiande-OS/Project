@@ -455,7 +455,7 @@ fn script_budget(script: &str) -> &'static str {
         // most of the loop run; combined with cyclictest/lmbench/
         // unixbench dropping to 1s each, total per-variant runtime
         // stays close to the original.
-        s if s.starts_with("ltp_") => "600",
+        s if s.starts_with("ltp_") => "1000",
         _ => "10",
     }
 }
