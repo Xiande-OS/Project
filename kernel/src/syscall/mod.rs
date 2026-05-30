@@ -31,7 +31,9 @@ const O_TRUNC: i32 = 0o1000;
 const O_APPEND: i32 = 0o2000;
 const O_NONBLOCK: i32 = 0o4000;
 const O_DIRECTORY: i32 = 0o200000;
+const O_NOFOLLOW: i32 = 0o400000;
 const O_CLOEXEC: i32 = 0o2000000;
+const O_PATH: i32 = 0o10000000;
 
 pub fn dispatch(tf: &mut TrapFrame) {
     let id = tf.syscall_no();
@@ -815,6 +817,35 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
             Ok(fd) => fd as isize,
             Err(e) => err_to_isize(e),
         };
+    }
+
+    // O_NOFOLLOW: a trailing symlink must not be followed. With O_PATH this
+    // yields a handle to the symlink itself (readlinkat reads it via an empty
+    // path — readlinkat01); without O_PATH a trailing symlink is ELOOP. A
+    // non-symlink target (e.g. the common O_DIRECTORY|O_NOFOLLOW probe) falls
+    // through to the normal following resolver below.
+    if (flags & O_NOFOLLOW) != 0 && !create {
+        let start = if dfd == AT_FDCWD || path_str.starts_with('/') {
+            cwd_inode()
+        } else {
+            match current_task().fd_table.lock().get(dfd) {
+                Some(f) => f.inode.clone(),
+                None => return EBADF,
+            }
+        };
+        if let Ok(i) = crate::fs::lookup_path_nofollow(start, &path_str) {
+            if i.kind() == FileType::Symlink {
+                if (flags & O_PATH) == 0 {
+                    return -40; // ELOOP
+                }
+                // O_PATH handle: no read/write access, purely a reference.
+                let file = Arc::new(File::from_inode(i, false, false, false));
+                return match current_task().fd_table.lock().alloc(file, cloexec) {
+                    Ok(fd) => fd as isize,
+                    Err(e) => err_to_isize(e),
+                };
+            }
+        }
     }
 
     let inode = match resolve_at_with_err(dfd, &path_str) {
@@ -3571,6 +3602,12 @@ fn sys_faccessat(dfd: i32, path: usize, mode: i32) -> isize {
 
 fn sys_unlinkat(dfd: i32, path: usize, flag: i32) -> isize {
     const AT_REMOVEDIR: i32 = 0x200;
+    // AT_REMOVEDIR is the only valid flag; any other bit is EINVAL. unlinkat01
+    // passes flag=9999, which happens to include the AT_REMOVEDIR bit, so we
+    // must reject it before interpreting the call as rmdir.
+    if flag & !AT_REMOVEDIR != 0 {
+        return EINVAL;
+    }
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
@@ -5162,11 +5199,23 @@ fn sys_readlinkat(dfd: i32, path: usize, buf: usize, len: usize) -> isize {
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
-    // An empty path is ENOENT (readlink03).
-    if path_str.is_empty() {
-        return ENOENT;
-    }
-    let resolved: alloc::string::String = if path_str == "/proc/self/exe" {
+    let resolved: alloc::string::String = if path_str.is_empty() {
+        // An empty path operates on the file referred to by dirfd. Per Linux
+        // this only works when dirfd is itself a symlink (opened
+        // O_PATH|O_NOFOLLOW — readlinkat01); AT_FDCWD or any non-symlink fd is
+        // ENOENT (readlink03 passes AT_FDCWD and expects ENOENT).
+        if dfd == AT_FDCWD {
+            return ENOENT;
+        }
+        let Some(f) = task.fd_table.lock().get(dfd) else { return EBADF; };
+        if f.inode.kind() != crate::fs::FileType::Symlink {
+            return ENOENT;
+        }
+        match f.inode.readlink() {
+            Ok(t) => t,
+            Err(_) => return EINVAL,
+        }
+    } else if path_str == "/proc/self/exe" {
         task.exe_path.lock().clone()
     } else if path_str == "/proc/self/cwd" {
         task.cwd.lock().clone()
