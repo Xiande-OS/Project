@@ -3121,6 +3121,10 @@ fn apply_times(inode: &Arc<dyn Inode>, atime: Option<(i64, i64)>, mtime: Option<
 fn sys_fchmod(fd: i32, mode: u32) -> isize {
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
+    // Only the owner or root may change the mode (fchmod06 => EPERM).
+    if !chmod_permitted(&file.inode) {
+        return -1; // EPERM
+    }
     apply_mode(&file.inode, mode);
     0
 }
@@ -3151,6 +3155,10 @@ fn sys_fchmodat(dfd: i32, path: usize, mode: u32) -> isize {
 fn sys_fchown(fd: i32, uid: u32, gid: u32) -> isize {
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
+    // chown needs CAP_CHOWN / ownership (fchown04 => EPERM).
+    if !chown_permitted(&file.inode, uid, gid) {
+        return -1; // EPERM
+    }
     apply_owner(&file.inode, uid, gid);
     0
 }
