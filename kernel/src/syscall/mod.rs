@@ -4002,6 +4002,11 @@ fn sys_getsid(pid: i32) -> isize {
 }
 
 fn sys_setpgid(pid: i32, pgid: i32) -> isize {
+    use core::sync::atomic::Ordering::Relaxed;
+    // A negative pgid is always invalid (setpgid02 case 1).
+    if pgid < 0 {
+        return EINVAL;
+    }
     let me = current_task();
     let target = if pid == 0 {
         me.clone()
@@ -4011,18 +4016,26 @@ fn sys_setpgid(pid: i32, pgid: i32) -> isize {
             None => return -3, // ESRCH
         }
     };
-    // POSIX: target must be the caller or one of its children, must not
-    // be a session leader, and must be in the same session as the caller.
-    // We only enforce the basics; everything else is permissive.
-    if target.sid.load(core::sync::atomic::Ordering::Relaxed)
-        != me.sid.load(core::sync::atomic::Ordering::Relaxed)
-    {
+    // POSIX: the target must be the caller or one of its children — setpgid02
+    // passes the *parent's* pid and expects ESRCH.
+    if target.pid != me.pid && !me.children.lock().contains(&target.pid) {
+        return -3; // ESRCH
+    }
+    // The target must be in the caller's session.
+    let my_sid = me.sid.load(Relaxed);
+    if target.sid.load(Relaxed) != my_sid {
         return -1; // EPERM
     }
     let new_pgid = if pgid == 0 { target.pid } else { pgid };
-    target
-        .pgid
-        .store(new_pgid, core::sync::atomic::Ordering::Relaxed);
+    // Joining an existing group (pgid != target's own pid) requires that group
+    // to exist in this session; otherwise EPERM (setpgid02 case 3).
+    if new_pgid != target.pid {
+        match crate::task::task_by_pid(new_pgid) {
+            Some(leader) if leader.sid.load(Relaxed) == my_sid => {}
+            _ => return -1, // EPERM
+        }
+    }
+    target.pgid.store(new_pgid, Relaxed);
     0
 }
 
