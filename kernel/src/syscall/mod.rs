@@ -4961,15 +4961,15 @@ fn sys_symlinkat(target: usize, new_dfd: i32, linkpath: usize) -> isize {
     }
 }
 
-fn sys_readlinkat(_dfd: i32, path: usize, buf: usize, len: usize) -> isize {
+fn sys_readlinkat(dfd: i32, path: usize, buf: usize, len: usize) -> isize {
     let task = current_task();
-    let Some(path_bytes) = task.copy_in_bytes(path, 256) else {
+    let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
-    let path_str = match cstr_to_str(&path_bytes) {
-        Some(s) => s,
-        None => return EINVAL,
-    };
+    // An empty path is ENOENT (readlink03).
+    if path_str.is_empty() {
+        return ENOENT;
+    }
     let resolved: alloc::string::String = if path_str == "/proc/self/exe" {
         task.exe_path.lock().clone()
     } else if path_str == "/proc/self/cwd" {
@@ -4987,16 +4987,38 @@ fn sys_readlinkat(_dfd: i32, path: usize, buf: usize, len: usize) -> isize {
             } else { return ENOENT; }
         } else { return ENOENT; }
     } else {
-        // General symlink: look up without following the final hop.
-        match crate::fs::lookup_path_nofollow(crate::fs::root(), path_str) {
-            Ok(i) if i.kind() == crate::fs::FileType::Symlink => match i.readlink() {
-                Ok(t) => t,
-                Err(_) => return EINVAL,
-            },
-            Ok(_) => return EINVAL,
-            Err(_) => return ENOENT,
+        // A non-searchable directory in the prefix => EACCES.
+        if let Err(e) = check_search_perm(dfd, &path_str) {
+            return e;
+        }
+        // Resolve relative to dfd WITHOUT following the final component
+        // (readlink reads the link itself), preserving the precise errno
+        // (ENOTDIR/ENOENT/ELOOP/ENAMETOOLONG).
+        let start = if dfd == AT_FDCWD || path_str.starts_with('/') {
+            cwd_inode()
+        } else {
+            match task.fd_table.lock().get(dfd) {
+                Some(f) => f.inode.clone(),
+                None => return EBADF,
+            }
+        };
+        match crate::fs::lookup_path_nofollow(start, &path_str) {
+            Ok(i) => {
+                if i.kind() != crate::fs::FileType::Symlink {
+                    return EINVAL; // not a symbolic link
+                }
+                match i.readlink() {
+                    Ok(t) => t,
+                    Err(_) => return EINVAL,
+                }
+            }
+            Err(e) => return e as isize,
         }
     };
+    // readlink requires a positive buffer size.
+    if len == 0 {
+        return EINVAL;
+    }
     if resolved.is_empty() {
         return ENOENT;
     }
