@@ -1442,6 +1442,47 @@ fn ranges_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
+/// Remove `[start,end)` from `pid`'s locks, splitting ranges that only
+/// partially overlap so the untouched portions survive (POSIX partial
+/// unlock / re-lock). fcntl19 locks a span, unlocks the middle, and expects
+/// F_GETLK to still report the trailing fragment.
+fn clear_pid_range(v: &mut alloc::vec::Vec<LockRange>, pid: i32, start: u64, end: u64) {
+    let mut out = alloc::vec::Vec::new();
+    for r in v.drain(..) {
+        if r.pid != pid || !ranges_overlap((r.start, r.end), (start, end)) {
+            out.push(r);
+            continue;
+        }
+        if r.start < start {
+            out.push(LockRange { start: r.start, end: start, excl: r.excl, pid });
+        }
+        if r.end > end {
+            out.push(LockRange { start: end, end: r.end, excl: r.excl, pid });
+        }
+    }
+    *v = out;
+}
+
+/// Coalesce a process's adjacent/overlapping same-type ranges into one, so
+/// F_GETLK reports a single merged region with the exact length the tests
+/// check.
+fn coalesce_pid(v: &mut alloc::vec::Vec<LockRange>, pid: i32) {
+    let mut mine: alloc::vec::Vec<LockRange> = v.iter().filter(|r| r.pid == pid).copied().collect();
+    v.retain(|r| r.pid != pid);
+    mine.sort_by_key(|r| (r.excl, r.start));
+    let mut merged: alloc::vec::Vec<LockRange> = alloc::vec::Vec::new();
+    for r in mine {
+        if let Some(last) = merged.last_mut() {
+            if last.excl == r.excl && r.start <= last.end {
+                last.end = last.end.max(r.end);
+                continue;
+            }
+        }
+        merged.push(r);
+    }
+    v.extend(merged);
+}
+
 fn fcntl_setlk(file: &Arc<crate::fs::File>, flock: &Flock, wait: bool) -> isize {
     let key = Arc::as_ptr(&file.inode) as *const () as usize;
     let size = file.inode.size();
@@ -1452,22 +1493,29 @@ fn fcntl_setlk(file: &Arc<crate::fs::File>, flock: &Flock, wait: bool) -> isize 
     let mut table = FLOCK_RANGES.lock();
     let v = table.entry(key).or_default();
 
+    // F_UNLCK (2): drop the caller's coverage of the range, splitting partials.
     if flock.l_type == 2 {
-        v.retain(|r| !(r.pid == pid && ranges_overlap((r.start, r.end), (start, end))));
+        clear_pid_range(v, pid, start, end);
         if v.is_empty() { table.remove(&key); }
         return 0;
     }
 
+    // A new lock conflicts only with *other* processes' locks: a write lock
+    // conflicts with anything, a read lock only with a write lock.
     let excl = flock.l_type == 1;
     for r in v.iter() {
         if r.pid == pid { continue; }
         if !ranges_overlap((r.start, r.end), (start, end)) { continue; }
         if excl || r.excl {
-            if wait { return -4; }
-            return -11;
+            if wait { return -4; } // EINTR sentinel: we don't block, report retry
+            return -11; // EAGAIN
         }
     }
+    // Replace the caller's own coverage in this range, then add the new lock
+    // and merge with adjacent same-type fragments (POSIX lock replacement).
+    clear_pid_range(v, pid, start, end);
     v.push(LockRange { start, end, excl, pid });
+    coalesce_pid(v, pid);
     0
 }
 
@@ -1479,22 +1527,42 @@ fn fcntl_getlk(file: &Arc<crate::fs::File>, flock_in: &Flock) -> Flock {
     let mut out = *flock_in;
     let table = FLOCK_RANGES.lock();
     let want_excl = flock_in.l_type == 1;
+    // Report the conflicting lock with the lowest start (POSIX: F_GETLK
+    // returns the first lock that would prevent the probe), ignoring the
+    // caller's own locks.
+    let mut best: Option<&LockRange> = None;
     if let Some(v) = table.get(&key) {
         for r in v {
             if r.pid == me_pid { continue; }
             if !ranges_overlap((r.start, r.end), (start, end)) { continue; }
-            if want_excl || r.excl {
-                out.l_type = if r.excl { 1 } else { 0 };
-                out.l_whence = 0;
-                out.l_start = r.start as i64;
-                out.l_len = if r.end == u64::MAX { 0 } else { (r.end - r.start) as i64 };
-                out.l_pid = r.pid;
-                return out;
+            if !(want_excl || r.excl) { continue; }
+            if best.map_or(true, |b| r.start < b.start) {
+                best = Some(r);
             }
         }
     }
+    if let Some(r) = best {
+        out.l_type = if r.excl { 1 } else { 0 };
+        out.l_whence = 0;
+        out.l_start = r.start as i64;
+        out.l_len = if r.end == u64::MAX { 0 } else { (r.end - r.start) as i64 };
+        out.l_pid = r.pid;
+        return out;
+    }
     out.l_type = 2;
     out
+}
+
+/// Drop every record lock owned by `pid`. POSIX releases a process's locks
+/// when it exits; without this, a dead process's ranges keep blocking later
+/// lockers and pile up across a long run (fcntl15 reuses one file across
+/// fork/dup/open subtests and wedges on a stale child's lock otherwise).
+fn release_record_locks(pid: i32) {
+    let mut table = FLOCK_RANGES.lock();
+    table.retain(|_, v| {
+        v.retain(|r| r.pid != pid);
+        !v.is_empty()
+    });
 }
 
 // ---------- flock (advisory, per-inode) ----------
@@ -3669,6 +3737,9 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
 
     // Drop ourselves from any futex queue.
     crate::sync::futex::forget_task(task.pid);
+
+    // Release any POSIX record (fcntl) locks this process held.
+    release_record_locks(task.pid);
 
     // Drop any stale SLEEPING_UNTIL entry. The deadline-keeps-after-expiry
     // policy in wake_expired_sleepers means a nanosleep'd thread can leave a
