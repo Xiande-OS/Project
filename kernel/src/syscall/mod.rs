@@ -741,6 +741,17 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
             if excl && create {
                 return -17; // EEXIST
             }
+            // Permission check on an existing file: opening for read needs R,
+            // for write needs W. Root bypasses (may_access handles euid 0).
+            // Directories may always be opened O_RDONLY (for getdents).
+            if i.kind() != FileType::Directory {
+                let mut want = 0u32;
+                if readable { want |= 0o4; }
+                if writable { want |= 0o2; }
+                if want != 0 && !may_access(&i, want) {
+                    return -13; // EACCES
+                }
+            }
             if trunc {
                 let _ = i.truncate(0);
             }
@@ -753,6 +764,11 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
             let Some((parent, name)) = resolve_at_parent(dfd, &path_str) else {
                 return ENOENT;
             };
+            // Creating a file requires write permission on the parent
+            // directory — creat04 drops to nobody and expects EACCES here.
+            if !may_access(&parent, 0o2) {
+                return -13; // EACCES
+            }
             match parent.create(&name, FileType::Regular) {
                 Ok(i) => i,
                 Err(e) => return err_to_isize(e),
@@ -2846,6 +2862,32 @@ fn inode_perm(inode: &Arc<dyn Inode>) -> (u32, u32, u32) {
         };
         (def, 0, 0)
     }
+}
+
+/// Permission check for the *effective* uid/gid (used by open/creat/mkdir,
+/// which check eUID — unlike access(2), which checks the real uid). `want` is
+/// a bitmask of 0o4=read, 0o2=write, 0o1=execute/search. Returns true if
+/// granted. Root (euid 0) is always granted R/W, and X if any exec bit is set
+/// — matching Linux, and keeping the contest (which runs as root) unaffected;
+/// only a test that drops privilege with setuid/seteuid(nobody) sees denials.
+fn may_access(inode: &Arc<dyn Inode>, want: u32) -> bool {
+    let (fmode, fuid, fgid) = inode_perm(inode);
+    let creds = creds_of(cur_tgid());
+    let (euid, egid) = (creds[1], creds[3]);
+    let granted = if euid == 0 {
+        let mut g = 0o6;
+        if fmode & 0o111 != 0 {
+            g |= 0o1;
+        }
+        g
+    } else if euid == fuid {
+        (fmode >> 6) & 0o7
+    } else if egid == fgid {
+        (fmode >> 3) & 0o7
+    } else {
+        fmode & 0o7
+    };
+    want & !granted == 0
 }
 
 fn sys_faccessat(dfd: i32, path: usize, mode: i32) -> isize {
