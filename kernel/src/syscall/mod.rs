@@ -178,6 +178,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SCHED_SETAFFINITY => 0,
         nr::SYS_SCHED_GETPARAM | nr::SYS_SCHED_GETSCHEDULER => 0,
         nr::SYS_SCHED_SETSCHEDULER => 0,
+        nr::SYS_SETPRIORITY => sys_setpriority(a0 as i32, a1 as i32, a2 as i32),
+        nr::SYS_GETPRIORITY => sys_getpriority(a0 as i32, a1 as i32),
         nr::SYS_CLOCK_GETTIME => sys_clock_gettime(a0, a1),
         nr::SYS_CLOCK_SETTIME => sys_clock_settime(a0, a1),
         nr::SYS_CLOCK_ADJTIME => sys_clock_adjtime(a0, a1),
@@ -2510,6 +2512,91 @@ fn sys_getrlimit(resource: u32, buf: usize) -> isize {
 
 fn sys_setrlimit(resource: u32, buf: usize) -> isize {
     sys_prlimit64(0, resource, buf, 0)
+}
+
+const PRIO_PROCESS: i32 = 0;
+const PRIO_PGRP: i32 = 1;
+const PRIO_USER: i32 = 2;
+
+/// Nice values set via setpriority(2), keyed by (which, who). We don't run a
+/// priority scheduler, but the values must round-trip for getpriority(2).
+static NICE_VALUES: spin::Mutex<alloc::collections::BTreeMap<(i32, i32), i32>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+/// Normalise `who == 0` ("the calling process/group/user") to a concrete id so
+/// a set/get pair keyed by it agrees regardless of which form the caller used.
+fn prio_key_who(which: i32, who: i32) -> i32 {
+    if who != 0 {
+        return who;
+    }
+    let t = current_task();
+    match which {
+        PRIO_PROCESS => t.pid,
+        PRIO_PGRP => t.pgid.load(core::sync::atomic::Ordering::Relaxed),
+        PRIO_USER => current_euid() as i32,
+        _ => who,
+    }
+}
+
+/// setpriority(which, who, prio). Validates `which`, rejects a negative target
+/// id (and an unknown pid for PRIO_PROCESS) with ESRCH, and enforces the
+/// unprivileged-caller rules: you can't lower the nice value of your own
+/// process without privilege (EACCES), nor touch a process owned by another
+/// user (EPERM). The clamped nice value is then stored for getpriority.
+fn sys_setpriority(which: i32, who: i32, prio: i32) -> isize {
+    if which < PRIO_PROCESS || which > PRIO_USER {
+        return EINVAL;
+    }
+    if who < 0 {
+        return -3; // ESRCH
+    }
+    let euid = current_euid();
+    if which == PRIO_PROCESS && who > 0 {
+        // A specific other process: it must exist, and a non-root caller may
+        // only adjust a process it owns.
+        match crate::task::task_by_pid(who) {
+            None => return -3, // ESRCH
+            Some(t) => {
+                if euid != 0 {
+                    let owner = creds_of(t.tgid.load(core::sync::atomic::Ordering::Relaxed))[1];
+                    if owner != euid {
+                        return -1; // EPERM
+                    }
+                }
+            }
+        }
+    }
+    // Linux clamps the requested nice into [-20, 19].
+    let nice = prio.clamp(-20, 19);
+    let key = (which, prio_key_who(which, who));
+    if euid != 0 {
+        // Unprivileged: lowering the nice value (raising priority) below the
+        // current setting requires CAP_SYS_NICE -> EACCES.
+        let cur = NICE_VALUES.lock().get(&key).copied().unwrap_or(0);
+        if nice < cur {
+            return -13; // EACCES
+        }
+    }
+    NICE_VALUES.lock().insert(key, nice);
+    0
+}
+
+/// getpriority(which, who). The raw syscall returns `20 - nice` so the value is
+/// always positive (glibc converts it back); errors are the usual negative
+/// errnos. Validates `which` (EINVAL) and a negative target id (ESRCH).
+fn sys_getpriority(which: i32, who: i32) -> isize {
+    if which < PRIO_PROCESS || which > PRIO_USER {
+        return EINVAL;
+    }
+    if who < 0 {
+        return -3; // ESRCH
+    }
+    if which == PRIO_PROCESS && who > 0 && crate::task::task_by_pid(who).is_none() {
+        return -3; // ESRCH
+    }
+    let key = (which, prio_key_who(which, who));
+    let nice = NICE_VALUES.lock().get(&key).copied().unwrap_or(0);
+    (20 - nice) as isize
 }
 
 fn sys_truncate(path: usize, length: u64) -> isize {
