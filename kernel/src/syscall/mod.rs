@@ -2330,28 +2330,149 @@ pub fn current_euid() -> u32 {
 }
 pub fn forget_creds(pid: i32) {
     CREDS.lock().remove(&pid);
+    SAVED_IDS.lock().remove(&pid);
+}
+
+/// Saved set-uid / set-gid, kept beside CREDS (which stays [ruid,euid,rgid,egid]
+/// so its many readers are unchanged). Default root, like CREDS.
+static SAVED_IDS: spin::Mutex<alloc::collections::BTreeMap<i32, (u32, u32)>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+fn saved_ids_of(tgid: i32) -> (u32, u32) {
+    SAVED_IDS.lock().get(&tgid).copied().unwrap_or((0, 0))
 }
 
 /// setuid(146)/setgid(144)/setreuid(145)/setregid(143)/setresuid(147)/
 /// setresgid(149). glibc's seteuid/setegid route through setresuid/setresgid.
-fn sys_set_id(nr: usize, a0: usize, a1: usize, _a2: usize) -> isize {
+///
+/// A privileged caller (euid 0) may set any id. An unprivileged caller is held
+/// to POSIX: the real id may only become the current real or effective id, and
+/// the effective id only the current real, effective or saved id; setres*id
+/// requires each specified id to already be one of those three. A disallowed
+/// change fails with EPERM and leaves every id untouched.
+fn sys_set_id(nr: usize, a0: usize, a1: usize, a2: usize) -> isize {
+    const M1: u32 = u32::MAX; // the -1 "leave unchanged" sentinel
     let tgid = cur_tgid();
-    let mut g = CREDS.lock();
-    let c = g.entry(tgid).or_insert([0, 0, 0, 0]);
-    let set = |slot: &mut u32, v: usize| {
-        if v as u32 != u32::MAX {
-            *slot = v as u32;
-        }
-    };
+    let mut c = creds_of(tgid); // [ruid, euid, rgid, egid]
+    let (mut suid, mut sgid) = saved_ids_of(tgid);
+    // The effective uid governs both CAP_SETUID and CAP_SETGID here.
+    let privileged = c[1] == 0;
+    let (a0, a1, a2) = (a0 as u32, a1 as u32, a2 as u32);
     match nr {
-        146 => { c[0] = a0 as u32; c[1] = a0 as u32; } // setuid  -> real+eff uid
-        144 => { c[2] = a0 as u32; c[3] = a0 as u32; } // setgid  -> real+eff gid
-        145 => { set(&mut c[0], a0); set(&mut c[1], a1); } // setreuid
-        143 => { set(&mut c[2], a0); set(&mut c[3], a1); } // setregid
-        147 => { set(&mut c[0], a0); set(&mut c[1], a1); } // setresuid (saved ignored)
-        149 => { set(&mut c[2], a0); set(&mut c[3], a1); } // setresgid
+        146 => {
+            // setuid(uid)
+            if privileged {
+                c[0] = a0;
+                c[1] = a0;
+                suid = a0;
+            } else if a0 == c[0] || a0 == suid {
+                c[1] = a0; // only the effective uid changes
+            } else {
+                return EPERM;
+            }
+        }
+        144 => {
+            // setgid(gid)
+            if privileged {
+                c[2] = a0;
+                c[3] = a0;
+                sgid = a0;
+            } else if a0 == c[2] || a0 == sgid {
+                c[3] = a0;
+            } else {
+                return EPERM;
+            }
+        }
+        145 => {
+            // setreuid(ruid, euid)
+            let old_ruid = c[0];
+            if !privileged {
+                if a0 != M1 && a0 != c[0] && a0 != c[1] {
+                    return EPERM;
+                }
+                if a1 != M1 && a1 != c[0] && a1 != c[1] && a1 != suid {
+                    return EPERM;
+                }
+            }
+            if a0 != M1 {
+                c[0] = a0;
+            }
+            if a1 != M1 {
+                c[1] = a1;
+            }
+            // The saved uid tracks the new euid whenever the real uid is set or
+            // the euid is set to a value other than the previous real uid.
+            if a0 != M1 || (a1 != M1 && a1 != old_ruid) {
+                suid = c[1];
+            }
+        }
+        143 => {
+            // setregid(rgid, egid)
+            let old_rgid = c[2];
+            if !privileged {
+                if a0 != M1 && a0 != c[2] && a0 != c[3] {
+                    return EPERM;
+                }
+                if a1 != M1 && a1 != c[2] && a1 != c[3] && a1 != sgid {
+                    return EPERM;
+                }
+            }
+            if a0 != M1 {
+                c[2] = a0;
+            }
+            if a1 != M1 {
+                c[3] = a1;
+            }
+            if a0 != M1 || (a1 != M1 && a1 != old_rgid) {
+                sgid = c[3];
+            }
+        }
+        147 => {
+            // setresuid(ruid, euid, suid)
+            if !privileged {
+                let ok = |v: u32| v == c[0] || v == c[1] || v == suid;
+                if (a0 != M1 && !ok(a0))
+                    || (a1 != M1 && !ok(a1))
+                    || (a2 != M1 && !ok(a2))
+                {
+                    return EPERM;
+                }
+            }
+            if a0 != M1 {
+                c[0] = a0;
+            }
+            if a1 != M1 {
+                c[1] = a1;
+            }
+            if a2 != M1 {
+                suid = a2;
+            }
+        }
+        149 => {
+            // setresgid(rgid, egid, sgid)
+            if !privileged {
+                let ok = |v: u32| v == c[2] || v == c[3] || v == sgid;
+                if (a0 != M1 && !ok(a0))
+                    || (a1 != M1 && !ok(a1))
+                    || (a2 != M1 && !ok(a2))
+                {
+                    return EPERM;
+                }
+            }
+            if a0 != M1 {
+                c[2] = a0;
+            }
+            if a1 != M1 {
+                c[3] = a1;
+            }
+            if a2 != M1 {
+                sgid = a2;
+            }
+        }
         _ => {}
     }
+    CREDS.lock().insert(tgid, c);
+    SAVED_IDS.lock().insert(tgid, (suid, sgid));
     0
 }
 
