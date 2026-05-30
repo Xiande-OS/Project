@@ -217,6 +217,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_CLONE => sys_clone(a0, a1, a2, a3, a4),
         nr::SYS_CLONE3 => sys_clone3(a0, a1),
         nr::SYS_EXECVE => sys_execve(a0, a1, a2),
+        nr::SYS_EXECVEAT => sys_execveat(a0 as i32, a1, a2, a3, a4 as i32),
         nr::SYS_WAIT4 => sys_wait4(a0 as i32, a1, a2 as i32),
         nr::SYS_WAITID => sys_waitid(a0 as i32, a1 as i32, a2, a3 as i32),
         nr::SYS_MQ_OPEN => sys_mq_open(a0, a1 as i32, a2 as u32, a3),
@@ -4238,6 +4239,19 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
         Ok(i) => i,
         Err(_) => return ENOENT,
     };
+    exec_resolved(inode, path, argv, envp)
+}
+
+/// Shared tail of execve / execveat: given the already-resolved program inode
+/// and a display path, load it (ELF, or a `#!`/shebang-less script) and
+/// replace the current image. Kept identical to the original execve body so
+/// the (critical, used-by-everything) exec path is unchanged.
+fn exec_resolved(
+    inode: Arc<dyn Inode>,
+    path: String,
+    argv: alloc::vec::Vec<String>,
+    envp: alloc::vec::Vec<String>,
+) -> isize {
     if inode.kind() != FileType::Regular {
         return -13; // EACCES
     }
@@ -4320,6 +4334,60 @@ fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
     }
+}
+
+/// execveat(dirfd, pathname, argv, envp, flags). Like execve but the program
+/// is named relative to `dirfd` (or, with AT_EMPTY_PATH and an empty pathname,
+/// `dirfd` *is* the program — fexecve). AT_SYMLINK_NOFOLLOW makes a symlinked
+/// target fail with ELOOP. Resolution errors (ENOTDIR/ENOENT/...) survive.
+fn sys_execveat(dirfd: i32, path_addr: usize, argv_addr: usize, envp_addr: usize, flags: i32) -> isize {
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return EINVAL;
+    }
+    let Some(path) = copy_path(path_addr) else { return EFAULT };
+    let argv = read_string_array(argv_addr).unwrap_or_default();
+    let envp = read_string_array(envp_addr).unwrap_or_default();
+    let task = current_task();
+
+    if path.is_empty() {
+        // Empty pathname: execute dirfd itself, but only with AT_EMPTY_PATH.
+        if flags & AT_EMPTY_PATH == 0 {
+            return ENOENT;
+        }
+        let Some(f) = task.fd_table.lock().get(dirfd) else { return EBADF };
+        return exec_resolved(f.inode.clone(), String::new(), argv, envp);
+    }
+
+    // Resolve `pathname` relative to dirfd (AT_FDCWD / absolute / dirfd-relative).
+    let start = if dirfd == AT_FDCWD || path.starts_with('/') {
+        let cwd = task.cwd.lock().clone();
+        match fs::lookup_path(fs::root(), &cwd) {
+            Ok(d) => d,
+            Err(e) => return e as isize,
+        }
+    } else {
+        let Some(f) = task.fd_table.lock().get(dirfd) else { return EBADF };
+        f.inode.clone()
+    };
+    let nofollow = flags & AT_SYMLINK_NOFOLLOW != 0;
+    let inode = if nofollow {
+        match fs::lookup_path_nofollow(start, &path) {
+            Ok(i) => i,
+            Err(e) => return e as isize,
+        }
+    } else {
+        match fs::lookup_path(start, &path) {
+            Ok(i) => i,
+            Err(e) => return e as isize,
+        }
+    };
+    // AT_SYMLINK_NOFOLLOW on a symlink target is ELOOP.
+    if nofollow && inode.kind() == FileType::Symlink {
+        return -40; // ELOOP
+    }
+    exec_resolved(inode, path, argv, envp)
 }
 
 fn aligned_clone(src: &[u8]) -> alloc::vec::Vec<u8> {

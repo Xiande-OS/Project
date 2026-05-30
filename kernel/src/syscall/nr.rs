@@ -110,6 +110,7 @@ pub const SYS_BRK: usize = 214;
 pub const SYS_MUNMAP: usize = 215;
 pub const SYS_CLONE: usize = 220;
 pub const SYS_EXECVE: usize = 221;
+pub const SYS_EXECVEAT: usize = 281;
 pub const SYS_MMAP: usize = 222;
 pub const SYS_MPROTECT: usize = 226;
 pub const SYS_MADVISE: usize = 233;
