@@ -686,6 +686,25 @@ fn resolve_at_with_err(dfd: i32, path: &str) -> core::result::Result<Arc<dyn Ino
     fs::lookup_path(start, path)
 }
 
+/// Resolve an *at-relative path preserving the precise errno (EBADF for a bad
+/// dirfd, ENOTDIR/ENOENT/ELOOP/ENAMETOOLONG from the walk), following the final
+/// symlink only when `follow` is set. Used by stat/statx/lstat so their error
+/// cases report the right errno instead of a blanket ENOENT.
+fn resolve_at_err(dfd: i32, path: &str, follow: bool) -> core::result::Result<Arc<dyn Inode>, i32> {
+    let task = current_task();
+    let start = if dfd == AT_FDCWD || path.starts_with('/') {
+        let cwd = task.cwd.lock().clone();
+        fs::lookup_path(fs::root(), &cwd)?
+    } else {
+        task.fd_table.lock().get(dfd).ok_or(EBADF as i32)?.inode.clone()
+    };
+    if follow {
+        fs::lookup_path(start, path)
+    } else {
+        fs::lookup_path_nofollow(start, path)
+    }
+}
+
 /// Enforce search (execute, 0o1) permission on every directory component
 /// leading to `path`'s final element — POSIX path resolution requires X on
 /// each traversed directory. Done in the syscall layer (which has the creds)
@@ -3643,16 +3662,26 @@ fn sys_fstat(fd: i32, buf: usize) -> isize {
 
 fn sys_newfstatat(dfd: i32, path: usize, buf: usize, flags: i32) -> isize {
     const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const AT_EMPTY_PATH: i32 = 0x1000;
     let Some(path_str) = copy_path(path) else { return EFAULT; };
     let inode = if path_str.is_empty() {
+        // An empty path only refers to dfd with AT_EMPTY_PATH; else ENOENT
+        // (lstat02 probes the empty-path case).
+        if flags & AT_EMPTY_PATH == 0 {
+            return ENOENT;
+        }
         let Some(file) = current_task().fd_table.lock().get(dfd) else { return EBADF; };
         file.inode.clone()
-    } else if flags & AT_SYMLINK_NOFOLLOW != 0 {
-        let Some(i) = resolve_at_nofollow(dfd, &path_str) else { return ENOENT; };
-        i
     } else {
-        let Some(i) = resolve_at(dfd, &path_str) else { return ENOENT; };
-        i
+        // Search permission on the prefix (lstat02 EACCES), then resolve
+        // preserving ENOTDIR/ENOENT/ELOOP/ENAMETOOLONG.
+        if let Err(e) = check_search_perm(dfd, &path_str) {
+            return e;
+        }
+        match resolve_at_err(dfd, &path_str, flags & AT_SYMLINK_NOFOLLOW == 0) {
+            Ok(i) => i,
+            Err(e) => return e as isize,
+        }
     };
     let st = fill_stat(&inode);
     write_struct(buf, &st)
@@ -3698,20 +3727,42 @@ struct Statx {
     __reserved: [u64; 12],
 }
 
-fn sys_statx(dfd: i32, path: usize, _flags: i32, _mask: u32, buf: usize) -> isize {
+fn sys_statx(dfd: i32, path: usize, flags: i32, mask: u32, buf: usize) -> isize {
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const AT_NO_AUTOMOUNT: i32 = 0x800;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    const AT_STATX_SYNC_TYPE: i32 = 0x6000;
+    const STATX_RESERVED: u32 = 0x8000_0000;
+    // Argument validation comes before path resolution (statx03): a reserved
+    // mask bit, an unknown flag, or an all-ones sync-type field is EINVAL.
+    if mask & STATX_RESERVED != 0 {
+        return EINVAL;
+    }
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0 {
+        return EINVAL;
+    }
+    if (flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE {
+        return EINVAL;
+    }
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
     let inode = if path_str.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return ENOENT;
+        }
         let Some(file) = current_task().fd_table.lock().get(dfd) else {
             return EBADF;
         };
         file.inode.clone()
     } else {
-        let Some(i) = resolve_at(dfd, &path_str) else {
-            return ENOENT;
-        };
-        i
+        if let Err(e) = check_search_perm(dfd, &path_str) {
+            return e;
+        }
+        match resolve_at_err(dfd, &path_str, flags & AT_SYMLINK_NOFOLLOW == 0) {
+            Ok(i) => i,
+            Err(e) => return e as isize,
+        }
     };
     let mut st = Statx::default();
     st.stx_mask = 0x7ff;
