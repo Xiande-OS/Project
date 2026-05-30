@@ -705,6 +705,21 @@ pub fn check_signals(task: &Arc<Task>, tf: &mut TrapFrame) -> bool {
     }
 }
 
+/// True if SIGKILL is pending for `task`.
+pub fn has_pending_sigkill(task: &Arc<Task>) -> bool {
+    task.signals.pending.load(Ordering::SeqCst) & sigbit(SIGKILL) != 0
+}
+
+/// Terminate `task`'s entire thread group right now for a pending SIGKILL.
+/// The scheduler calls this for a task parked in a blocking syscall: such a
+/// task re-blocks before `check_signals` (Ready/Running only) ever delivers
+/// the kill, so without this a SIGKILL'd-but-parked process outlives the
+/// per-case timeout and pins its frames/kstack until the budget expires.
+pub fn kill_now(task: &Arc<Task>) {
+    clear_pending(task, SIGKILL);
+    deliver_default_terminate(task, SIGKILL as i32, false);
+}
+
 fn deliver_default_terminate(task: &Arc<Task>, signo: i32, core: bool) {
     // wait4-encoded status: WIFSIGNALED bits in the low 7 of byte0, optional
     // WCOREDUMP at 0x80.

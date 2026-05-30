@@ -1159,6 +1159,15 @@ pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
             if became_zombie {
                 // Fall through to scheduler -- it'll pick another task.
             }
+        } else if st == TaskState::Waiting && crate::signal::has_pending_sigkill(&cur) {
+            // A task parked in a blocking syscall (read/futex/wait4) re-blocks
+            // before check_signals — which only runs for Ready/Running — can
+            // deliver a pending SIGKILL. Left alone it outlives the per-case
+            // timeout and pins its frames/kstack; a killed fork-storm
+            // (cgroup_regression_fork_processes) thus leaks ~200 stacks until
+            // the heap drains and later fork()s fail (the loop breaks with an
+            // empty `$(basename)`). SIGKILL is unblockable: end it now.
+            crate::signal::kill_now(&cur);
         }
     }
 
