@@ -225,12 +225,6 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SHMDT => -1,
         nr::SYS_GETRUSAGE => sys_getrusage(a0 as i32, a1),
         nr::SYS_MEMBARRIER => 0,
-        nr::SYS_PROCESS_VM_READV => {
-            sys_process_vm_rw(a0 as i32, a1, a2, a3, a4, a5, false)
-        }
-        nr::SYS_PROCESS_VM_WRITEV => {
-            sys_process_vm_rw(a0 as i32, a1, a2, a3, a4, a5, true)
-        }
         nr::SYS_TIMES => sys_times(a0),
         nr::SYS_READLINKAT => sys_readlinkat(a0 as i32, a1, a2, a3),
         nr::SYS_RENAMEAT2 => sys_renameat2(a0 as i32, a1, a2 as i32, a3, a4 as u32),
