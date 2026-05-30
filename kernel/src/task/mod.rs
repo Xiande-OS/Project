@@ -351,12 +351,22 @@ pub fn reap_orphan_zombies(except: i32) {
             .collect();
         (pairs, live)
     };
+    const INIT_PID: i32 = 1;
     let mut n = 0;
     for (pid, ppid) in pairs {
-        if pid == except || live.contains(&ppid) {
-            continue; // self, or parent still alive (it may wait4 us)
+        if pid == except {
+            continue; // never reap the caller
         }
-        // Parent is gone. Reap only if this task really is a Zombie.
+        // Reap a Zombie if nobody will wait4 it: either its parent is gone
+        // (true orphan), or its parent is init (pid 1) — orphans we reparented
+        // to init are fire-and-forget; init never explicitly wait4()s the
+        // grandchildren of a SIGKILLed test, so collect them here. A Zombie
+        // whose parent is a *normal* live task is left alone (that parent's
+        // own wait4 will reap it and read its status).
+        let reapable_parent = ppid == INIT_PID || !live.contains(&ppid);
+        if !reapable_parent {
+            continue;
+        }
         if let Some(task) = task_by_pid(pid) {
             let is_zombie = *task.state.lock() == TaskState::Zombie;
             drop(task);
