@@ -635,10 +635,22 @@ pub fn check_signals(task: &Arc<Task>, tf: &mut TrapFrame) -> bool {
                     continue;
                 }
                 DefaultAction::Term => {
+                    // PID 1 (init) is immune to signals left at their default
+                    // action, exactly as Linux protects init. A test that
+                    // broadcasts to its process group via kill(0)/kill(-1) (the
+                    // cpu-controller cases fire SIGUSR1 at their workers) must
+                    // never be able to terminate the reaper of last resort —
+                    // a dead init leaves unreapable zombies and wedges the run.
+                    if task.pid == 1 {
+                        continue;
+                    }
                     deliver_default_terminate(task, signo as i32, false);
                     return true;
                 }
                 DefaultAction::Core => {
+                    if task.pid == 1 {
+                        continue;
+                    }
                     deliver_default_terminate(task, signo as i32, true);
                     return true;
                 }

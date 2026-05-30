@@ -321,8 +321,17 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 // cases finish well inside it; clusters of hung helpers (the
                 // cgroup_* tests) cost 30s instead of eating the whole budget,
                 // which is what lets the run reach hundreds of later cases.
+                // Run each case via `setsid` so it leads its OWN session /
+                // process group. Several LTP cases broadcast to their process
+                // group with kill(0, sig) (e.g. the cpu-controller tests signal
+                // their worker tasks with SIGUSR1). Without isolation every
+                // process inherits pgrp 1 (init's group), so that kill(0) lands
+                // on the loop shell AND on pid 1 — killing init turns it into an
+                // unreapable zombie, the watchdogs spin on it forever, and the
+                // whole run wedges. setsid puts the case in a fresh group so its
+                // group signals stay contained to the case + its children.
                 s.push_str(&alloc::format!(
-                    "./busybox sed 's@^\\( *\\)\"$file\"\\( *\\)$@\\1./busybox timeout -s KILL 10 \"$file\"@' ./{s} > /tmp/ltp_to.sh 2>/dev/null\n",
+                    "./busybox sed 's@^\\( *\\)\"$file\"\\( *\\)$@\\1./busybox setsid ./busybox timeout -s KILL 10 \"$file\"@' ./{s} > /tmp/ltp_to.sh 2>/dev/null\n",
                     s = script
                 ));
                 s.push_str(&alloc::format!(
