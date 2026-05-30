@@ -32,6 +32,17 @@ const USER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// Sv39 user-half ceiling (0x40_0000_0000). Sits well above our 8 MiB
 /// user stack (which ends at 0x4000_0000).
 const INTERP_BASE: usize = 0x10_0000_0000;
+/// Load bias for ET_DYN (PIE) main executables. ET_EXEC mains carry
+/// absolute virtual addresses and load at bias 0; PIE mains are linked at
+/// vaddr 0 and must be relocated as a unit to a fixed base. We place that
+/// base low — above the null-guard region but below everything else — so a
+/// PIE main lands in the same neighbourhood an ET_EXEC main links to (the
+/// proven layout): the program break then grows upward from just past the
+/// image into the large gap below the mmap arena (MMAP_BASE = 0x2000_0000),
+/// exactly as it does for the low-linked riscv64 contest mains. The mmap
+/// arena, the user stack (top 0x4000_0000), and the interpreter
+/// (INTERP_BASE) all sit above, clear of the image + its break.
+const PIE_LOAD_BASE: usize = 0x20_0000;
 
 pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static str> {
     let elf = ElfFile::new(image).map_err(|_| "bad ELF")?;
@@ -62,6 +73,14 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
         }
     }
 
+    // ET_DYN (PIE) main executables are linked at vaddr 0 and must be
+    // relocated as a unit; ET_EXEC mains carry absolute vaddrs and stay at
+    // bias 0. Deriving the bias from the ELF type leaves riscv64 (ET_EXEC
+    // contest mains) behaving identically while loongarch64's PIE mains get
+    // a correct, non-zero load address — and a matching AT_PHDR / AT_ENTRY.
+    let is_pie = header.pt2.type_().as_type() == xmas_elf::header::Type::SharedObject;
+    let load_bias = if is_pie { PIE_LOAD_BASE } else { 0 };
+
     let mut max_end_va = 0usize;
     let mut phdr_va = 0usize;
     let phent = header.pt2.ph_entry_size() as usize;
@@ -73,11 +92,13 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
         let ph = elf.program_header(i as u16).map_err(|_| "bad phdr")?;
         match ph.get_type().map_err(|_| "bad phdr type")? {
             Type::Load => {
-                load_segment(&ph, image, ms, &mut max_end_va, ph_off, &mut phdr_va, 0)?;
+                load_segment(&ph, image, ms, &mut max_end_va, ph_off, &mut phdr_va, load_bias)?;
             }
             Type::Phdr => {
+                // PT_PHDR carries the pre-bias vaddr of the program header
+                // table; bias it so AT_PHDR points at the loaded copy.
                 if ph.virtual_addr() != 0 {
-                    phdr_va = ph.virtual_addr() as usize;
+                    phdr_va = ph.virtual_addr() as usize + load_bias;
                 }
             }
             Type::Interp => {
@@ -107,7 +128,12 @@ pub fn load_elf(image: &[u8], ms: &mut MemorySet) -> Result<LoadedElf, &'static 
     ms.brk_base = VirtAddr(brk_base);
     ms.brk_cur = VirtAddr(brk_base);
 
-    let program_entry = header.pt2.entry_point() as usize;
+    // AT_ENTRY: the main object's entry. Biased for PIE so the dynamic
+    // linker (or the static-PIE self-reloc crt) lands in the loaded image.
+    let program_entry = header.pt2.entry_point() as usize + load_bias;
+    // First user PC. A dynamic executable (has PT_INTERP) starts in the
+    // interpreter; a static-PIE (ET_DYN, no PT_INTERP) starts at its own
+    // biased entry, which `program_entry` already is.
     let mut entry = program_entry;
     let mut interp_base = 0usize;
 
@@ -210,11 +236,13 @@ fn load_segment(
         *max_end_va = va + mem_sz;
     }
 
-    if base_offset == 0
-        && *phdr_va == 0
-        && file_off <= ph_off
-        && ph_off < file_off + file_sz
-    {
+    // Fallback for AT_PHDR when PT_PHDR is absent: record where the program
+    // header table landed by finding the PT_LOAD that covers file offset
+    // `ph_off`. `va` already includes `base_offset`, so the recorded address
+    // is correct for ET_EXEC (bias 0) and biased PIE mains alike. The
+    // interpreter passes its own throwaway `phdr_va`, so the main object's
+    // value is never clobbered by an interpreter segment.
+    if *phdr_va == 0 && file_off <= ph_off && ph_off < file_off + file_sz {
         *phdr_va = va + (ph_off - file_off);
     }
 
