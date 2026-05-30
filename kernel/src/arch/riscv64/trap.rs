@@ -249,10 +249,35 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             crate::signal::force_fault_signal(&task, signo);
         }
         Trap::Exception(e) => {
-            panic!(
-                "kernel exception {:?}\n  sepc  = {:#x}\n  stval = {:#x}\n  sstatus = {:#x}",
-                e, tf.sepc, stval, tf.sstatus,
+            // A kernel-mode memory fault on a low (user-range) address means a
+            // syscall dereferenced a bad user pointer — the crash02/crashme
+            // fuzzer runs random code that ecalls with garbage pointers. Don't
+            // take the whole kernel down for one rogue process: terminate just
+            // that process (Linux turns a bad user access into the task's
+            // death) and let the scheduler carry on. A fault in the kernel /
+            // RAM region (>= 0x8000_0000) is a genuine kernel bug — still panic.
+            let is_mem_fault = matches!(
+                e,
+                Exception::LoadFault
+                    | Exception::StoreFault
+                    | Exception::LoadPageFault
+                    | Exception::StorePageFault
+                    | Exception::InstructionFault
+                    | Exception::InstructionPageFault
             );
+            if is_mem_fault && stval < 0x8000_0000 {
+                crate::println!(
+                    "[kernel-mode user fault] pid={} {:?} sepc={:#x} stval={:#x} — killing task",
+                    crate::task::current_pid(), e, tf.sepc, stval
+                );
+                let task = crate::task::current_task();
+                crate::signal::kill_now(&task);
+            } else {
+                panic!(
+                    "kernel exception {:?}\n  sepc  = {:#x}\n  stval = {:#x}\n  sstatus = {:#x}",
+                    e, tf.sepc, stval, tf.sstatus,
+                );
+            }
         }
         Trap::Interrupt(i) => {
             crate::println!("[trap] unhandled interrupt {:?}; masking", i);
