@@ -381,6 +381,14 @@ impl FdTable {
             return Err(EBADF);
         }
         let f = t[oldfd as usize].clone().ok_or(EBADF)?;
+        // Reject an out-of-range target the way Linux does: newfd must be a
+        // non-negative descriptor below RLIMIT_NOFILE. Without this, dup201's
+        // dup2(fd, huge) grows the fd-table Vec to `newfd` entries — a
+        // multi-hundred-MB infallible allocation that panics the whole kernel.
+        let cap = self.soft_max.load(core::sync::atomic::Ordering::Relaxed);
+        if newfd < 0 || newfd as usize >= cap {
+            return Err(EBADF);
+        }
         let nf = newfd as usize;
         while t.len() <= nf {
             t.push(None);
