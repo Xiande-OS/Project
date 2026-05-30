@@ -869,6 +869,11 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
     if nfds == 0 || fds == 0 {
         return 0;
     }
+    // Bound the pollfd array a fuzzer (crash02) can demand. A garbage nfds
+    // would otherwise size an infallible Vec at gigabytes and panic.
+    if nfds > 65536 {
+        return EINVAL;
+    }
     let task = current_task();
     // A non-NULL timeout pointer to {0,0} means "poll, don't block". Other
     // finite values mean "block up to N then return 0". NULL = block forever.
@@ -1455,6 +1460,15 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
             let min_fd = arg as usize;
             // Find the smallest free fd >= min_fd and place the file there.
             let mut t = task.fd_table.lock();
+            // Linux requires 0 <= arg < RLIMIT_NOFILE. The crash02 fuzzer
+            // passes garbage like fcntl(0, F_DUPFD, 0xea60b827) — a negative
+            // i32 that sign-extends to a astronomically large min_fd; growing
+            // the table to that many entries is a multi-GB infallible Vec push
+            // that panics the kernel. Reject out-of-range targets with EINVAL.
+            let cap = t.soft_max.load(core::sync::atomic::Ordering::Relaxed);
+            if arg < 0 || min_fd >= cap {
+                return EINVAL;
+            }
             let mut tab = t.table.lock();
             let mut c = t.cloexec.lock();
             while tab.len() <= min_fd {
@@ -1492,6 +1506,13 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
         }
         F_SETFD => {
             let t = task.fd_table.lock();
+            // A valid open fd is below RLIMIT_NOFILE; reject garbage (the
+            // crash02 fuzzer passes negative/huge fds) with EBADF rather than
+            // growing the cloexec vector to `fd` entries and OOM-panicking.
+            let cap = t.soft_max.load(core::sync::atomic::Ordering::Relaxed);
+            if fd < 0 || fd as usize >= cap {
+                return EBADF;
+            }
             let mut c = t.cloexec.lock();
             while c.len() <= fd as usize {
                 c.push(false);
