@@ -3486,10 +3486,12 @@ fn sys_faccessat(dfd: i32, path: usize, mode: i32) -> isize {
     0
 }
 
-fn sys_unlinkat(dfd: i32, path: usize, _flag: i32) -> isize {
+fn sys_unlinkat(dfd: i32, path: usize, flag: i32) -> isize {
+    const AT_REMOVEDIR: i32 = 0x200;
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
+    let removedir = flag & AT_REMOVEDIR != 0;
     let (parent, name) = match resolve_at_parent(dfd, &path_str) {
         Ok(v) => v,
         Err(e) => return err_to_isize(e),
@@ -3498,6 +3500,33 @@ fn sys_unlinkat(dfd: i32, path: usize, _flag: i32) -> isize {
     // directory (root bypasses). unlink08 drops to nobody and expects EACCES.
     if !may_access(&parent, 0o2) {
         return -13; // EACCES
+    }
+    if removedir {
+        // rmdir(2). "." (and an empty final component) is EINVAL.
+        if name == "." || name.is_empty() {
+            return EINVAL;
+        }
+        // The target must exist, be a directory (ENOTDIR), and be empty
+        // (ENOTEMPTY) — rmdir02 pins these down.
+        let target = match parent.lookup(&name) {
+            Ok(t) => t,
+            Err(e) => return err_to_isize(e), // ENOENT
+        };
+        if target.kind() != FileType::Directory {
+            return -20; // ENOTDIR
+        }
+        if let Ok(entries) = target.list() {
+            if !entries.is_empty() {
+                return -39; // ENOTEMPTY
+            }
+        }
+    } else {
+        // unlink(2) on a directory is EISDIR.
+        if let Ok(target) = parent.lookup(&name) {
+            if target.kind() == FileType::Directory {
+                return -21; // EISDIR
+            }
+        }
     }
     match parent.unlink(&name) {
         Ok(()) => 0,
