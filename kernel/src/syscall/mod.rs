@@ -2518,14 +2518,21 @@ fn apply_mode(inode: &Arc<dyn Inode>, mode: u32) {
 }
 
 fn apply_owner(inode: &Arc<dyn Inode>, uid: u32, gid: u32) {
+    // chown(-1) (== u32::MAX) leaves that field unchanged. A successful chown
+    // also clears the set-user-ID and set-group-ID bits (S_ISUID|S_ISGID =
+    // 0o6000), which chown02 verifies (it sets 0o6770 then expects 0o0770
+    // back). Linux only keeps the setgid bit when the file isn't group-
+    // executable; LTP's files are, so always clearing both is correct here.
     if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
         let mut m = f.meta.lock();
         if uid != u32::MAX { m.uid = uid; }
         if gid != u32::MAX { m.gid = gid; }
+        m.mode &= !0o6000;
     } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
         let mut m = d.meta.lock();
         if uid != u32::MAX { m.uid = uid; }
         if gid != u32::MAX { m.gid = gid; }
+        m.mode &= !0o6000;
     }
 }
 
