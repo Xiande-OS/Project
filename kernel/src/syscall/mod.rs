@@ -119,6 +119,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
         // set*id family (setuid/setgid/setreuid/setregid/setresuid/setresgid):
         // track per-tgid creds and succeed. Were ENOSYS -> LTP setup TBROK.
         143 | 144 | 145 | 146 | 147 | 149 => sys_set_id(id, a0, a1, a2),
+        // getgroups(158)/setgroups(159): permissive stub. We don't track
+        // supplementary groups, so getgroups reports none (return 0) and
+        // setgroups accepts any list (return 0). Without this, chmod05 and
+        // other tests that call setgroups() in setup() TBROK with ENOSYS.
+        158 => 0,
+        159 => 0,
         // klogctl(2): stub so busybox dmesg / klogd don't error with ENOSYS.
         // Returns 0 for all actions — including SYSLOG_ACTION_READ_ALL (type 3),
         // which dmesg uses by default — meaning "empty kernel ring buffer".
