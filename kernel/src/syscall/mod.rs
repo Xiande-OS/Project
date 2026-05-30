@@ -150,6 +150,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SETRLIMIT => sys_setrlimit(a0 as u32, a1),
         nr::SYS_TRUNCATE => sys_truncate(a0, a1 as u64),
         nr::SYS_FTRUNCATE => sys_ftruncate(a0 as i32, a1 as u64),
+        nr::SYS_FALLOCATE => sys_fallocate(a0 as i32, a1 as i32, a2 as i64, a3 as i64),
         nr::SYS_PSELECT6 => sys_pselect6(a0, a1, a2, a3, a4, a5),
         nr::SYS_EVENTFD2 => sys_eventfd2(a0 as u32, a1 as i32),
         nr::SYS_SENDFILE => sys_sendfile(a0 as i32, a1 as i32, a2, a3),
@@ -2328,6 +2329,38 @@ fn sys_ftruncate(fd: i32, length: u64) -> isize {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
     }
+}
+
+/// fallocate(fd, mode, offset, len). For our in-memory filesystems we treat a
+/// plain allocation as "make sure the bytes exist": grow the file to
+/// offset+len (the gap reads back as zeros). FALLOC_FL_KEEP_SIZE allocates
+/// without moving EOF, which is a no-op when storage isn't tracked separately
+/// from length. fallocate03 just needs the call to succeed across its sparse
+/// offsets; negative/zero arguments and a non-writable fd are rejected.
+fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> isize {
+    const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+    if offset < 0 || len <= 0 {
+        return EINVAL;
+    }
+    // offset + len must stay within the signed file-size range; overflow is
+    // EFBIG (fallocate02 probes offset near i64::MAX).
+    let Some(end_i) = offset.checked_add(len) else {
+        return -27; // EFBIG
+    };
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
+    if !file.writable {
+        return EBADF; // fd must be open for writing
+    }
+    if mode & FALLOC_FL_KEEP_SIZE == 0 {
+        let end = end_i as u64;
+        if end > file.inode.size() {
+            if let Err(e) = file.inode.truncate(end) {
+                return err_to_isize(e);
+            }
+        }
+    }
+    0
 }
 
 /// Best-effort readability check for poll/select. Returns true if a read on

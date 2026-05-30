@@ -131,6 +131,7 @@ pub const SYS_GETRLIMIT: usize = 163;
 pub const SYS_SETRLIMIT: usize = 164;
 pub const SYS_TRUNCATE: usize = 45;
 pub const SYS_FTRUNCATE: usize = 46;
+pub const SYS_FALLOCATE: usize = 47;
 pub const SYS_PSELECT6: usize = 72;
 pub const SYS_EVENTFD2: usize = 19;
 pub const SYS_SENDFILE: usize = 71;
