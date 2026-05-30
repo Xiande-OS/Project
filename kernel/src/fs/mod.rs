@@ -487,9 +487,20 @@ fn lookup_path_inner(
         .collect();
     let last_idx = parts.len().wrapping_sub(1);
     for (idx, part) in parts.iter().enumerate() {
+        // A component longer than NAME_MAX (255) is ENAMETOOLONG.
+        if part.len() > 255 {
+            return Err(ENAMETOOLONG);
+        }
         if *part == ".." {
             // Single-level VFS doesn't track parents.
             continue;
+        }
+        // Descending *through* a component requires it to be a directory. If
+        // `cur` is a regular file (or other non-dir), the path tries to use it
+        // as a directory — that is ENOTDIR, not ENOENT. access04/chmod06/
+        // chown04/creat06 build "<file>/sub" paths and require ENOTDIR.
+        if cur.kind() != FileType::Directory {
+            return Err(ENOTDIR);
         }
         let next = cur.lookup(part)?;
         // Follow symlinks for all but the final component when follow_last==false.
