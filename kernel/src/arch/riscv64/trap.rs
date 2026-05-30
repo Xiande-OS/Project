@@ -269,6 +269,15 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     | Exception::InstructionFault
                     | Exception::InstructionPageFault
             );
+            // The faulting kernel operation is abandoned without unwinding, so
+            // any spin-lock it held (TABLE in particular — the fault was often
+            // inside a BTreeMap walk of the task table) stays locked forever.
+            // On this single hart the only possible holder is this faulting
+            // stack, so force-release before the recovery path re-locks TABLE,
+            // or has_current_task()/kill_now would deadlock.
+            if is_mem_fault {
+                unsafe { crate::task::force_release_locks_after_fault(); }
+            }
             // Recover only when there is a live user task to blame and sacrifice.
             // With no current task (e.g. a fault in early boot before the first
             // task, or in the idle scheduler itself) there is nothing to kill,

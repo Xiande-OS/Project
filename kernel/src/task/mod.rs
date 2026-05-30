@@ -254,6 +254,21 @@ pub fn has_current_task() -> bool {
     pid != 0 && TABLE.lock().tasks.contains_key(&pid)
 }
 
+/// Recovery prep for a kernel-mode fault: the faulting operation is abandoned
+/// without unwinding (no_std has no unwinding), so any spin-lock it held is
+/// stuck locked forever. On this single-hart kernel the only possible holder
+/// of these locks is the faulting stack itself, so force-releasing them is
+/// safe and is the only way the recovery path (which re-locks TABLE etc.) can
+/// proceed instead of deadlocking. Call this BEFORE any other task API in the
+/// trap handler's recover-by-kill path.
+///
+/// # Safety
+/// Must only be called from the trap handler when abandoning a faulted
+/// kernel operation on a single hart.
+pub unsafe fn force_release_locks_after_fault() {
+    TABLE.force_unlock();
+}
+
 pub fn current_task() -> Arc<Task> {
     let pid = current_pid();
     TABLE
