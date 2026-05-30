@@ -225,6 +225,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SHMDT => -1,
         nr::SYS_GETRUSAGE => sys_getrusage(a0 as i32, a1),
         nr::SYS_MEMBARRIER => 0,
+        nr::SYS_PROCESS_VM_READV => {
+            sys_process_vm_rw(a0 as i32, a1, a2, a3, a4, a5, false)
+        }
+        nr::SYS_PROCESS_VM_WRITEV => {
+            sys_process_vm_rw(a0 as i32, a1, a2, a3, a4, a5, true)
+        }
         nr::SYS_TIMES => sys_times(a0),
         nr::SYS_READLINKAT => sys_readlinkat(a0 as i32, a1, a2, a3),
         nr::SYS_RENAMEAT2 => sys_renameat2(a0 as i32, a1, a2 as i32, a3, a4 as u32),
@@ -1516,6 +1522,39 @@ fn sys_signalfd4(fd: i32, mask_addr: usize, _sizemask: usize, flags: i32) -> isi
 
 // ---------- waitid ----------
 
+/// Shared child-reaping core for waitid (mirrors sys_wait4's blocking style).
+/// Returns Ok((cpid, raw_status)) when a zombie child was reaped; Ok((0, 0))
+/// when there is nothing ready — either WNOHANG, or we marked the caller
+/// Waiting and rewound the syscall so it re-runs when a child exits; and
+/// Err(ECHILD) when the caller has no children. `raw_status` is the
+/// pre-encoded wait status word ((exitcode & 0xff) << 8).
+fn wait_reap(task: &Arc<crate::task::Task>, options: i32) -> Result<(i32, i32), isize> {
+    const WNOHANG: i32 = 1;
+    let zombie = {
+        let kids = task.children.lock();
+        kids.iter()
+            .filter_map(|&cpid| crate::task::task_by_pid(cpid))
+            .find(|c| *c.state.lock() == crate::task::TaskState::Zombie)
+    };
+    if let Some(z) = zombie {
+        let code = z.exit_code.load(core::sync::atomic::Ordering::Relaxed);
+        task.children.lock().retain(|&cpid| cpid != z.pid);
+        crate::task::reap(z.pid);
+        return Ok((z.pid, code));
+    }
+    if task.children.lock().is_empty() {
+        return Err(-10); // ECHILD
+    }
+    if options & WNOHANG != 0 {
+        return Ok((0, 0));
+    }
+    *task.state.lock() = crate::task::TaskState::Waiting;
+    unsafe {
+        (*task.tf_ptr()).rewind_syscall();
+    }
+    Ok((0, 0))
+}
+
 fn sys_waitid(idtype: i32, id: i32, infop: usize, options: i32) -> isize {
     // The option set must be a subset of the defined flags and include at
     // least one of WEXITED/WSTOPPED/WCONTINUED — waitid02 passes WNOHANG alone
@@ -1554,7 +1593,9 @@ fn sys_waitid(idtype: i32, id: i32, infop: usize, options: i32) -> isize {
         buf[8..12].copy_from_slice(&1i32.to_le_bytes());          // si_code = CLD_EXITED
         buf[16..20].copy_from_slice(&cpid.to_le_bytes());         // si_pid
         buf[20..24].copy_from_slice(&0i32.to_le_bytes());         // si_uid
-        buf[24..28].copy_from_slice(&(code & 0xff).to_le_bytes()); // si_status
+        // exit_code is the pre-encoded wait status ((exitcode & 0xff) << 8);
+        // si_status wants the program's exit code itself.
+        buf[24..28].copy_from_slice(&((code >> 8) & 0xff).to_le_bytes()); // si_status
         let _ = task.copy_out_bytes(infop, &buf);
     }
     0
@@ -5470,6 +5511,46 @@ fn write_field(dst: &mut [u8; 65], s: &str) {
     dst[n] = 0;
 }
 
+fn write_field_bytes(dst: &mut [u8; 65], s: &[u8]) {
+    let n = core::cmp::min(64, s.len());
+    dst[..n].copy_from_slice(&s[..n]);
+    dst[n] = 0;
+}
+
+/// System-wide host/domain name set via sethostname/setdomainname and reported
+/// by uname. Empty means "use the built-in default".
+static HOSTNAME: spin::Mutex<alloc::vec::Vec<u8>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+static DOMAINNAME: spin::Mutex<alloc::vec::Vec<u8>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
+const UTS_LEN: usize = 64; // __NEW_UTS_LEN; utsname fields are 65 = +NUL
+
+/// sethostname(2)/setdomainname(2) share validation: CAP_SYS_ADMIN (root) is
+/// required (EPERM otherwise), the length must be 0..=64 (EINVAL), and the
+/// user buffer must be readable (EFAULT). The accepted name is stored.
+fn set_uts_name(store: &spin::Mutex<alloc::vec::Vec<u8>>, ptr: usize, len: i64) -> isize {
+    if current_euid() != 0 {
+        return EPERM;
+    }
+    if len < 0 || len as usize > UTS_LEN {
+        return EINVAL;
+    }
+    let Some(bytes) = current_task().copy_in_bytes(ptr, len as usize) else {
+        return EFAULT;
+    };
+    *store.lock() = bytes;
+    0
+}
+
+fn sys_sethostname(ptr: usize, len: i64) -> isize {
+    set_uts_name(&HOSTNAME, ptr, len)
+}
+
+fn sys_setdomainname(ptr: usize, len: i64) -> isize {
+    set_uts_name(&DOMAINNAME, ptr, len)
+}
+
 fn sys_uname(addr: usize) -> isize {
     let mut uts = Utsname {
         sysname: [0; 65],
@@ -5480,11 +5561,21 @@ fn sys_uname(addr: usize) -> isize {
         domainname: [0; 65],
     };
     write_field(&mut uts.sysname, "Linux");
-    write_field(&mut uts.nodename, "xiande");
     write_field(&mut uts.release, "6.6.0-xiande");
     write_field(&mut uts.version, "#1 SMP xiande-os");
     write_field(&mut uts.machine, "riscv64");
-    write_field(&mut uts.domainname, "(none)");
+    let host = HOSTNAME.lock();
+    if host.is_empty() {
+        write_field(&mut uts.nodename, "xiande");
+    } else {
+        write_field_bytes(&mut uts.nodename, &host);
+    }
+    let domain = DOMAINNAME.lock();
+    if domain.is_empty() {
+        write_field(&mut uts.domainname, "(none)");
+    } else {
+        write_field_bytes(&mut uts.domainname, &domain);
+    }
     write_struct(addr, &uts)
 }
 
