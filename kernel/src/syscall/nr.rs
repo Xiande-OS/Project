@@ -174,6 +174,7 @@ pub const SYS_SCHED_GETPARAM: usize = 121;
 pub const SYS_SCHED_SETPARAM: usize = 118;
 pub const SYS_SCHED_GET_PRIORITY_MAX: usize = 125;
 pub const SYS_SCHED_GET_PRIORITY_MIN: usize = 126;
+pub const SYS_SCHED_RR_GET_INTERVAL: usize = 127;
 pub const SYS_SCHED_GETSCHEDULER: usize = 120;
 pub const SYS_SCHED_SETSCHEDULER: usize = 119;
 pub const SYS_GETRESUID: usize = 148;

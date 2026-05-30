@@ -3160,6 +3160,27 @@ fn sys_sched_get_priority_min(policy: i32) -> isize {
     }
 }
 
+/// sched_rr_get_interval(pid, tp): report the round-robin time quantum. We
+/// don't run a tick-sliced RR scheduler, but the call must validate its
+/// arguments and write a plausible non-zero quantum (sched_rr_get_interval01
+/// checks 0 < interval < 100s; sched_rr_get_interval03 checks the errnos).
+fn sys_sched_rr_get_interval(pid: i32, tp: usize) -> isize {
+    // pid<0 -> EINVAL, unknown pid -> ESRCH, 0 -> self.
+    if let Err(e) = sched_resolve_pid(pid) {
+        return e;
+    }
+    if tp == 0 {
+        return EFAULT;
+    }
+    // struct timespec { i64 tv_sec; i64 tv_nsec; } — report a 100ms quantum.
+    let mut out = [0u8; 16];
+    out[8..16].copy_from_slice(&100_000_000i64.to_le_bytes());
+    if current_task().copy_out_bytes(tp, &out).is_none() {
+        return EFAULT;
+    }
+    0
+}
+
 fn sys_truncate(path: usize, length: u64) -> isize {
     let Some(p) = copy_path(path) else { return EFAULT };
     if p.is_empty() {
