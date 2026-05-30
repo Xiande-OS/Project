@@ -125,6 +125,7 @@ pub const ENOMEM: i32 = -12;
 pub const EFAULT: i32 = -14;
 pub const EEXIST: i32 = -17;
 pub const ENOTDIR: i32 = -20;
+pub const ENAMETOOLONG: i32 = -36;
 pub const EISDIR: i32 = -21;
 pub const EINVAL: i32 = -22;
 pub const ENOSPC: i32 = -28;
