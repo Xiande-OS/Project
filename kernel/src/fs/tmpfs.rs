@@ -8,11 +8,15 @@ use spin::Mutex;
 
 use core::any::Any;
 
-use super::{devfs, FileType, Inode, Result, EEXIST, EINVAL, ENOENT, ENOSPC};
+use super::{
+    devfs, xattr_store_get, xattr_store_list, xattr_store_remove, xattr_store_set, FileType,
+    Inode, Result, XattrStore, EEXIST, EINVAL, ENOENT, ENOSPC,
+};
 
 pub struct TmpfsFile {
     data: Mutex<Vec<u8>>,
     pub meta: Mutex<Meta>,
+    xattrs: XattrStore,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +53,7 @@ impl TmpfsFile {
         Self {
             data: Mutex::new(Vec::new()),
             meta: Mutex::new(Meta::default()),
+            xattrs: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -102,11 +107,24 @@ impl Inode for TmpfsFile {
         data.resize(new_len, 0);
         Ok(())
     }
+    fn xattr_get(&self, name: &str) -> Result<Vec<u8>> {
+        xattr_store_get(&self.xattrs, name)
+    }
+    fn xattr_set(&self, name: &str, value: &[u8], flags: i32) -> Result<()> {
+        xattr_store_set(&self.xattrs, name, value, flags)
+    }
+    fn xattr_list(&self) -> Vec<String> {
+        xattr_store_list(&self.xattrs)
+    }
+    fn xattr_remove(&self, name: &str) -> Result<()> {
+        xattr_store_remove(&self.xattrs, name)
+    }
 }
 
 pub struct TmpfsDir {
     entries: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
     pub meta: Mutex<Meta>,
+    xattrs: XattrStore,
 }
 
 impl TmpfsDir {
@@ -114,6 +132,7 @@ impl TmpfsDir {
         Arc::new(Self {
             entries: Mutex::new(BTreeMap::new()),
             meta: Mutex::new(Meta { mode: 0o755, ..Meta::default() }),
+            xattrs: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -176,6 +195,7 @@ impl Inode for TmpfsDir {
             FileType::Directory => Arc::new(TmpfsDir {
                 entries: Mutex::new(BTreeMap::new()),
                 meta: Mutex::new(Meta { mode: 0o755, ..Meta::default() }),
+                xattrs: Mutex::new(BTreeMap::new()),
             }),
             _ => return Err(EINVAL),
         };
@@ -187,9 +207,7 @@ impl Inode for TmpfsDir {
         if entries.contains_key(name) {
             return Err(EEXIST);
         }
-        let link: Arc<dyn Inode> = Arc::new(super::Symlink {
-            target: target.to_string(),
-        });
+        let link: Arc<dyn Inode> = Arc::new(super::Symlink::new(target.to_string()));
         entries.insert(name.to_string(), link);
         Ok(())
     }
@@ -208,5 +226,17 @@ impl Inode for TmpfsDir {
             .iter()
             .map(|(k, v)| (k.clone(), v.kind()))
             .collect())
+    }
+    fn xattr_get(&self, name: &str) -> Result<Vec<u8>> {
+        xattr_store_get(&self.xattrs, name)
+    }
+    fn xattr_set(&self, name: &str, value: &[u8], flags: i32) -> Result<()> {
+        xattr_store_set(&self.xattrs, name, value, flags)
+    }
+    fn xattr_list(&self) -> Vec<String> {
+        xattr_store_list(&self.xattrs)
+    }
+    fn xattr_remove(&self, name: &str) -> Result<()> {
+        xattr_store_remove(&self.xattrs, name)
     }
 }

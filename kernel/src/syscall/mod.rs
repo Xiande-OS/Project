@@ -18,6 +18,8 @@ const EINVAL: isize = -22;
 const ERANGE: isize = -34;
 const EACCES: isize = -13;
 const ENOENT: isize = -2;
+const E2BIG: isize = -7;
+const ENOTSUP: isize = -95;
 
 const AT_FDCWD: i32 = -100;
 
@@ -78,6 +80,20 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_NEWFSTATAT => sys_newfstatat(a0 as i32, a1, a2, a3 as i32),
         nr::SYS_STATX => sys_statx(a0 as i32, a1, a2 as i32, a3 as u32, a4),
         nr::SYS_GETCWD => sys_getcwd(a0, a1),
+        // Extended attributes. The path forms follow a trailing symlink; the
+        // l* forms operate on the link itself; the f* forms take an fd.
+        nr::SYS_SETXATTR => sys_setxattr(a0, a1, a2, a3, a4 as i32, true),
+        nr::SYS_LSETXATTR => sys_setxattr(a0, a1, a2, a3, a4 as i32, false),
+        nr::SYS_FSETXATTR => sys_fsetxattr(a0 as i32, a1, a2, a3, a4 as i32),
+        nr::SYS_GETXATTR => sys_getxattr(a0, a1, a2, a3, true),
+        nr::SYS_LGETXATTR => sys_getxattr(a0, a1, a2, a3, false),
+        nr::SYS_FGETXATTR => sys_fgetxattr(a0 as i32, a1, a2, a3),
+        nr::SYS_LISTXATTR => sys_listxattr(a0, a1, a2, true),
+        nr::SYS_LLISTXATTR => sys_listxattr(a0, a1, a2, false),
+        nr::SYS_FLISTXATTR => sys_flistxattr(a0 as i32, a1, a2),
+        nr::SYS_REMOVEXATTR => sys_removexattr(a0, a1, true),
+        nr::SYS_LREMOVEXATTR => sys_removexattr(a0, a1, false),
+        nr::SYS_FREMOVEXATTR => sys_fremovexattr(a0 as i32, a1),
         nr::SYS_CHDIR => sys_chdir(a0),
         nr::SYS_CHROOT => sys_chroot(a0),
         nr::SYS_MOUNT => sys_mount(a0, a1, a2, a3, a4),
@@ -4467,6 +4483,235 @@ fn may_access(inode: &Arc<dyn Inode>, want: u32) -> bool {
         fmode & 0o7
     };
     want & !granted == 0
+}
+
+// ---------- Extended attributes (xattr) ----------
+//
+// setxattr/getxattr/listxattr/removexattr and their l* (don't-follow-symlink)
+// and f* (by-fd) variants. The per-inode store lives on the tmpfs inode (see
+// `fs::tmpfs`); this layer copies the user buffers, enforces the POSIX name /
+// namespace / size rules, then delegates to the inode's xattr_* methods.
+
+const XATTR_CREATE: i32 = 1;
+const XATTR_REPLACE: i32 = 2;
+/// VFS ceilings from uapi/linux/limits.h: a single value caps at 64 KiB
+/// (over → E2BIG) and a name at 255 bytes (over/empty → ERANGE).
+const XATTR_SIZE_MAX: usize = 65536;
+const XATTR_NAME_MAX: usize = 255;
+
+/// Validate a copied attribute name: empty or over-long is ERANGE (matching
+/// the kernel's strncpy_from_user bound check); a name outside the known
+/// namespaces is "not supported".
+fn xattr_check_name(name: &str) -> core::result::Result<(), isize> {
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return Err(ERANGE);
+    }
+    if name.starts_with("user.")
+        || name.starts_with("security.")
+        || name.starts_with("trusted.")
+        || name.starts_with("system.")
+    {
+        Ok(())
+    } else {
+        Err(ENOTSUP)
+    }
+}
+
+/// Enforce the `user.` namespace rules against the target inode: user xattrs
+/// only attach to regular files and directories (else EPERM), and need the
+/// matching access right — write to set/remove, read to get/list. Root
+/// bypasses the access test (may_access returns true for euid 0), so this only
+/// bites a test that has dropped privilege. Other namespaces are left to the
+/// (root) contest context.
+fn xattr_user_guard(
+    inode: &Arc<dyn Inode>,
+    name: &str,
+    write: bool,
+) -> core::result::Result<(), isize> {
+    if name.starts_with("user.") {
+        match inode.kind() {
+            FileType::Regular | FileType::Directory => {}
+            _ => return Err(EPERM),
+        }
+        let want = if write { 0o2 } else { 0o4 };
+        if !may_access(inode, want) {
+            return Err(EACCES);
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the target inode for a path-based xattr call. An empty path is
+/// ENOENT; `follow` selects whether a trailing symlink is dereferenced.
+fn xattr_path_inode(path: usize, follow: bool) -> core::result::Result<Arc<dyn Inode>, isize> {
+    let Some(p) = copy_path(path) else {
+        return Err(EFAULT);
+    };
+    if p.is_empty() {
+        return Err(ENOENT);
+    }
+    resolve_at_err(AT_FDCWD, &p, follow).map_err(|e| e as isize)
+}
+
+/// Resolve the target inode for an fd-based xattr call.
+fn xattr_fd_inode(fd: i32) -> core::result::Result<Arc<dyn Inode>, isize> {
+    current_task()
+        .fd_table
+        .lock()
+        .get(fd)
+        .map(|f| f.inode.clone())
+        .ok_or(EBADF)
+}
+
+fn xattr_set_core(inode: &Arc<dyn Inode>, name: usize, value: usize, size: usize, flags: i32) -> isize {
+    // Only XATTR_CREATE / XATTR_REPLACE are valid flag bits.
+    if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+        return EINVAL;
+    }
+    let Some(name) = copy_path(name) else {
+        return EFAULT;
+    };
+    if let Err(e) = xattr_check_name(&name) {
+        return e;
+    }
+    if size > XATTR_SIZE_MAX {
+        return E2BIG;
+    }
+    let val = if size == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        match current_task().copy_in_bytes(value, size) {
+            Some(v) => v,
+            None => return EFAULT,
+        }
+    };
+    if let Err(e) = xattr_user_guard(inode, &name, true) {
+        return e;
+    }
+    match inode.xattr_set(&name, &val, flags) {
+        Ok(()) => 0,
+        Err(e) => e as isize,
+    }
+}
+
+fn xattr_get_core(inode: &Arc<dyn Inode>, name: usize, value: usize, size: usize) -> isize {
+    let Some(name) = copy_path(name) else {
+        return EFAULT;
+    };
+    if let Err(e) = xattr_check_name(&name) {
+        return e;
+    }
+    if let Err(e) = xattr_user_guard(inode, &name, false) {
+        return e;
+    }
+    let val = match inode.xattr_get(&name) {
+        Ok(v) => v,
+        Err(e) => return e as isize,
+    };
+    let len = val.len();
+    // size == 0 is a probe: report the length without copying.
+    if size == 0 {
+        return len as isize;
+    }
+    if size < len {
+        return ERANGE;
+    }
+    if current_task().copy_out_bytes(value, &val).is_none() {
+        return EFAULT;
+    }
+    len as isize
+}
+
+fn xattr_list_core(inode: &Arc<dyn Inode>, list: usize, size: usize) -> isize {
+    // Names are returned as a run of NUL-terminated strings.
+    let mut buf = alloc::vec::Vec::new();
+    for n in inode.xattr_list() {
+        buf.extend_from_slice(n.as_bytes());
+        buf.push(0);
+    }
+    let total = buf.len();
+    if size == 0 {
+        return total as isize;
+    }
+    if size < total {
+        return ERANGE;
+    }
+    if total > 0 && current_task().copy_out_bytes(list, &buf).is_none() {
+        return EFAULT;
+    }
+    total as isize
+}
+
+fn xattr_remove_core(inode: &Arc<dyn Inode>, name: usize) -> isize {
+    let Some(name) = copy_path(name) else {
+        return EFAULT;
+    };
+    if let Err(e) = xattr_check_name(&name) {
+        return e;
+    }
+    if let Err(e) = xattr_user_guard(inode, &name, true) {
+        return e;
+    }
+    match inode.xattr_remove(&name) {
+        Ok(()) => 0,
+        Err(e) => e as isize,
+    }
+}
+
+fn sys_setxattr(path: usize, name: usize, value: usize, size: usize, flags: i32, follow: bool) -> isize {
+    match xattr_path_inode(path, follow) {
+        Ok(i) => xattr_set_core(&i, name, value, size, flags),
+        Err(e) => e,
+    }
+}
+
+fn sys_fsetxattr(fd: i32, name: usize, value: usize, size: usize, flags: i32) -> isize {
+    match xattr_fd_inode(fd) {
+        Ok(i) => xattr_set_core(&i, name, value, size, flags),
+        Err(e) => e,
+    }
+}
+
+fn sys_getxattr(path: usize, name: usize, value: usize, size: usize, follow: bool) -> isize {
+    match xattr_path_inode(path, follow) {
+        Ok(i) => xattr_get_core(&i, name, value, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_fgetxattr(fd: i32, name: usize, value: usize, size: usize) -> isize {
+    match xattr_fd_inode(fd) {
+        Ok(i) => xattr_get_core(&i, name, value, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_listxattr(path: usize, list: usize, size: usize, follow: bool) -> isize {
+    match xattr_path_inode(path, follow) {
+        Ok(i) => xattr_list_core(&i, list, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_flistxattr(fd: i32, list: usize, size: usize) -> isize {
+    match xattr_fd_inode(fd) {
+        Ok(i) => xattr_list_core(&i, list, size),
+        Err(e) => e,
+    }
+}
+
+fn sys_removexattr(path: usize, name: usize, follow: bool) -> isize {
+    match xattr_path_inode(path, follow) {
+        Ok(i) => xattr_remove_core(&i, name),
+        Err(e) => e,
+    }
+}
+
+fn sys_fremovexattr(fd: i32, name: usize) -> isize {
+    match xattr_fd_inode(fd) {
+        Ok(i) => xattr_remove_core(&i, name),
+        Err(e) => e,
+    }
 }
 
 fn sys_faccessat(dfd: i32, path: usize, mode: i32) -> isize {
