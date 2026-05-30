@@ -1527,23 +1527,32 @@ fn sys_waitid(idtype: i32, id: i32, infop: usize, options: i32) -> isize {
     if options & !VALID != 0 || options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
         return EINVAL;
     }
-    let pid_filter = match idtype {
-        0 => -1,              // P_ALL
-        1 if id > 0 => id,    // P_PID
-        2 if id >= 0 => -id,  // P_PGID
+    match idtype {
+        0 => {}                          // P_ALL
+        1 if id > 0 => {}                // P_PID
+        2 if id >= 0 => {}               // P_PGID
         1 | 2 => return EINVAL,
         _ => return EINVAL,
+    }
+    let task = current_task();
+    let (cpid, code) = match wait_reap(&task, options) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    let r = sys_wait4(pid_filter, 0, 0);
-    if r < 0 { return r; }
-    if r == 0 { return 0; }
+    if cpid == 0 {
+        return 0; // WNOHANG, nothing ready
+    }
     if infop != 0 {
-        let pid = r as i32;
-        let task = current_task();
+        // siginfo_t (SIGCHLD): si_signo@0, si_code@8, si_pid@16, si_uid@20,
+        // si_status@24. The child exit()'d, so si_code = CLD_EXITED (1) and
+        // si_status carries the low 8 bits of the exit code (waitid01 wants
+        // 123). 17 = SIGCHLD.
         let mut buf = [0u8; 128];
-        buf[0..4].copy_from_slice(&17i32.to_le_bytes());
-        buf[8..12].copy_from_slice(&1i32.to_le_bytes());
-        buf[16..20].copy_from_slice(&pid.to_le_bytes());
+        buf[0..4].copy_from_slice(&17i32.to_le_bytes());          // si_signo
+        buf[8..12].copy_from_slice(&1i32.to_le_bytes());          // si_code = CLD_EXITED
+        buf[16..20].copy_from_slice(&cpid.to_le_bytes());         // si_pid
+        buf[20..24].copy_from_slice(&0i32.to_le_bytes());         // si_uid
+        buf[24..28].copy_from_slice(&(code & 0xff).to_le_bytes()); // si_status
         let _ = task.copy_out_bytes(infop, &buf);
     }
     0
