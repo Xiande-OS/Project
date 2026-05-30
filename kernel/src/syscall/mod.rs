@@ -2483,7 +2483,32 @@ fn sys_setrlimit(resource: u32, buf: usize) -> isize {
 
 fn sys_truncate(path: usize, length: u64) -> isize {
     let Some(p) = copy_path(path) else { return EFAULT };
-    let Some(i) = resolve_at(AT_FDCWD, &p) else { return ENOENT };
+    if p.is_empty() {
+        return ENOENT;
+    }
+    // Search permission on the prefix (truncate03 EACCES), then resolve
+    // preserving ENOTDIR/ENOENT/ELOOP/ENAMETOOLONG.
+    if let Err(e) = check_search_perm(AT_FDCWD, &p) {
+        return e;
+    }
+    let i = match resolve_at_err(AT_FDCWD, &p, true) {
+        Ok(i) => i,
+        Err(e) => return e as isize,
+    };
+    // Truncating a directory is EISDIR; otherwise the file must be writable.
+    if i.kind() == FileType::Directory {
+        return -21; // EISDIR
+    }
+    if !may_access(&i, 0o2) {
+        return -13; // EACCES
+    }
+    // RLIMIT_FSIZE: growing the file past the soft file-size limit is EFBIG
+    // (truncate03 lowers the limit to 16MB and truncates to 32MB). Linux also
+    // raises SIGXFSZ, but the test blocks it and only checks the errno.
+    let fsize = rlimit_for(current_task().pid, RLIMIT_FSIZE);
+    if fsize.cur != RLIM_INFINITY && length > fsize.cur {
+        return -27; // EFBIG
+    }
     match i.truncate(length) {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
@@ -2493,6 +2518,20 @@ fn sys_truncate(path: usize, length: u64) -> isize {
 fn sys_ftruncate(fd: i32, length: u64) -> isize {
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
+    // A negative length is EINVAL (off_t is signed; the user may pass -1).
+    if (length as i64) < 0 {
+        return EINVAL;
+    }
+    // ftruncate only operates on regular files opened for writing; an
+    // O_RDONLY fd, a socket, a pipe or a directory is EINVAL (ftruncate03).
+    if !file.writable || file.inode.kind() != FileType::Regular {
+        return EINVAL;
+    }
+    // RLIMIT_FSIZE: growing past the soft file-size limit is EFBIG.
+    let fsize = rlimit_for(task.pid, RLIMIT_FSIZE);
+    if fsize.cur != RLIM_INFINITY && length > fsize.cur {
+        return -27; // EFBIG
+    }
     match file.inode.truncate(length) {
         Ok(()) => 0,
         Err(e) => err_to_isize(e),
