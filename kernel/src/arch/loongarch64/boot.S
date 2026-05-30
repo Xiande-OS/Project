@@ -39,8 +39,14 @@ _start:
     addi.d      $t0, $t0, 8
     b           1b
 2:
-    # EUEN.FPE = 1 so userspace FP doesn't trap before we wire FP context.
-    li.w        $t0, 1
+    # EUEN: enable FP (FPE), 128-bit vector (SXE/LSX) and 256-bit vector
+    # (ASXE/LASX) for userspace. The LoongArch C library resolves its
+    # memcpy/memset/str* ifuncs to LSX/LASX variants, and code built for
+    # -march=la464 emits vector ops inline; with only FPE set, those
+    # instructions raise an SXD/ASXD ("vector unit disabled") exception on
+    # first use and the process dies. Enable all three eagerly at boot (no
+    # lazy/trap-driven switching), the same way FPE already was.
+    li.w        $t0, 0x7
     csrwr       $t0, 0x2
 
     # kmain(hartid = 0, dtb = 0). LA direct boot has no SBI-style args we

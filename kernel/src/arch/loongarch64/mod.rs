@@ -7,6 +7,7 @@
 use core::arch::global_asm;
 
 pub mod console;
+pub mod fpu;
 pub mod mm;
 pub mod power;
 pub mod time;
