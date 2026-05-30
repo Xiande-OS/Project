@@ -1993,11 +1993,40 @@ fn sys_memfd_create(_name: usize, flags: u32) -> isize {
     }
 }
 
-fn sys_close_range(first: u32, last: u32, _flags: u32) -> isize {
+fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
+    const CLOSE_RANGE_UNSHARE: u32 = 0x02;
+    const CLOSE_RANGE_CLOEXEC: u32 = 0x04;
+    // Unknown flag bits or an inverted range are EINVAL (close_range02).
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+        return EINVAL;
+    }
+    if first > last {
+        return EINVAL;
+    }
     let task = current_task();
     let t = task.fd_table.lock();
     let max = t.table.lock().len() as u32;
-    let end = core::cmp::min(last, max.saturating_sub(1));
+    if max == 0 {
+        return 0;
+    }
+    let end = core::cmp::min(last, max - 1);
+    // CLOSE_RANGE_CLOEXEC marks the range close-on-exec instead of closing it.
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        let open: alloc::vec::Vec<usize> = {
+            let tbl = t.table.lock();
+            (first..=end)
+                .map(|f| f as usize)
+                .filter(|&i| i < tbl.len() && tbl[i].is_some())
+                .collect()
+        };
+        let mut c = t.cloexec.lock();
+        for i in open {
+            if i < c.len() {
+                c[i] = true;
+            }
+        }
+        return 0;
+    }
     for fd in first..=end {
         let _ = t.close(fd as i32);
     }
