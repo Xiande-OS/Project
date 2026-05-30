@@ -1,5 +1,6 @@
 //! VFS skeleton. Minimal Inode/File/FdTable, in-memory only (M5).
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -135,6 +136,51 @@ pub const ENOSYS: i32 = -38;
 pub const ENODATA: i32 = -61;
 pub const ENOTSUP: i32 = -95;
 
+/// `setxattr(2)` flag bits (uapi/linux/xattr.h).
+const XATTR_CREATE: i32 = 1;
+const XATTR_REPLACE: i32 = 2;
+
+/// Per-inode extended-attribute table: a name -> value map behind its own
+/// lock so xattr operations don't contend with the inode's data I/O. Shared
+/// by every in-memory inode type that supports xattrs (tmpfs files/dirs and
+/// symlinks); the free functions below carry the common POSIX flag rules.
+pub type XattrStore = Mutex<BTreeMap<String, Vec<u8>>>;
+
+pub fn xattr_store_get(store: &XattrStore, name: &str) -> Result<Vec<u8>> {
+    store.lock().get(name).cloned().ok_or(ENODATA)
+}
+
+pub fn xattr_store_set(store: &XattrStore, name: &str, value: &[u8], flags: i32) -> Result<()> {
+    let mut map = store.lock();
+    let exists = map.contains_key(name);
+    // XATTR_CREATE fails if it's already there; XATTR_REPLACE fails if absent.
+    if flags & XATTR_CREATE != 0 && exists {
+        return Err(EEXIST);
+    }
+    if flags & XATTR_REPLACE != 0 && !exists {
+        return Err(ENODATA);
+    }
+    // The value lives on the kernel heap; reserve fallibly so a large value on
+    // a low heap surfaces ENOSPC instead of tripping the alloc-error handler.
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(value.len()).map_err(|_| ENOSPC)?;
+    owned.extend_from_slice(value);
+    map.insert(name.to_string(), owned);
+    Ok(())
+}
+
+pub fn xattr_store_list(store: &XattrStore) -> Vec<String> {
+    store.lock().keys().cloned().collect()
+}
+
+pub fn xattr_store_remove(store: &XattrStore, name: &str) -> Result<()> {
+    if store.lock().remove(name).is_some() {
+        Ok(())
+    } else {
+        Err(ENODATA)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileType {
     Regular,
@@ -199,9 +245,17 @@ pub trait Inode: Send + Sync + core::any::Any {
     }
 }
 
-/// In-memory symlink: just stores the target path.
+/// In-memory symlink: stores the target path plus its own xattr table (the
+/// l*xattr LTP cases attach `security.*` attributes to the link itself).
 pub struct Symlink {
     pub target: String,
+    pub xattrs: XattrStore,
+}
+
+impl Symlink {
+    pub fn new(target: String) -> Self {
+        Self { target, xattrs: Mutex::new(BTreeMap::new()) }
+    }
 }
 
 impl Inode for Symlink {
@@ -209,6 +263,18 @@ impl Inode for Symlink {
     fn kind(&self) -> FileType { FileType::Symlink }
     fn size(&self) -> u64 { self.target.len() as u64 }
     fn readlink(&self) -> Result<String> { Ok(self.target.clone()) }
+    fn xattr_get(&self, name: &str) -> Result<Vec<u8>> {
+        xattr_store_get(&self.xattrs, name)
+    }
+    fn xattr_set(&self, name: &str, value: &[u8], flags: i32) -> Result<()> {
+        xattr_store_set(&self.xattrs, name, value, flags)
+    }
+    fn xattr_list(&self) -> Vec<String> {
+        xattr_store_list(&self.xattrs)
+    }
+    fn xattr_remove(&self, name: &str) -> Result<()> {
+        xattr_store_remove(&self.xattrs, name)
+    }
 }
 
 pub struct File {

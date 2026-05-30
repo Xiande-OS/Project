@@ -8,50 +8,10 @@ use spin::Mutex;
 
 use core::any::Any;
 
-use super::{devfs, FileType, Inode, Result, EEXIST, EINVAL, ENODATA, ENOENT, ENOSPC};
-
-/// `setxattr(2)` flag bits (uapi/linux/xattr.h).
-const XATTR_CREATE: i32 = 1;
-const XATTR_REPLACE: i32 = 2;
-
-/// Per-inode extended-attribute table: a name -> value map guarded by its own
-/// lock so xattr operations don't contend with file data I/O.
-type XattrStore = Mutex<BTreeMap<String, Vec<u8>>>;
-
-fn xattr_store_get(store: &XattrStore, name: &str) -> Result<Vec<u8>> {
-    store.lock().get(name).cloned().ok_or(ENODATA)
-}
-
-fn xattr_store_set(store: &XattrStore, name: &str, value: &[u8], flags: i32) -> Result<()> {
-    let mut map = store.lock();
-    let exists = map.contains_key(name);
-    // XATTR_CREATE fails if it's already there; XATTR_REPLACE fails if absent.
-    if flags & XATTR_CREATE != 0 && exists {
-        return Err(EEXIST);
-    }
-    if flags & XATTR_REPLACE != 0 && !exists {
-        return Err(ENODATA);
-    }
-    // The value lives on the kernel heap; reserve fallibly so a large value on
-    // a low heap surfaces ENOSPC instead of tripping the alloc-error handler.
-    let mut owned = Vec::new();
-    owned.try_reserve_exact(value.len()).map_err(|_| ENOSPC)?;
-    owned.extend_from_slice(value);
-    map.insert(name.to_string(), owned);
-    Ok(())
-}
-
-fn xattr_store_list(store: &XattrStore) -> Vec<String> {
-    store.lock().keys().cloned().collect()
-}
-
-fn xattr_store_remove(store: &XattrStore, name: &str) -> Result<()> {
-    if store.lock().remove(name).is_some() {
-        Ok(())
-    } else {
-        Err(ENODATA)
-    }
-}
+use super::{
+    devfs, xattr_store_get, xattr_store_list, xattr_store_remove, xattr_store_set, FileType,
+    Inode, Result, XattrStore, EEXIST, EINVAL, ENOENT, ENOSPC,
+};
 
 pub struct TmpfsFile {
     data: Mutex<Vec<u8>>,
@@ -247,9 +207,7 @@ impl Inode for TmpfsDir {
         if entries.contains_key(name) {
             return Err(EEXIST);
         }
-        let link: Arc<dyn Inode> = Arc::new(super::Symlink {
-            target: target.to_string(),
-        });
+        let link: Arc<dyn Inode> = Arc::new(super::Symlink::new(target.to_string()));
         entries.insert(name.to_string(), link);
         Ok(())
     }
