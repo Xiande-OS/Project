@@ -302,6 +302,41 @@ pub fn reap(pid: i32) {
 /// Trap counter to rate-limit the orphan-zombie sweep (see scheduler).
 static REAP_SWEEP_TICK: AtomicU64 = AtomicU64::new(0);
 
+/// Reparent an exiting task's still-live children to pid 1 (init), the way a
+/// real kernel's `find_new_reaper` does. Without this, a test that is
+/// SIGKILLed mid-run (timeout) leaves grandchildren whose parent pointer
+/// dangles: nobody adds them to a living wait4'er's child list, so when they
+/// become zombies no one reaps them and they pin frames/kstack until the pool
+/// drains (the cumulative fork07 ENOMEM + scheduler livelock). Moving them to
+/// pid 1 — the contest init, a proper reaper — lets them be collected
+/// normally. This only rewrites ppid + child lists; it never kills a task.
+pub fn reparent_children_to_init(dead_pid: i32) {
+    const INIT_PID: i32 = 1;
+    if dead_pid == INIT_PID {
+        return;
+    }
+    let dead = match task_by_pid(dead_pid) {
+        Some(t) => t,
+        None => return,
+    };
+    // Take the dying task's child list.
+    let kids: Vec<i32> = {
+        let mut c = dead.children.lock();
+        core::mem::take(&mut *c)
+    };
+    if kids.is_empty() {
+        return;
+    }
+    let Some(init) = task_by_pid(INIT_PID) else { return };
+    let mut init_kids = init.children.lock();
+    for kid in kids {
+        if let Some(k) = task_by_pid(kid) {
+            k.ppid.store(INIT_PID, Ordering::Relaxed);
+            init_kids.push(kid);
+        }
+    }
+}
+
 pub fn reap_orphan_zombies(except: i32) {
     // Snapshot (pid, ppid) and the live-pid set under the table lock, then
     // release it before touching per-task state locks (TABLE-then-state would

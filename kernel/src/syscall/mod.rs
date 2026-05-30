@@ -3424,6 +3424,10 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
     let is_thread = task.tgid.load(core::sync::atomic::Ordering::Relaxed) != task.pid;
     let leader_exit = group_exit || !any_alive;
     if leader_exit {
+        // Reparent our still-live children to init (pid 1) so a proper reaper
+        // collects them — otherwise a SIGKILLed test's orphaned grandchildren
+        // pin frames forever and eventually wedge the run (fork07 ENOMEM).
+        crate::task::reparent_children_to_init(task.pid);
         let ppid = task.ppid.load(core::sync::atomic::Ordering::Relaxed);
         if let Some(parent) = crate::task::task_by_pid(ppid) {
             {
