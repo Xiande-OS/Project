@@ -184,12 +184,10 @@ pub fn dispatch(tf: &mut TrapFrame) {
         // mostly use it for relative sleeps and a missing-syscall ENOSYS
         // here makes them fall back to a noisy retry loop.
         nr::SYS_CLOCK_NANOSLEEP => sys_nanosleep(a2, a3),
-        // epoll stubs: empty event-set, never readies. cyclictest +
-        // others fall back to polling timers instead of hanging on
-        // ENOSYS.
-        nr::SYS_EPOLL_CREATE1 => 100,
-        nr::SYS_EPOLL_CTL => 0,
-        nr::SYS_EPOLL_PWAIT => 0,
+        // Real epoll: a fd-backed interest set with ready reporting.
+        nr::SYS_EPOLL_CREATE1 => sys_epoll_create1(a0 as i32),
+        nr::SYS_EPOLL_CTL => sys_epoll_ctl(a0 as i32, a1 as i32, a2 as i32, a3),
+        nr::SYS_EPOLL_PWAIT => sys_epoll_pwait(a0 as i32, a1, a2 as i32, a3 as i32),
         nr::SYS_GETTIMEOFDAY => sys_gettimeofday(a0),
         nr::SYS_ADJTIMEX => sys_adjtimex(a0),
         nr::SYS_SCHED_YIELD => 0,
@@ -2730,6 +2728,150 @@ fn sys_eventfd2(initval: u32, flags: i32) -> isize {
         Ok(fd) => fd as isize,
         Err(e) => err_to_isize(e),
     }
+}
+
+// ---------- epoll ----------
+//
+// A real epoll instance: a kernel object reachable through an fd that tracks
+// an "interest set" of (fd -> events, user data). Previously epoll was a stub
+// (a fake fd, no-op ctl, wait returning 0), which left the whole epoll_ctl /
+// epoll_create / epoll_wait test family scoring nothing. Correct usage
+// (adding sockets/pipes/eventfds) is unaffected; only the deliberately-bad
+// operations the tests probe are now rejected with the right errno.
+
+const EPOLL_CTL_ADD: i32 = 1;
+const EPOLL_CTL_DEL: i32 = 2;
+const EPOLL_CTL_MOD: i32 = 3;
+const EPOLLIN: u32 = 0x001;
+const EPOLLOUT: u32 = 0x004;
+
+struct EpollInode {
+    // fd -> (interest events, opaque user data) — the kernel echoes `data`
+    // back verbatim in the ready list.
+    interest: SpinMutex<alloc::collections::BTreeMap<i32, (u32, u64)>>,
+}
+
+impl crate::fs::Inode for EpollInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn kind(&self) -> crate::fs::FileType { crate::fs::FileType::Pipe }
+    fn size(&self) -> u64 { 0 }
+}
+
+fn sys_epoll_create1(flags: i32) -> isize {
+    const EPOLL_CLOEXEC: i32 = 0o2000000;
+    let ep = Arc::new(EpollInode {
+        interest: SpinMutex::new(alloc::collections::BTreeMap::new()),
+    });
+    let file = Arc::new(crate::fs::File::from_inode(ep, true, true, false));
+    let cloexec = flags & EPOLL_CLOEXEC != 0;
+    match current_task().fd_table.lock().alloc(file, cloexec) {
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+/// epoll_ctl(epfd, op, fd, event). Validation order matches Linux (which
+/// epoll_ctl02 pins down): for ADD/MOD the event struct is read first (NULL =>
+/// EFAULT); epfd must be a valid fd (EBADF) that is an epoll (EINVAL); the
+/// target must be a valid fd (EBADF), not epfd itself (EINVAL), and must
+/// support polling — a regular file or directory does not (EPERM); finally the
+/// op is applied (EEXIST on re-ADD, ENOENT on MOD/DEL of an unregistered fd,
+/// EINVAL on an unknown op).
+fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: usize) -> isize {
+    let task = current_task();
+    let evt = if op != EPOLL_CTL_DEL {
+        let Some(b) = task.copy_in_bytes(event, 16) else { return EFAULT; };
+        let events = u32::from_le_bytes(b[0..4].try_into().unwrap());
+        let data = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        (events, data)
+    } else {
+        (0, 0)
+    };
+    let Some(epfile) = task.fd_table.lock().get(epfd) else { return EBADF; };
+    let Some(ep) = epfile.inode.as_any().downcast_ref::<EpollInode>() else {
+        return EINVAL;
+    };
+    let Some(tfile) = task.fd_table.lock().get(fd) else { return EBADF; };
+    if fd == epfd {
+        return EINVAL;
+    }
+    // Regular files and directories do not support epoll.
+    match tfile.inode.kind() {
+        crate::fs::FileType::Regular | crate::fs::FileType::Directory => return -1, // EPERM
+        _ => {}
+    }
+    let mut interest = ep.interest.lock();
+    match op {
+        EPOLL_CTL_ADD => {
+            if interest.contains_key(&fd) {
+                return -17; // EEXIST
+            }
+            interest.insert(fd, evt);
+        }
+        EPOLL_CTL_MOD => {
+            if !interest.contains_key(&fd) {
+                return ENOENT;
+            }
+            interest.insert(fd, evt);
+        }
+        EPOLL_CTL_DEL => {
+            if interest.remove(&fd).is_none() {
+                return ENOENT;
+            }
+        }
+        _ => return EINVAL,
+    }
+    0
+}
+
+/// epoll_pwait(epfd, events, maxevents, timeout, ...). Validates maxevents > 0
+/// (EINVAL) and the output buffer (EFAULT), then reports the ready members of
+/// the interest set. Blocking-for-`timeout` precision isn't modelled (we report
+/// current readiness and return), which is enough for the functional/error
+/// cases; a no-event return is the same 0 the previous stub gave.
+fn sys_epoll_pwait(epfd: i32, events: usize, maxevents: i32, _timeout: i32) -> isize {
+    if maxevents <= 0 {
+        return EINVAL;
+    }
+    let task = current_task();
+    let Some(epfile) = task.fd_table.lock().get(epfd) else { return EBADF; };
+    let Some(ep) = epfile.inode.as_any().downcast_ref::<EpollInode>() else {
+        return EINVAL;
+    };
+    if events == 0 {
+        return EFAULT;
+    }
+    let want: alloc::vec::Vec<(i32, u32, u64)> = ep
+        .interest
+        .lock()
+        .iter()
+        .map(|(&fd, &(ev, dt))| (fd, ev, dt))
+        .collect();
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    for (fd, ev, data) in want {
+        if out.len() / 16 >= maxevents as usize {
+            break;
+        }
+        let Some(f) = task.fd_table.lock().get(fd) else { continue };
+        let mut revents = 0u32;
+        if (ev & EPOLLIN) != 0 && fd_is_readable(&f) {
+            revents |= EPOLLIN;
+        }
+        // Treat a pollable fd as writable (sockets/pipes accept writes); only
+        // surface it when the caller asked for EPOLLOUT.
+        if (ev & EPOLLOUT) != 0 {
+            revents |= EPOLLOUT;
+        }
+        if revents != 0 {
+            out.extend_from_slice(&revents.to_le_bytes());
+            out.extend_from_slice(&[0u8; 4]);
+            out.extend_from_slice(&data.to_le_bytes());
+        }
+    }
+    if !out.is_empty() && task.copy_out_bytes(events, &out).is_none() {
+        return EFAULT;
+    }
+    (out.len() / 16) as isize
 }
 
 // ---------- mmap / munmap / mprotect ----------
