@@ -720,12 +720,29 @@ pub fn kill_now(task: &Arc<Task>) {
     deliver_default_terminate(task, SIGKILL as i32, false);
 }
 
+/// Release a terminated task's heavy resources NOW instead of at reap: free
+/// its user frames and close its fds. A killed fork-storm test (the cgroup
+/// regression cases fork ~200) must return its frames immediately or the pool
+/// stays drained — later execve()s then fail to map their segments (load_elf
+/// -> EINVAL) and the whole contest loop breaks. Mirrors sys_exit's eager
+/// teardown; only acts when this task is the sole holder so a live CLONE_VM /
+/// CLONE_FILES sibling keeps the shared resource.
+fn release_user_resources(task: &Arc<Task>) {
+    if alloc::sync::Arc::strong_count(&task.fd_table) == 1 {
+        task.fd_table.lock().close_all();
+    }
+    if alloc::sync::Arc::strong_count(&task.memory_set) == 1 {
+        task.memory_set.lock().free_user_frames();
+    }
+}
+
 fn deliver_default_terminate(task: &Arc<Task>, signo: i32, core: bool) {
     // wait4-encoded status: WIFSIGNALED bits in the low 7 of byte0, optional
     // WCOREDUMP at 0x80.
     let status = (signo & 0x7f) | if core { 0x80 } else { 0 };
     task.exit_code.store(status, Ordering::Relaxed);
     *task.state.lock() = TaskState::Zombie;
+    release_user_resources(task);
     if crate::syscall::syscall_trace_enabled() {
         crate::println!(
             "[exit] pid={} killed by signal {}{}",
@@ -747,6 +764,7 @@ fn deliver_default_terminate(task: &Arc<Task>, signo: i32, core: bool) {
         }
         sib.exit_code.store(status, Ordering::Relaxed);
         *sib.state.lock() = TaskState::Zombie;
+        release_user_resources(&sib);
         // CLONE_CHILD_CLEARTID: zero the ctid and wake one waiter so
         // pthread_join unblocks.
         let ctid = *sib.clear_child_tid.lock();
