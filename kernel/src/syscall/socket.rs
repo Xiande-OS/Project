@@ -652,7 +652,10 @@ pub fn sys_recvfrom(
     net::poll();
 
     let task = current_task();
-    let mut buf: Vec<u8> = alloc::vec![0u8; len];
+    // Bounded + fallible: a recvfrom(huge_len) must not allocate the full
+    // request on the kernel heap (infallible vec! panics the whole kernel).
+    // A short recv is legal for streams; a real datagram never exceeds this.
+    let mut buf: Vec<u8> = crate::syscall::io_bounce_buf(len);
 
     match kind {
         SocketKind::Tcp => {

@@ -409,7 +409,7 @@ const MAX_IO_BOUNCE: usize = 16 * 1024 * 1024;
 /// Allocate a zeroed I/O bounce buffer of at most `MAX_IO_BOUNCE` bytes
 /// without ever panicking. On a fragmented/low heap it degrades to a smaller
 /// buffer (down to a page) so the caller still makes progress via a short op.
-fn io_bounce_buf(len: usize) -> alloc::vec::Vec<u8> {
+pub(crate) fn io_bounce_buf(len: usize) -> alloc::vec::Vec<u8> {
     if len == 0 {
         return alloc::vec::Vec::new();
     }
