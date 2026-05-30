@@ -4225,8 +4225,10 @@ fn sys_timer_settime(timerid: i32, _flags: i32, new_value: usize, old_value: usi
     let task = current_task();
     let pid = task.pid;
     // itimerspec: it_interval (sec@0,nsec@8), it_value (sec@16,nsec@24) — 32B.
+    // A NULL new_value is EINVAL (Linux do_timer_settime checks !new_setting
+    // before touching memory); a non-NULL but unreadable address is EFAULT.
     if new_value == 0 {
-        return EFAULT;
+        return EINVAL;
     }
     let Some(buf) = task.copy_in_bytes(new_value, 32) else { return EFAULT; };
     let rd = |o: usize| i64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
@@ -5770,7 +5772,12 @@ fn sys_uname(addr: usize) -> isize {
     write_struct(addr, &uts)
 }
 
-fn sys_getrandom(buf: usize, len: usize, _flags: usize) -> isize {
+fn sys_getrandom(buf: usize, len: usize, flags: usize) -> isize {
+    // Valid flags are GRND_NONBLOCK(1) | GRND_RANDOM(2) | GRND_INSECURE(4);
+    // any other bit is EINVAL (getrandom02 probes 0x08..0x40).
+    if flags & !0x7 != 0 {
+        return EINVAL;
+    }
     let task = current_task();
     let mut out = io_bounce_buf(len);
     let mut x: u64 = crate::arch::now_ticks()
