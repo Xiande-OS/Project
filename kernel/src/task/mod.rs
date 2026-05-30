@@ -884,7 +884,18 @@ pub fn clone_current(
     let parent = current_task();
 
     // ---- Address space ----
-    let memory_set: Arc<Mutex<MemorySet>> = if flags & CLONE_VM != 0 {
+    // Share the page table only for a genuine thread (CLONE_VM *without*
+    // CLONE_VFORK). A CLONE_VM|CLONE_VFORK child is glibc's posix_spawn /
+    // fork-then-exec helper: it shares briefly then immediately execve()s.
+    // If we let it share the Arc, its execve would replace the *shared*
+    // MemorySet contents and yank the still-mapped vfork parent's code out
+    // from under it — the parent then faults at a glibc PC the instant the
+    // child execs (clock_gettime04 / creat07 SIGSEGV'd exactly this way).
+    // Give the vfork child its own private (forked) copy instead: correct
+    // per POSIX (the child must not durably modify the parent's memory
+    // other than by exec/exit) and it makes execve's in-place swap safe.
+    let share_vm = (flags & CLONE_VM != 0) && (flags & CLONE_VFORK == 0);
+    let memory_set: Arc<Mutex<MemorySet>> = if share_vm {
         // Share: same Arc, same satp, same page table.
         // Before spawning a new thread, reclaim the stacks of any threads
         // that have since exited and were never joined. Doing this here (and
@@ -1080,10 +1091,11 @@ pub fn execve_current_with_path(
 
     // execve detaches the caller from any shared address space (POSIX
     // semantics): we replace the contents of the Arc<Mutex<MemorySet>>.
-    // If it was shared (e.g. by a CLONE_VM thread that lived past exec),
-    // the other thread keeps the *old* shared Arc — but in practice
-    // pthread_create + execve is undefined, so this is safe for our test
-    // matrix. We just swap the lock's contents.
+    // A CLONE_VM child that reaches execve does NOT share this Arc (see
+    // clone_current: a CLONE_VFORK/spawn child is given its own private
+    // address space precisely so this in-place swap can't clobber the
+    // vfork parent's still-live memory). Pure CLONE_THREAD pthreads that
+    // exec are undefined behaviour, so swapping in place is safe here.
     let new_satp;
     {
         let mut slot = task.memory_set.lock();
