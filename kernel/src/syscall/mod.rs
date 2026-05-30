@@ -125,6 +125,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         143 | 144 | 145 | 146 | 147 | 149 => sys_set_id(id, a0, a1, a2),
         nr::SYS_SETFSUID => sys_setfsid(true, a0 as u32),
         nr::SYS_SETFSGID => sys_setfsid(false, a0 as u32),
+        nr::SYS_GETRESUID => sys_getresid(true, a0, a1, a2),
+        nr::SYS_GETRESGID => sys_getresid(false, a0, a1, a2),
         // getgroups(158)/setgroups(159): permissive stub. We don't track
         // supplementary groups, so getgroups reports none (return 0) and
         // setgroups accepts any list (return 0). Without this, chmod05 and
@@ -2336,6 +2338,30 @@ pub fn forget_creds(pid: i32) {
     FS_IDS.lock().remove(&pid);
 }
 
+/// A forked child gets its own thread-group id, so it must inherit the
+/// parent's credential set (real/effective/saved uid+gid and the filesystem
+/// ids). Without this a child of a privilege-dropped process would default
+/// back to root — setresuid04/setreuid07 fork after dropping and expect the
+/// child to still be denied. Thread members share the parent tgid and so its
+/// creds already; only call this when the tgids differ.
+pub fn inherit_creds(parent_tgid: i32, child_tgid: i32) {
+    // Bind each lookup to a local first so the read guard is released before
+    // we re-lock to insert — spin::Mutex is not reentrant, and an `if let`
+    // scrutinee would otherwise hold the guard across the body and deadlock.
+    let creds = CREDS.lock().get(&parent_tgid).copied();
+    if let Some(c) = creds {
+        CREDS.lock().insert(child_tgid, c);
+    }
+    let saved = SAVED_IDS.lock().get(&parent_tgid).copied();
+    if let Some(s) = saved {
+        SAVED_IDS.lock().insert(child_tgid, s);
+    }
+    let fs = FS_IDS.lock().get(&parent_tgid).copied();
+    if let Some(f) = fs {
+        FS_IDS.lock().insert(child_tgid, f);
+    }
+}
+
 /// Saved set-uid / set-gid, kept beside CREDS (which stays [ruid,euid,rgid,egid]
 /// so its many readers are unchanged). Default root, like CREDS.
 static SAVED_IDS: spin::Mutex<alloc::collections::BTreeMap<i32, (u32, u32)>> =
@@ -2350,6 +2376,27 @@ fn saved_ids_of(tgid: i32) -> (u32, u32) {
 /// round-trip, so it is stored lazily and seeded from the effective id.
 static FS_IDS: spin::Mutex<alloc::collections::BTreeMap<i32, (u32, u32)>> =
     spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+/// getresuid(2)/getresgid(2): write the real, effective and saved id to the
+/// three user pointers. setresuid03 and friends call these to confirm the
+/// ids after a setres*id, so without them the tests TBROK on ENOSYS.
+fn sys_getresid(is_uid: bool, r: usize, e: usize, s: usize) -> isize {
+    let tgid = cur_tgid();
+    let c = creds_of(tgid);
+    let (suid, sgid) = saved_ids_of(tgid);
+    let (real, eff, saved) = if is_uid {
+        (c[0], c[1], suid)
+    } else {
+        (c[2], c[3], sgid)
+    };
+    let task = current_task();
+    for (ptr, val) in [(r, real), (e, eff), (s, saved)] {
+        if task.copy_out_bytes(ptr, &val.to_le_bytes()).is_none() {
+            return EFAULT;
+        }
+    }
+    0
+}
 
 /// setfsuid(2)/setfsgid(2). Both always return the *previous* fs id and never
 /// fail; an unprivileged caller may only select one of its real/effective/

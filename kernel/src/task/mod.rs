@@ -1143,6 +1143,14 @@ pub fn clone_current(
         core::ptr::write(task.tf_ptr(), new_tf);
     }
 
+    // A fork starts a new thread group and so needs its own copy of the
+    // parent's credentials; thread members share the parent's tgid (and thus
+    // its creds) already.
+    let parent_tgid = parent.tgid.load(Ordering::Relaxed);
+    if tgid != parent_tgid {
+        crate::syscall::inherit_creds(parent_tgid, tgid);
+    }
+
     // loongarch64: the child inherits the parent's vector-unit state. We're
     // running in the parent's clone syscall and the kernel is soft-float, so
     // the live registers still hold the parent's values — snapshot them into
