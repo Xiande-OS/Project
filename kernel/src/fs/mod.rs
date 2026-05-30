@@ -132,6 +132,8 @@ pub const ENOSPC: i32 = -28;
 pub const EMFILE: i32 = -24;
 pub const ESPIPE: i32 = -29;
 pub const ENOSYS: i32 = -38;
+pub const ENODATA: i32 = -61;
+pub const ENOTSUP: i32 = -95;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileType {
@@ -177,6 +179,23 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// If this Inode is a symlink, return its target path.
     fn readlink(&self) -> Result<String> {
         Err(EINVAL)
+    }
+
+    /// Extended attributes. Only the in-memory fs keeps a real key/value
+    /// store; every other inode type uses these defaults, which report "no
+    /// such attribute" (get/remove) or "not supported" (set), matching what
+    /// Linux returns for a filesystem without xattr support.
+    fn xattr_get(&self, _name: &str) -> Result<Vec<u8>> {
+        Err(ENODATA)
+    }
+    fn xattr_set(&self, _name: &str, _value: &[u8], _flags: i32) -> Result<()> {
+        Err(ENOTSUP)
+    }
+    fn xattr_list(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn xattr_remove(&self, _name: &str) -> Result<()> {
+        Err(ENODATA)
     }
 }
 

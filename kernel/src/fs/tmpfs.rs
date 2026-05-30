@@ -8,11 +8,55 @@ use spin::Mutex;
 
 use core::any::Any;
 
-use super::{devfs, FileType, Inode, Result, EEXIST, EINVAL, ENOENT, ENOSPC};
+use super::{devfs, FileType, Inode, Result, EEXIST, EINVAL, ENODATA, ENOENT, ENOSPC};
+
+/// `setxattr(2)` flag bits (uapi/linux/xattr.h).
+const XATTR_CREATE: i32 = 1;
+const XATTR_REPLACE: i32 = 2;
+
+/// Per-inode extended-attribute table: a name -> value map guarded by its own
+/// lock so xattr operations don't contend with file data I/O.
+type XattrStore = Mutex<BTreeMap<String, Vec<u8>>>;
+
+fn xattr_store_get(store: &XattrStore, name: &str) -> Result<Vec<u8>> {
+    store.lock().get(name).cloned().ok_or(ENODATA)
+}
+
+fn xattr_store_set(store: &XattrStore, name: &str, value: &[u8], flags: i32) -> Result<()> {
+    let mut map = store.lock();
+    let exists = map.contains_key(name);
+    // XATTR_CREATE fails if it's already there; XATTR_REPLACE fails if absent.
+    if flags & XATTR_CREATE != 0 && exists {
+        return Err(EEXIST);
+    }
+    if flags & XATTR_REPLACE != 0 && !exists {
+        return Err(ENODATA);
+    }
+    // The value lives on the kernel heap; reserve fallibly so a large value on
+    // a low heap surfaces ENOSPC instead of tripping the alloc-error handler.
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(value.len()).map_err(|_| ENOSPC)?;
+    owned.extend_from_slice(value);
+    map.insert(name.to_string(), owned);
+    Ok(())
+}
+
+fn xattr_store_list(store: &XattrStore) -> Vec<String> {
+    store.lock().keys().cloned().collect()
+}
+
+fn xattr_store_remove(store: &XattrStore, name: &str) -> Result<()> {
+    if store.lock().remove(name).is_some() {
+        Ok(())
+    } else {
+        Err(ENODATA)
+    }
+}
 
 pub struct TmpfsFile {
     data: Mutex<Vec<u8>>,
     pub meta: Mutex<Meta>,
+    xattrs: XattrStore,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +93,7 @@ impl TmpfsFile {
         Self {
             data: Mutex::new(Vec::new()),
             meta: Mutex::new(Meta::default()),
+            xattrs: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -102,11 +147,24 @@ impl Inode for TmpfsFile {
         data.resize(new_len, 0);
         Ok(())
     }
+    fn xattr_get(&self, name: &str) -> Result<Vec<u8>> {
+        xattr_store_get(&self.xattrs, name)
+    }
+    fn xattr_set(&self, name: &str, value: &[u8], flags: i32) -> Result<()> {
+        xattr_store_set(&self.xattrs, name, value, flags)
+    }
+    fn xattr_list(&self) -> Vec<String> {
+        xattr_store_list(&self.xattrs)
+    }
+    fn xattr_remove(&self, name: &str) -> Result<()> {
+        xattr_store_remove(&self.xattrs, name)
+    }
 }
 
 pub struct TmpfsDir {
     entries: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
     pub meta: Mutex<Meta>,
+    xattrs: XattrStore,
 }
 
 impl TmpfsDir {
@@ -114,6 +172,7 @@ impl TmpfsDir {
         Arc::new(Self {
             entries: Mutex::new(BTreeMap::new()),
             meta: Mutex::new(Meta { mode: 0o755, ..Meta::default() }),
+            xattrs: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -176,6 +235,7 @@ impl Inode for TmpfsDir {
             FileType::Directory => Arc::new(TmpfsDir {
                 entries: Mutex::new(BTreeMap::new()),
                 meta: Mutex::new(Meta { mode: 0o755, ..Meta::default() }),
+                xattrs: Mutex::new(BTreeMap::new()),
             }),
             _ => return Err(EINVAL),
         };
@@ -208,5 +268,17 @@ impl Inode for TmpfsDir {
             .iter()
             .map(|(k, v)| (k.clone(), v.kind()))
             .collect())
+    }
+    fn xattr_get(&self, name: &str) -> Result<Vec<u8>> {
+        xattr_store_get(&self.xattrs, name)
+    }
+    fn xattr_set(&self, name: &str, value: &[u8], flags: i32) -> Result<()> {
+        xattr_store_set(&self.xattrs, name, value, flags)
+    }
+    fn xattr_list(&self) -> Vec<String> {
+        xattr_store_list(&self.xattrs)
+    }
+    fn xattr_remove(&self, name: &str) -> Result<()> {
+        xattr_store_remove(&self.xattrs, name)
     }
 }

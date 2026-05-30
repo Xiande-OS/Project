@@ -178,3 +178,17 @@ pub const SYS_MEMBARRIER: usize = 283;
 pub const SYS_STATX: usize = 291;
 pub const SYS_CLONE3: usize = 435;
 pub const SYS_FACCESSAT2: usize = 439;
+
+// Extended attributes (asm-generic / riscv64 numbering).
+pub const SYS_SETXATTR: usize = 5;
+pub const SYS_LSETXATTR: usize = 6;
+pub const SYS_FSETXATTR: usize = 7;
+pub const SYS_GETXATTR: usize = 8;
+pub const SYS_LGETXATTR: usize = 9;
+pub const SYS_FGETXATTR: usize = 10;
+pub const SYS_LISTXATTR: usize = 11;
+pub const SYS_LLISTXATTR: usize = 12;
+pub const SYS_FLISTXATTR: usize = 13;
+pub const SYS_REMOVEXATTR: usize = 14;
+pub const SYS_LREMOVEXATTR: usize = 15;
+pub const SYS_FREMOVEXATTR: usize = 16;
