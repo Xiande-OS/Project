@@ -246,6 +246,14 @@ pub fn current_pid() -> i32 {
     CURRENT_PID.load(Ordering::Relaxed)
 }
 
+/// True when there is a live current task that `current_task()` can return
+/// without panicking. Used by the trap handler to decide whether a kernel-mode
+/// fault is recoverable (kill the task) or fatal (no task to blame -> panic).
+pub fn has_current_task() -> bool {
+    let pid = CURRENT_PID.load(Ordering::Relaxed);
+    pid != 0 && TABLE.lock().tasks.contains_key(&pid)
+}
+
 pub fn current_task() -> Arc<Task> {
     let pid = current_pid();
     TABLE
