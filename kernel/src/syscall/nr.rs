@@ -9,6 +9,7 @@ pub const SYS_DUP3: usize = 24;
 pub const SYS_FCNTL: usize = 25;
 pub const SYS_FLOCK: usize = 32;
 pub const SYS_IOCTL: usize = 29;
+pub const SYS_MKNODAT: usize = 33;
 pub const SYS_MKDIRAT: usize = 34;
 pub const SYS_UNLINKAT: usize = 35;
 pub const SYS_SYMLINKAT: usize = 36;

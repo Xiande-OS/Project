@@ -69,6 +69,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_DUP3 => sys_dup3(a0 as i32, a1 as i32, a2 as i32),
         nr::SYS_PIPE2 => sys_pipe2(a0, a1 as i32),
         nr::SYS_MKDIRAT => sys_mkdirat(a0 as i32, a1, a2 as u32),
+        nr::SYS_MKNODAT => sys_mknodat(a0 as i32, a1, a2 as u32, a3 as u64),
         nr::SYS_UNLINKAT => sys_unlinkat(a0 as i32, a1, a2 as i32),
         nr::SYS_GETDENTS64 => sys_getdents64(a0 as i32, a1, a2),
         nr::SYS_FSTAT => sys_fstat(a0 as i32, a1),
@@ -956,6 +957,52 @@ fn sys_mkdirat(dfd: i32, path: usize, mode: u32) -> isize {
             // (access01, mkdir09) never see the EACCES they expect.
             let m = mode & !0o022 & 0o7777;
             apply_mode(&inode, m);
+            0
+        }
+        Err(e) => err_to_isize(e),
+    }
+}
+
+/// mknodat(dirfd, path, mode, dev). Creates a filesystem node. We model
+/// regular nodes fully; FIFO/socket/device types are accepted (with the
+/// correct permission and error semantics the mknod tests pin down) but
+/// backed by a plain node for now. An unknown type in `mode` is EINVAL
+/// (mknod09); creating a device node requires CAP_MKNOD/root (mknod07 EPERM);
+/// the parent must be writable (EACCES) and the name must not exist (EEXIST);
+/// resolution errors (ENOTDIR/ENOENT/ELOOP/ENAMETOOLONG) survive.
+fn sys_mknodat(dirfd: i32, path: usize, mode: u32, _dev: u64) -> isize {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFBLK: u32 = 0o060000;
+    const S_IFIFO: u32 = 0o010000;
+    const S_IFSOCK: u32 = 0o140000;
+    let Some(p) = copy_path(path) else { return EFAULT };
+    // A type of 0 means a regular file; any other unknown S_IFMT is EINVAL.
+    let typ = mode & S_IFMT;
+    match typ {
+        0 | S_IFREG | S_IFCHR | S_IFBLK | S_IFIFO | S_IFSOCK => {}
+        _ => return EINVAL,
+    }
+    let (parent, name) = match resolve_at_parent(dirfd, &p) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
+    };
+    // Device special files require privilege (CAP_MKNOD).
+    if (typ == S_IFCHR || typ == S_IFBLK) && creds_of(cur_tgid())[1] != 0 {
+        return -1; // EPERM
+    }
+    // Creating an entry needs write permission on the parent directory.
+    if !may_access(&parent, 0o2) {
+        return -13; // EACCES
+    }
+    if parent.lookup(&name).is_ok() {
+        return -17; // EEXIST
+    }
+    match parent.create(&name, FileType::Regular) {
+        Ok(i) => {
+            stamp_creator(&i);
+            apply_mode(&i, mode & 0o7777);
             0
         }
         Err(e) => err_to_isize(e),
