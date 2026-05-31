@@ -1487,10 +1487,18 @@ fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame 
             let now = crate::arch::now_ticks();
             let alive_others = any_runnable_except(cur_pid) || any_waiting();
             if !alive_others {
-                if cur_state == Some(TaskState::Zombie) {
+                // End the run ONLY when the contest init (pid 1) has exited.
+                // A transient empty runnable+waiting set during a test's
+                // teardown (e.g. pidns04's PID-namespace collapse racing its
+                // parent's wait4) must NOT halt the machine — the old code
+                // shut down here and killed every group after it. pid 1 is
+                // the reaper and will be runnable again; fall through and keep
+                // spinning (the orphan drain above + wakeups below resolve it).
+                let init_done = task_by_pid(1)
+                    .map_or(false, |t| matches!(*t.state.lock(), TaskState::Zombie));
+                if init_done {
                     crate::arch::shutdown();
                 }
-                panic_dead_locked(cur_pid, "no other live tasks");
             }
             if !any_pending_deadline(now) {
                 // Everyone is parked on something with no timeout —
@@ -1557,7 +1565,11 @@ fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame 
                     wake_socket_waiters();
                 }
                 if any_runnable_except(cur_pid) { break; }
-                if !any_waiting() {
+                if !any_waiting()
+                    && task_by_pid(1).map_or(false, |t| matches!(*t.state.lock(), TaskState::Zombie))
+                {
+                    // Only halt once the contest init (pid 1) itself is gone;
+                    // a transient lull during a test's teardown keeps spinning.
                     crate::arch::shutdown();
                 }
                 core::hint::spin_loop();

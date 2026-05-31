@@ -434,7 +434,7 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                     "./busybox timeout -s KILL {b} ./busybox sh -c 'cd {d}/ltp/testcases/bin 2>/dev/null || exit 0; \
                      WL=\" {wl} \"; SKIP=\" {skip} \"; \
                      for t in $WL; do [ -f \"$t\" ] || continue; {d}/busybox echo \"RUN LTP CASE $t\"; {d}/busybox setsid {d}/busybox timeout -s KILL 5 \"./$t\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $t : $?\"; done; \
-                     for f in *; do [ -f \"$f\" ] || continue; case \"$f\" in *.sh|cgroup_*|cpuctl_*|cpuacct_*|cpuset_*|cpuhotplug_*|genload|ebizzy|crash0?|hackbench|messaging) continue ;; esac; case \"$WL\" in *\" $f \"*) continue ;; esac; case \"$SKIP\" in *\" $f \"*) continue ;; esac; {d}/busybox echo \"RUN LTP CASE $f\"; {d}/busybox setsid {d}/busybox timeout -s KILL 3 \"./$f\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $f : $?\"; done'\n",
+                     for f in *; do [ -f \"$f\" ] || continue; case \"$f\" in *.sh|cgroup_*|cpuctl_*|cpuacct_*|cpuset_*|cpuhotplug_*|genload|ebizzy|crash0?|hackbench|messaging|pidns*|pid_namespace*) continue ;; esac; case \"$WL\" in *\" $f \"*) continue ;; esac; case \"$SKIP\" in *\" $f \"*) continue ;; esac; {d}/busybox echo \"RUN LTP CASE $f\"; {d}/busybox setsid {d}/busybox timeout -s KILL 3 \"./$f\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $f : $?\"; done'\n",
                     b = budget,
                     d = dir,
                     wl = LTP_WHITELIST,

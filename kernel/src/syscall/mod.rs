@@ -5438,9 +5438,16 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
         mark_for_self_reap(task.pid);
     }
 
-    // If no other runnable/waiting/zombie task exists, halt.
+    // Only the contest init (pid 1) exiting ends the run. A test process
+    // exiting must NEVER power off the machine — even if it momentarily
+    // leaves no other task runnable/waiting (e.g. pidns04's PID-namespace
+    // teardown raced the parent's wait4, which used to trip the old
+    // "no live tasks -> shutdown" heuristic and halt mid-suite, killing
+    // every group after it). The init shell is the reaper and will be
+    // scheduled again. This mirrors the reference kernel, whose lifetime is
+    // tied to the single init app, not to a "no live tasks" guess.
     let pid = task.pid;
-    if !crate::task::any_runnable_except(pid) && !crate::task::any_waiting() {
+    if pid == 1 {
         crate::arch::shutdown();
     }
 }
