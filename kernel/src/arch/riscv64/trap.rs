@@ -27,6 +27,19 @@ extern "C" {
 /// zero on any user-originated trap, which proves the hart resumed userspace.
 static KERNEL_ACCESS_FAULTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Fault-loop breaker. A user task that takes the SAME fault at the SAME PC
+/// over and over makes no progress — typically a SIGSEGV handler that
+/// `sigreturn`s straight back to the faulting instruction. Left alone it spins
+/// out hundreds of identical faults until the per-case timeout, flooding the
+/// log and pinning the live task's memory (which an OOM sweep can't reclaim
+/// while it runs). After this many consecutive identical faults we terminate
+/// the task outright. (riscv64 always turns a user fault into a signal — there
+/// is no demand-paging retry to break — so a repeat is genuinely stuck.)
+static LAST_FAULT_PID: AtomicUsize = AtomicUsize::new(0);
+static LAST_FAULT_PC: AtomicUsize = AtomicUsize::new(0);
+static FAULT_REPEAT: AtomicUsize = AtomicUsize::new(0);
+const FAULT_LOOP_LIMIT: usize = 8;
+
 /// Layout matches `trap.S`.
 #[repr(C)]
 #[derive(Debug, Clone, Default)]
@@ -261,16 +274,19 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             // User-mode quantum tick: fall through to the cooperative scheduler.
         }
         Trap::Exception(e) if from_user => {
-            crate::println!(
-                "[user fault pid={}] {:?}\n  sepc  = {:#x}\n  stval = {:#x}\n  sstatus = {:#x}",
-                crate::task::current_pid(),
-                e, tf.sepc, stval, tf.sstatus
-            );
-            // Dump a few key registers, not all of them.
-            crate::println!(
-                "  ra={:#x} sp={:#x} a0={:#x} a1={:#x} a7={:#x}",
-                tf.x[0], tf.x[1], tf.x[9], tf.x[10], tf.x[16]
-            );
+            let pid = crate::task::current_pid();
+            // Count consecutive identical (pid, PC) faults to break no-progress
+            // loops (see FAULT_LOOP_LIMIT).
+            let same = LAST_FAULT_PID.load(Ordering::Relaxed) == pid as usize
+                && LAST_FAULT_PC.load(Ordering::Relaxed) == tf.sepc;
+            let reps = if same {
+                FAULT_REPEAT.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                LAST_FAULT_PID.store(pid as usize, Ordering::Relaxed);
+                LAST_FAULT_PC.store(tf.sepc, Ordering::Relaxed);
+                FAULT_REPEAT.store(1, Ordering::Relaxed);
+                1
+            };
             // Translate the fault into a signal targeting the current task.
             let signo = match e {
                 Exception::IllegalInstruction => crate::signal::SIGILL,
@@ -286,17 +302,32 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 _ => crate::signal::SIGSEGV,
             };
             let task = crate::task::current_task();
-            // A synchronous, CPU-generated fault signal must never be lost.
-            // If the task has it blocked or set to SIG_IGN, a plain raise
-            // leaves it undeliverable and we sret back to the faulting PC
-            // and fault again forever (the unbounded InstructionPageFault
-            // storm). force_fault_signal applies Linux `force_sig`
-            // semantics — unblock, and reset a blocked/ignored disposition
-            // to SIG_DFL — so the process is always terminated. An
-            // installed, unblocked handler still runs once; if it returns
-            // to the faulting PC the signal is blocked during its own
-            // handler, so the re-fault forces the default and terminates.
-            crate::signal::force_fault_signal(&task, signo);
+            if reps >= FAULT_LOOP_LIMIT {
+                // No progress after repeated identical faults (e.g. a SIGSEGV
+                // handler that sigreturns to the faulting PC) — terminate it so
+                // it stops flooding the log and frees its memory now.
+                if reps == FAULT_LOOP_LIMIT {
+                    crate::println!(
+                        "[user fault pid={}] {:?} at sepc={:#x} repeated — killing (no progress)",
+                        pid, e, tf.sepc,
+                    );
+                }
+                crate::signal::kill_now(&task);
+                FAULT_REPEAT.store(0, Ordering::Relaxed);
+            } else {
+                // Log only the first couple so a loop can't flood the console.
+                if reps <= 2 {
+                    crate::println!(
+                        "[user fault pid={}] {:?} sepc={:#x} stval={:#x} ra={:#x} sp={:#x} a0={:#x} a7={:#x}",
+                        pid, e, tf.sepc, stval, tf.x[0], tf.x[1], tf.x[9], tf.x[16],
+                    );
+                }
+                // A synchronous, CPU-generated fault signal must never be lost.
+                // force_fault_signal resets a blocked/ignored disposition to
+                // SIG_DFL so the process is always terminated; an installed,
+                // unblocked handler still runs once.
+                crate::signal::force_fault_signal(&task, signo);
+            }
         }
         Trap::Exception(e) => {
             // A kernel-mode memory fault almost always means a syscall touched
