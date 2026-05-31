@@ -336,6 +336,22 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
     // script hangs we still bank the easy points.
     for (dir, scripts) in variants {
         s.push_str(&alloc::format!("cd {}\n", dir));
+        // Point the dynamic loader at this variant's own lib dir. glibc's
+        // dynamic test binaries (ltp-glibc, libctest-glibc) DT_NEEDED
+        // libc.so.6 / libm.so.6; on LoongArch the glibc loader's compiled-in
+        // search path does NOT include the dirs bind_loaders populates
+        // (/lib, /lib64), so every dynamic glibc case exits 127 "libc.so.6:
+        // cannot open shared object file" — 417 such failures in the grader
+        // log, zeroing the entire glibc-la column. RV's glibc loader happens
+        // to find them, so this is purely a search-path gap. Setting
+        // LD_LIBRARY_PATH to the variant's real lib dir (where libc.so.6 /
+        // libc.so actually live) makes the loader find them regardless of its
+        // built-in defaults. Safe for musl (its loader is libc and a miss is
+        // harmless) and a no-op on RV where resolution already worked.
+        s.push_str(&alloc::format!(
+            "export LD_LIBRARY_PATH={d}/lib:/lib:/lib64\n",
+            d = dir,
+        ));
         // LTP shell-based cases (`.sh` files under ltp/testcases/bin) source
         // their lib helpers — `. tst_test.sh`, `. tst_net.sh`, `. cgroup_lib.sh`
         // and friends — via the shell's PATH search. Those helpers live next
