@@ -212,11 +212,28 @@ fn rebind_bin_to_disk_busybox() {
     // /busybox (shebang `#!/busybox sh`) + the full /bin applet set that
     // main.rs linked, now pointing at the LA busybox (place_inode replaces).
     let _ = fs::link_into("/", "busybox", bb.clone());
+    // Must mirror main.rs's /bin applet set exactly. main.rs links the
+    // RISC-V busybox, which can't execute on loongarch64, so every applet
+    // the contest scripts invoke has to be re-pointed here. `basename` is
+    // load-bearing: ltp_testcode.sh derives each case name with
+    // `basename "$file"` for its "RUN/FAIL LTP CASE <name>" lines — the
+    // exact strings the grader scores. If basename still resolves to the
+    // RISC-V binary it faults with INE, the name comes out blank, and the
+    // whole LTP group (~97% of the rubric) becomes unscorable even though
+    // the cases run. The earlier short list stopped at `kill` and dropped
+    // basename + the rest, zeroing LTP on LA. Keep this in sync with the
+    // main.rs list.
     const APPLETS: &[&str] = &[
-        "busybox", "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir",
-        "mv", "cp", "true", "false", "env", "pwd", "wc", "grep", "head",
-        "tail", "sort", "uniq", "tr", "find", "touch", "test", "[", "[[",
-        "stat", "sleep", "kill",
+        "busybox",
+        "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir", "mv", "cp",
+        "true", "false", "env", "pwd", "wc", "grep", "head", "tail", "sort",
+        "uniq", "tr", "find", "touch", "test", "[", "[[", "stat",
+        "sleep", "kill",
+        "basename", "dirname", "cut", "expr", "seq", "id", "printf", "date",
+        "chmod", "chown", "ln", "dd", "sync", "cmp", "od", "awk", "sed",
+        "xargs", "readlink", "mkfifo", "du", "df", "mount", "umount",
+        "chattr", "getconf", "tee", "yes", "mknod", "mktemp", "chgrp",
+        "dmesg", "ps", "free", "hostname", "md5sum", "diff", "unlink",
     ];
     for a in APPLETS {
         let _ = fs::link_into("/bin", a, bb.clone());
