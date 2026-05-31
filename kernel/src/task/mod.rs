@@ -25,9 +25,13 @@ const KSTACK_SIZE: usize = 64 * 1024;
 #[repr(C, align(16))]
 struct TaskStorage {
     buf: [u8; KSTACK_SIZE],
+    /// Parked kernel context (callee-saved regs + kernel sp) for the preemptive
+    /// scheduler. Holds where this task last `__switch`ed out — empty/`init`ed
+    /// to a first-run trampoline for a task that has never run.
+    kctx: crate::arch::TaskContext,
     /// loongarch64 vector-unit (FP/LSX/LASX) save slot. The kernel is
     /// soft-float, so a preempted task's live vector registers must be
-    /// parked here while another task runs (see `fp_context_switch`).
+    /// parked here while another task runs (see `context_switch_to`).
     #[cfg(target_arch = "loongarch64")]
     fp: crate::arch::loongarch64::fpu::FpContext,
 }
@@ -36,6 +40,7 @@ impl TaskStorage {
     fn boxed() -> Box<Self> {
         Box::new(Self {
             buf: [0u8; KSTACK_SIZE],
+            kctx: crate::arch::TaskContext::new(),
             #[cfg(target_arch = "loongarch64")]
             fp: crate::arch::loongarch64::fpu::FpContext::new(),
         })
@@ -64,6 +69,10 @@ impl TaskStorage {
 
     fn tf_ptr(&self) -> *mut TrapFrame {
         (self.kstack_top() - size_of::<TrapFrame>()) as *mut TrapFrame
+    }
+
+    fn kctx_ptr(&self) -> *mut crate::arch::TaskContext {
+        &self.kctx as *const _ as *mut _
     }
 
     #[cfg(target_arch = "loongarch64")]
@@ -150,6 +159,20 @@ impl Task {
 
     pub fn kstack_top(&self) -> usize {
         unsafe { (*self.storage.get()).kstack_top() }
+    }
+
+    /// Pointer to this task's parked kernel context (for `__switch`).
+    pub fn kctx_ptr(&self) -> *mut crate::arch::TaskContext {
+        unsafe { (*self.storage.get()).kctx_ptr() }
+    }
+
+    /// Prime this task's kernel context so the scheduler's first `__switch`
+    /// into it lands in the first-run trampoline (then enters user mode via
+    /// the normal trap-return path). Stack is the task's kstack just below its
+    /// TrapFrame — the same region a syscall handler would use.
+    pub fn init_kctx_for_first_run(&self) {
+        let sp = self.tf_ptr() as usize;
+        unsafe { (*self.storage.get()).kctx.init(task_first_run as usize, sp); }
     }
 
     /// loongarch64: pointer to this task's parked vector-unit state.
@@ -933,6 +956,11 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
     }
+    // Prime the kernel context for a first `__switch` into this task. (The
+    // initial task enters via run_user_loop instead and overwrites this on its
+    // first park, but ELF-spawned tasks reached only through the scheduler
+    // need it.)
+    task.init_kctx_for_first_run();
     task
 }
 
@@ -1244,6 +1272,10 @@ pub fn clone_current(
     unsafe {
         core::ptr::write(task.tf_ptr(), new_tf);
     }
+    // Prime the kernel context: the child has never run, so the scheduler's
+    // first `__switch` into it must land in the first-run trampoline, which
+    // sret's to the TrapFrame just written (the child returns 0 from fork).
+    task.init_kctx_for_first_run();
 
     // A fork starts a new thread group and so needs its own copy of the
     // parent's credentials; thread members share the parent's tgid (and thus
@@ -1425,32 +1457,61 @@ pub fn run_user_loop(task: &Arc<Task>) -> ! {
 /// one's — without this, two vector workloads silently corrupt each other.
 #[cfg(target_arch = "loongarch64")]
 pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
-    let from_pid = current_pid();
-    let next_tf = schedule_next_after_trap_inner(current_tf);
-    let to_pid = current_pid();
-    if to_pid != from_pid {
-        fp_context_switch(from_pid, to_pid);
-    }
-    next_tf
-}
-
-/// loongarch64: park `from`'s live vector registers and load `to`'s. Safe to
-/// call after the scheduler has returned (no task-table lock held); the
-/// hardware register file still holds `from`'s values because nothing in the
-/// kernel touches it.
-#[cfg(target_arch = "loongarch64")]
-fn fp_context_switch(from_pid: i32, to_pid: i32) {
-    if let Some(from) = task_by_pid(from_pid) {
-        unsafe { crate::arch::loongarch64::fpu::save(from.fp_ptr()) };
-    }
-    if let Some(to) = task_by_pid(to_pid) {
-        unsafe { crate::arch::loongarch64::fpu::restore(to.fp_ptr()) };
-    }
+    // The actual task change — and, on loongarch64, the FP/vector save+restore
+    // that goes with it — now happens inside the inner scheduler via
+    // `context_switch_to`, so this is a thin wrapper.
+    schedule_next_after_trap_inner(current_tf)
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
 pub fn schedule_next_after_trap(current_tf: *mut TrapFrame) -> *mut TrapFrame {
     schedule_next_after_trap_inner(current_tf)
+}
+
+extern "C" {
+    /// Restore a TrapFrame and return to its task's user mode (defined in
+    /// trap.S). Used by the first-run trampoline.
+    fn __trap_return(tf: *const TrapFrame) -> !;
+}
+
+/// First-run entry for a task that has never executed. The scheduler primes a
+/// fresh task's kernel context (see [`Task::init_kctx_for_first_run`]) so the
+/// first `__switch` into it lands here. CURRENT_PID is already this task, so
+/// restore its user TrapFrame and enter user mode via the normal trap return.
+extern "C" fn task_first_run() -> ! {
+    let tf = current_task().tf_ptr();
+    unsafe { __trap_return(tf) }
+}
+
+/// Park the currently-running task (`prev_pid`) and resume `next_pid` by
+/// switching kernel contexts. `next_pid` must already be published as
+/// CURRENT_PID, with its page table active and its pending signals delivered.
+/// Returns the now-running task's trap frame — in the resumed task's timeline
+/// that is its own frame, since we only return here once `prev_pid` runs again.
+///
+/// # Safety
+/// Call only from the scheduler at a point where no kernel lock is held; both
+/// pids must name live tasks with intact kernel stacks.
+unsafe fn context_switch_to(prev_pid: i32, next_pid: i32) -> *mut TrapFrame {
+    let prev_kctx = task_by_pid(prev_pid).map(|t| t.kctx_ptr());
+    let next_kctx = task_by_pid(next_pid).map(|t| t.kctx_ptr());
+    if let (Some(p), Some(n)) = (prev_kctx, next_kctx) {
+        // loongarch64: the kernel is soft-float, so the outgoing task's live
+        // FP/LSX/LASX state lives only in the hardware regs until parked. Save
+        // it and load the incoming task's before the GPR switch.
+        #[cfg(target_arch = "loongarch64")]
+        {
+            if let Some(prev) = task_by_pid(prev_pid) {
+                unsafe { crate::arch::loongarch64::fpu::save(prev.fp_ptr()) };
+            }
+            if let Some(next) = task_by_pid(next_pid) {
+                unsafe { crate::arch::loongarch64::fpu::restore(next.fp_ptr()) };
+            }
+        }
+        unsafe { crate::arch::switch_context(p, n) };
+    }
+    // Resumed: CURRENT_PID has been restored to us by whoever switched back.
+    current_task().tf_ptr()
 }
 
 fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame {
@@ -1625,7 +1686,7 @@ fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame 
         loop {
             // Try to pick a Ready task, skipping any that get killed by
             // their own signals on arrival.
-            let mut found: Option<*mut TrapFrame> = None;
+            let mut found: Option<i32> = None;
             while let Some(next) = pick_ready(cur_pid) {
                 CURRENT_PID.store(next.pid, Ordering::Relaxed);
                 let next_satp = next.memory_set.lock().satp();
@@ -1635,12 +1696,15 @@ fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame 
                 let next_tf = next.tf_ptr();
                 unsafe { crate::signal::check_signals(&next, &mut *next_tf); }
                 if !matches!(*next.state.lock(), TaskState::Zombie) {
-                    found = Some(next_tf);
+                    found = Some(next.pid);
                     break;
                 }
             }
-            if let Some(tf) = found {
-                return tf;
+            if let Some(next_pid) = found {
+                // Switch kernel context to the chosen task. If `cur` is a
+                // Zombie its parked context is simply never resumed; if it is
+                // Waiting it resumes when later woken and re-runs its syscall.
+                return unsafe { context_switch_to(cur_pid, next_pid) };
             }
             // No live Ready task. If cur is Zombie we must NOT return
             // its tf. Wait for either a sleeper to mature, an I/O event
@@ -1723,7 +1787,10 @@ fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame 
             }
         }
         CURRENT_PID.store(next.pid, Ordering::Relaxed);
-        return next_tf;
+        // Switch kernel contexts instead of just returning next's TrapFrame:
+        // `cur` (demoted to Ready above) parks here and resumes the next time
+        // the scheduler picks it; `next` resumes wherever it last parked.
+        return unsafe { context_switch_to(cur_pid, next.pid) };
     }
 
     current_tf

@@ -27,6 +27,23 @@ use loongarch64 as imp;
 /// its inherent methods, so it is portable across backends.
 pub use imp::trap::TrapFrame;
 
+/// Per-task parked kernel context (callee-saved regs + sp), backend-defined.
+/// The scheduler switches between tasks by saving one and restoring another.
+pub use imp::context::TaskContext;
+
+/// Switch kernel execution from the task whose context is `prev` to the one
+/// whose context is `next`: saves the current callee-saved state into `prev`
+/// and resumes `next` where it last switched out. Returns (in the original
+/// task's timeline) once that task is scheduled again.
+///
+/// # Safety
+/// `prev` and `next` must point to valid `TaskContext`s for live tasks with
+/// intact kernel stacks, and no kernel lock may be held across the call.
+#[inline]
+pub unsafe fn switch_context(prev: *mut TaskContext, next: *const TaskContext) {
+    imp::context::__switch(prev, next)
+}
+
 // ---- Traps ------------------------------------------------------------
 
 /// Install the trap vector(s) and start the preemption timer. Call once
