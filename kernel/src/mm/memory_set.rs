@@ -709,6 +709,58 @@ impl MemorySet {
         VirtAddr(start)
     }
 
+    /// SysV `shmat`: map a set of already-allocated, shared physical frames
+    /// into this address space. The frames are owned by the IPC segment (in
+    /// `sysv_ipc::SHM`); we clone each `Arc` so they stay live while *either*
+    /// the segment or this attachment references them — exactly SysV semantics
+    /// (memory persists past the creator's exit until IPC_RMID *and* the last
+    /// detach). With `at` == None we place the region at the mmap arena top;
+    /// otherwise we honor the caller's address (shmat with a non-NULL shmaddr),
+    /// replacing whatever was there. Returns the start VA, or usize::MAX on a
+    /// page-table-node OOM.
+    pub fn map_shared_frames(
+        &mut self,
+        frames: &[Arc<FrameTracker>],
+        perm: VmPerm,
+        at: Option<usize>,
+    ) -> VirtAddr {
+        let aligned = frames.len() * PAGE_SIZE;
+        if aligned == 0 {
+            return VirtAddr(usize::MAX);
+        }
+        let start = match at {
+            Some(a) => {
+                let s = a & !(PAGE_SIZE - 1);
+                // Replace any existing mapping in the target span (shmat at a
+                // fixed address overlays it, like MAP_FIXED).
+                self.unmap_range(VirtAddr(s), aligned);
+                s
+            }
+            None => {
+                let mut s = self.mmap_top.0;
+                let brk_hi = (self.brk_cur.0 + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                if s < brk_hi && s + aligned > self.brk_base.0 {
+                    s = brk_hi;
+                }
+                s
+            }
+        };
+        let end = start + aligned;
+        let mut area = VmArea::new(VirtAddr(start), VirtAddr(end), perm);
+        area.shared = true;
+        let pte_flags = perm.to_pte();
+        for (i, fr) in frames.iter().enumerate() {
+            let vpn = VirtPageNum(start / PAGE_SIZE + i);
+            self.page_table.map(vpn, fr.ppn, pte_flags);
+            area.frames.insert(vpn, fr.clone());
+        }
+        self.areas.push(area);
+        if start >= self.mmap_top.0 {
+            self.mmap_top = VirtAddr(end);
+        }
+        VirtAddr(start)
+    }
+
     /// `mmap(... MAP_FIXED ...)`: map exactly at `va`, replacing whatever
     /// was mapped in `[va, va+len)`. This is mandatory for the glibc
     /// dynamic loader: it reserves a span with one file mmap, then

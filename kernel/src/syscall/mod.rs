@@ -2,6 +2,7 @@
 
 pub mod nr;
 pub mod socket;
+pub mod sysv_ipc;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -233,13 +234,13 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(a0, a1, a2),
         nr::SYS_RT_SIGSUSPEND => sys_rt_sigsuspend(a0, a1),
         nr::SYS_SYSINFO => sys_sysinfo(a0),
-        // SysV shared memory: iozone -t (throughput mode), netperf, libcbench
-        // all try shmget/shmat. Stub as ENOSYS-ish failure (-1) which makes
-        // them fall back to non-SysV-shmem paths.
-        nr::SYS_SHMGET => -1,
-        nr::SYS_SHMCTL => -1,
-        nr::SYS_SHMAT => -1,
-        nr::SYS_SHMDT => -1,
+        // SysV shared memory: real shared-frame segments (kernel/src/syscall/
+        // sysv_ipc.rs). Unblocks the LTP shm* family and every test that uses
+        // a SysV segment as scaffolding.
+        nr::SYS_SHMGET => sysv_ipc::sys_shmget(a0 as i32, a1, a2 as i32),
+        nr::SYS_SHMAT => sysv_ipc::sys_shmat(a0 as i32, a1, a2 as i32),
+        nr::SYS_SHMDT => sysv_ipc::sys_shmdt(a0),
+        nr::SYS_SHMCTL => sysv_ipc::sys_shmctl(a0 as i32, a1 as i32, a2),
         nr::SYS_GETRUSAGE => sys_getrusage(a0 as i32, a1),
         nr::SYS_MEMBARRIER => 0,
         nr::SYS_TIMES => sys_times(a0),
