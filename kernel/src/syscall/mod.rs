@@ -183,7 +183,10 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_COPY_FILE_RANGE => sys_copy_file_range(a0 as i32, a1, a2 as i32, a3, a4, a5 as u32),
         nr::SYS_MEMFD_CREATE => sys_memfd_create(a0, a1 as u32),
         nr::SYS_SYNC | nr::SYS_FDATASYNC | nr::SYS_SYNCFS => 0,
-        nr::SYS_MLOCK | nr::SYS_MUNLOCK | nr::SYS_MLOCKALL | nr::SYS_MUNLOCKALL => 0,
+        nr::SYS_MLOCK | nr::SYS_MUNLOCK | nr::SYS_MLOCKALL | nr::SYS_MUNLOCKALL | nr::SYS_MLOCK2 => 0,
+        nr::SYS_OPENAT2 => sys_openat2(a0 as i32, a1, a2, a3),
+        nr::SYS_SENDMMSG => sys_sendmmsg(a0 as i32, a1, a2, a3 as i32),
+        nr::SYS_RECVMMSG => sys_recvmmsg(a0 as i32, a1, a2, a3 as i32),
         nr::SYS_MREMAP => sys_mremap(a0, a1, a2, a3 as i32, a4),
         nr::SYS_CLOSE_RANGE => sys_close_range(a0 as u32, a1 as u32, a2 as u32),
         nr::SYS_STATFS => sys_statfs(a0, a1),
@@ -2373,6 +2376,102 @@ fn sys_splice(fd_in: i32, off_in: usize, fd_out: i32, off_out: usize, len: usize
         let _ = task.copy_out_bytes(off_out, &(out_off + n_written as u64).to_le_bytes());
     }
     n_written as isize
+}
+
+/// openat2(dirfd, pathname, struct open_how *how, size): the extended openat.
+/// We route to openat after validating the open_how the way openat202/203
+/// expect — `size` must cover open_how, unknown RESOLVE_* bits are EINVAL, and
+/// a nonzero mode without O_CREAT/O_TMPFILE is EINVAL.
+fn sys_openat2(dirfd: i32, path: usize, how: usize, size: usize) -> isize {
+    const OPEN_HOW_SIZE: usize = 24; // u64 flags, u64 mode, u64 resolve
+    if size < OPEN_HOW_SIZE {
+        return EINVAL;
+    }
+    let task = current_task();
+    let Some(b) = task.copy_in_bytes(how, OPEN_HOW_SIZE) else { return EFAULT };
+    let flags = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let mode = u64::from_le_bytes(b[8..16].try_into().unwrap());
+    let resolve = u64::from_le_bytes(b[16..24].try_into().unwrap());
+    const RESOLVE_MASK: u64 = 0x3f; // NO_XDEV|NO_MAGICLINKS|NO_SYMLINKS|BENEATH|IN_ROOT|CACHED
+    if resolve & !RESOLVE_MASK != 0 {
+        return EINVAL;
+    }
+    const O_CREAT: u64 = 0o100;
+    const O_TMPFILE: u64 = 0o20000000;
+    if mode != 0 && (flags & (O_CREAT | O_TMPFILE)) == 0 {
+        return EINVAL;
+    }
+    sys_openat(dirfd, path, flags as i32, mode as i32)
+}
+
+// struct mmsghdr on lp64: struct msghdr (56 bytes) + unsigned msg_len (4) + pad.
+const MMSGHDR_STRIDE: usize = 64;
+const MMSG_LEN_OFF: usize = 56;
+
+/// sendmmsg/recvmmsg: send/receive an array of messages by looping the single
+/// -message syscall and stamping each entry's msg_len. recvmmsg blocks only as
+/// its inner recvmsg does; LTP's recvmmsg01 pre-queues the datagrams, so each
+/// receive finds data and the loop completes without a mid-array park.
+fn sys_sendmmsg(fd: i32, msgvec: usize, vlen: usize, flags: i32) -> isize {
+    if vlen == 0 {
+        return 0;
+    }
+    crate::net::poll();
+    let task = current_task();
+    let mut sent = 0i32;
+    for i in 0..core::cmp::min(vlen, 1024) {
+        let base = msgvec + i * MMSGHDR_STRIDE;
+        let r = socket::sys_sendmsg(fd, base, flags);
+        if r < 0 {
+            return if sent == 0 { r } else { sent as isize };
+        }
+        if task.copy_out_bytes(base + MMSG_LEN_OFF, &(r as u32).to_le_bytes()).is_none() {
+            return if sent == 0 { EFAULT } else { sent as isize };
+        }
+        sent += 1;
+    }
+    sent as isize
+}
+
+fn sys_recvmmsg(fd: i32, msgvec: usize, vlen: usize, flags: i32) -> isize {
+    if vlen == 0 {
+        return 0;
+    }
+    crate::net::poll();
+    let task = current_task();
+    // Force non-blocking for the whole array: an inner recvmsg that parked
+    // would rewind and re-enter recvmmsg from index 0, re-receiving into slots
+    // it already filled (and hanging when fewer than vlen datagrams arrive).
+    // recvmmsg's contract is "return the messages immediately available", so a
+    // would-block recvmsg (EAGAIN) just ends the batch.
+    let restore = socket::set_nonblock(fd, true);
+    let mut recvd = 0i32;
+    let mut first_err = 0isize;
+    for i in 0..core::cmp::min(vlen, 1024) {
+        let base = msgvec + i * MMSGHDR_STRIDE;
+        let r = socket::sys_recvmsg(fd, base, flags);
+        if r < 0 {
+            if recvd == 0 {
+                first_err = r;
+            }
+            break;
+        }
+        if task.copy_out_bytes(base + MMSG_LEN_OFF, &(r as u32).to_le_bytes()).is_none() {
+            if recvd == 0 {
+                first_err = EFAULT;
+            }
+            break;
+        }
+        recvd += 1;
+    }
+    if let Some(old) = restore {
+        socket::set_nonblock(fd, old);
+    }
+    if recvd == 0 && first_err != 0 {
+        first_err
+    } else {
+        recvd as isize
+    }
 }
 
 fn sys_name_to_handle_at(dfd: i32, path: usize, handle: usize, mount_id: usize, flags: i32) -> isize {

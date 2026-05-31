@@ -1117,6 +1117,20 @@ pub fn sys_recvmsg(fd: i32, msg_ptr: usize, flags: i32) -> isize {
 #[allow(dead_code)]
 fn _touch_handle(_h: SocketHandle) {}
 
+/// Temporarily force a socket fd's non-blocking flag, returning the previous
+/// value (None if fd isn't a socket). recvmmsg uses this to drain the
+/// immediately-available datagrams without ever parking mid-array (a parked
+/// recvmsg would rewind and re-run the whole recvmmsg, double-receiving).
+pub fn set_nonblock(fd: i32, nb: bool) -> Option<bool> {
+    with_socket(fd, |s| {
+        let mut st = s.state.lock();
+        let old = st.nonblock;
+        st.nonblock = nb;
+        old
+    })
+    .ok()
+}
+
 // ───────────────────────── AF_UNIX socketpair ──────────────────────────────
 //
 // A connected pair of stream sockets, modeled as two byte queues (one per
