@@ -1182,10 +1182,14 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         polls[i].revents = 0;
     }
 
-    // Classify fds: console (special blocking path) vs regular (we
-    // signal POLLIN immediately and let the subsequent read syscall
-    // do the actual blocking against the pipe / file).
-    let mut console_indices: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    // Collect every fd asked about POLLIN. Console fds are treated like any
+    // other readable source rather than via a dedicated blocking peek:
+    // fd_is_readable() checks the console non-blockingly, so they ride the
+    // same timeout-respecting, SIGKILL-killable park-retry path below. The
+    // old code special-cased a console fd into a blocking
+    // console_wait_readable() that ignored both the timeout and pending
+    // signals, so a NULL-timeout poll on the console wedged the task
+    // uninterruptibly (same class of bug as sys_pselect6's console branch).
     let mut other_indices: alloc::vec::Vec<(usize, Arc<crate::fs::File>)> = alloc::vec::Vec::new();
     for (i, p) in polls.iter().enumerate() {
         if p.fd < 0 {
@@ -1193,11 +1197,7 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         }
         if let Some(f) = task.fd_table.lock().get(p.fd) {
             if p.events & 0x1 != 0 {
-                if f.is_console {
-                    console_indices.push(i);
-                } else {
-                    other_indices.push((i, f));
-                }
+                other_indices.push((i, f));
             }
         }
     }
@@ -1215,26 +1215,11 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
             ready += 1;
         }
     }
-    if !console_indices.is_empty() {
-        if timeout == 0 && ready == 0 && other_indices.is_empty() {
-            // NULL timeout = block until something readable.
-            crate::fs::console_wait_readable();
-            for &i in &console_indices {
-                polls[i].revents = 0x1;
-            }
-            ready += console_indices.len() as isize;
-        } else if crate::fs::console_has_readable() {
-            for &i in &console_indices {
-                polls[i].revents = 0x1;
-            }
-            ready += console_indices.len() as isize;
-        }
-    }
     // If nothing was ready, yield so peers can produce data. The poll
     // (selectish) caller will see EAGAIN-via-zero and rerun us via the
     // scheduler's socket-waiter wake path. A zero timeout (poll) must
     // return immediately with 0 instead of parking.
-    if ready == 0 && !other_indices.is_empty() && console_indices.is_empty() && !zero_timeout {
+    if ready == 0 && !other_indices.is_empty() && !zero_timeout {
         // Finite timeout? Install a sleep deadline so we wake up when it
         // expires even if no fd ever became readable.
         if let Some(t) = timeout_ticks {
@@ -3453,85 +3438,80 @@ fn sys_pselect6(
         ready += 1;
     }
 
-    // Block if nothing is ready and we were asked to wait. The console
-    // path uses its dedicated peek+block; for socket-only select we mark
-    // ourselves Waiting + rewind sepc so the scheduler can advance peers.
-    // A zero timeout (poll) must never block: return the immediate count.
+    // Block if nothing is ready and we were asked to wait. We mark
+    // ourselves Waiting + rewind sepc so the scheduler can advance peers
+    // and — crucially — deliver a pending SIGKILL on the re-park (the
+    // scheduler's "Waiting + SIGKILL" check ends a task stuck in a blocking
+    // syscall). A zero timeout (poll) must never block: return the
+    // immediate count.
+    //
+    // Console read fds go through this same path, NOT a dedicated blocking
+    // peek. The old console branch called console_wait_readable(), which
+    // blocks on get_console_byte_blocking() while ignoring both the timeout
+    // AND pending signals: a case that selects on a console fd with a finite
+    // timeout (e.g. personality02 — it sets STICKY_TIMEOUTS then selects)
+    // parked forever and could not even be SIGKILLed by the per-case
+    // timeout, wedging the whole run uninterruptibly. fd_is_readable()
+    // already peeks the console non-blockingly, so the readiness re-scan
+    // below still detects real console input on a later retry, and a finite
+    // timeout now actually expires.
     if ready == 0 && !readers.is_empty() && !zero_timeout {
-        let mut console_in_set = false;
+        // Finite timeout? Install a sleep deadline so we wake up when
+        // it expires even if no fd ever became readable. iperf3's
+        // throttle loop selects with a finite timeout, expecting to be
+        // re-scheduled when the throttle interval ends.
+        if let Some(t) = timeout_ticks {
+            let now = crate::arch::now_ticks();
+            let deadline = crate::task::sleeper_deadline(task.pid)
+                .unwrap_or_else(|| {
+                    let d = now.saturating_add(t);
+                    crate::task::sleep_until(task.pid, d);
+                    d
+                });
+            if now >= deadline {
+                crate::task::forget_sleeper(task.pid);
+                // Timed out — write the (empty) bitmaps and return 0.
+                if rfds != 0 {
+                    let _ = task.copy_out_bytes(rfds, &r_out);
+                }
+                if wfds != 0 {
+                    let _ = task.copy_out_bytes(wfds, &w_out);
+                }
+                if efds != 0 {
+                    let _ = task.copy_out_bytes(efds, &zero);
+                }
+                return 0;
+            }
+        }
+        // Wake any peer parked on the loopback pipes before we sleep:
+        // the iperf3 control flow has the server poll (zero timeout)
+        // and the client block here on NULL timeout; nudging peers
+        // prevents a lost-wakeup deadlock where neither side runs.
+        crate::task::wake_socket_waiters();
+        // Park briefly: the same block_and_retry pattern used by
+        // socket reads. The scheduler picks another runnable task
+        // (often the peer that needs to send) and reattempts.
+        crate::task::mark_socket_waiter(task.pid);
+        *task.state.lock() = crate::task::TaskState::Waiting;
+        unsafe {
+            let tf = task.tf_ptr();
+            (*tf).rewind_syscall();
+        }
+        // Lost-wakeup guard: a peer that makes one of our read fds
+        // ready between the scan above and the Waiting store would fire
+        // wake_socket_waiters() while we were still Running (a no-op).
+        // Re-scan after parking; flip back to Ready if anything is now
+        // readable. This is what the UDP server (which selects on its
+        // datagram fd with no write set) relies on. Only reached when
+        // ready==0, so it never affects a caller whose write set kept
+        // it runnable.
         for (_, f) in &readers {
-            if f.is_console {
-                console_in_set = true;
+            if fd_is_readable(f) {
+                *task.state.lock() = crate::task::TaskState::Ready;
                 break;
             }
         }
-        if console_in_set {
-            crate::fs::console_wait_readable();
-            // After waking, recompute readiness.
-            for (fd, f) in &readers {
-                if fd_is_readable(f) {
-                    r_out[fd / 8] |= 1 << (fd % 8);
-                    ready += 1;
-                }
-            }
-        } else {
-            // Finite timeout? Install a sleep deadline so we wake up when
-            // it expires even if no fd ever became readable. iperf3's
-            // throttle loop selects with a finite timeout, expecting to be
-            // re-scheduled when the throttle interval ends.
-            if let Some(t) = timeout_ticks {
-                let now = crate::arch::now_ticks();
-                let deadline = crate::task::sleeper_deadline(task.pid)
-                    .unwrap_or_else(|| {
-                        let d = now.saturating_add(t);
-                        crate::task::sleep_until(task.pid, d);
-                        d
-                    });
-                if now >= deadline {
-                    crate::task::forget_sleeper(task.pid);
-                    // Timed out — write the (empty) bitmaps and return 0.
-                    if rfds != 0 {
-                        let _ = task.copy_out_bytes(rfds, &r_out);
-                    }
-                    if wfds != 0 {
-                        let _ = task.copy_out_bytes(wfds, &w_out);
-                    }
-                    if efds != 0 {
-                        let _ = task.copy_out_bytes(efds, &zero);
-                    }
-                    return 0;
-                }
-            }
-            // Wake any peer parked on the loopback pipes before we sleep:
-            // the iperf3 control flow has the server poll (zero timeout)
-            // and the client block here on NULL timeout; nudging peers
-            // prevents a lost-wakeup deadlock where neither side runs.
-            crate::task::wake_socket_waiters();
-            // Park briefly: the same block_and_retry pattern used by
-            // socket reads. The scheduler picks another runnable task
-            // (often the peer that needs to send) and reattempts.
-            crate::task::mark_socket_waiter(task.pid);
-            *task.state.lock() = crate::task::TaskState::Waiting;
-            unsafe {
-                let tf = task.tf_ptr();
-                (*tf).rewind_syscall();
-            }
-            // Lost-wakeup guard: a peer that makes one of our read fds
-            // ready between the scan above and the Waiting store would fire
-            // wake_socket_waiters() while we were still Running (a no-op).
-            // Re-scan after parking; flip back to Ready if anything is now
-            // readable. This is what the UDP server (which selects on its
-            // datagram fd with no write set) relies on. Only reached when
-            // ready==0, so it never affects a caller whose write set kept
-            // it runnable.
-            for (_, f) in &readers {
-                if fd_is_readable(f) {
-                    *task.state.lock() = crate::task::TaskState::Ready;
-                    break;
-                }
-            }
-            return -11; // EAGAIN — caller will be retried by scheduler.
-        }
+        return -11; // EAGAIN — caller will be retried by scheduler.
     }
 
     // Write result bitmaps back.
