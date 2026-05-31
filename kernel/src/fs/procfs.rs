@@ -411,24 +411,27 @@ fn gen_maps(pid: i32) -> Vec<u8> {
     let ms = task.memory_set.lock();
     let brk_base_vpn = ms.brk_base.0 >> crate::mm::address::PAGE_SIZE_BITS;
     // Sort areas by start VPN.
-    let mut areas: Vec<(usize, usize, crate::mm::memory_set::VmPerm)> = ms
+    let mut areas: Vec<(usize, usize, crate::mm::memory_set::VmPerm, bool)> = ms
         .areas
         .iter()
         .filter(|a| a.perm.contains(crate::mm::memory_set::VmPerm::U))
-        .map(|a| (a.vpn_start.0, a.vpn_end.0, a.perm))
+        .map(|a| (a.vpn_start.0, a.vpn_end.0, a.perm, a.shared))
         .collect();
-    areas.sort_by_key(|&(s, _, _)| s);
+    areas.sort_by_key(|&(s, _, _, _)| s);
 
     // Heuristic: the highest-address user area is the stack.
-    let stack_start = areas.iter().map(|&(s, _, _)| s).max().unwrap_or(0);
+    let stack_start = areas.iter().map(|&(s, _, _, _)| s).max().unwrap_or(0);
 
     let mut out = String::new();
-    for (s, e, p) in &areas {
+    for (s, e, p, shared) in &areas {
         let start = s << crate::mm::address::PAGE_SIZE_BITS;
         let end = e << crate::mm::address::PAGE_SIZE_BITS;
         let r = if p.contains(crate::mm::memory_set::VmPerm::R) { 'r' } else { '-' };
         let w = if p.contains(crate::mm::memory_set::VmPerm::W) { 'w' } else { '-' };
         let x = if p.contains(crate::mm::memory_set::VmPerm::X) { 'x' } else { '-' };
+        // 4th flag: 's' for a MAP_SHARED area, 'p' (private/copy-on-write) else.
+        // mmap04 maps with MAP_SHARED and greps /proc/self/maps for the 's'.
+        let sh = if *shared { 's' } else { 'p' };
         let name = if *s == brk_base_vpn {
             "[heap]"
         } else if *s == stack_start {
@@ -437,8 +440,8 @@ fn gen_maps(pid: i32) -> Vec<u8> {
             ""
         };
         out.push_str(&format!(
-            "{:08x}-{:08x} {}{}{}p 00000000 00:00 0          {}\n",
-            start, end, r, w, x, name
+            "{:08x}-{:08x} {}{}{}{} 00000000 00:00 0          {}\n",
+            start, end, r, w, x, sh, name
         ));
     }
     out.into_bytes()
