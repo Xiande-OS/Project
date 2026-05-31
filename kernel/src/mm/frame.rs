@@ -40,6 +40,24 @@ pub fn alloc() -> Option<FrameTracker> {
     res
 }
 
+/// Allocate a frame WITHOUT zeroing it. Only sound when the caller
+/// immediately overwrites the entire page; otherwise stale physical
+/// contents would leak to user space. The fork copy path qualifies — it
+/// does a full-page `copy_from_slice` straight after — and skipping the
+/// zero there removes a redundant 4 KiB write per copied page (the page is
+/// zeroed and then overwritten), which matters when a busybox `fork`
+/// duplicates a multi-thousand-page address space on every shell command.
+pub fn alloc_uninit() -> Option<FrameTracker> {
+    let res = FRAME_ALLOC
+        .lock()
+        .alloc(1)
+        .map(|ppn_usize| FrameTracker { ppn: PhysPageNum(ppn_usize) });
+    if res.is_some() {
+        ALLOCATED_PAGES.fetch_add(1, Ordering::Relaxed);
+    }
+    res
+}
+
 pub fn dealloc(ppn: PhysPageNum) {
     FRAME_ALLOC.lock().dealloc(ppn.0, 1);
     ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
