@@ -30,6 +30,16 @@ pub fn init(pa_start: PhysAddr, pa_end: PhysAddr) {
 }
 
 pub fn alloc() -> Option<FrameTracker> {
+    if let Some(f) = try_alloc_zeroed() {
+        return Some(f);
+    }
+    // Out of frames: reclaim a finished fork/thread-storm's dead leftovers
+    // (their user frames are freed as the tasks are reaped) and retry once.
+    crate::task::emergency_reclaim();
+    try_alloc_zeroed()
+}
+
+fn try_alloc_zeroed() -> Option<FrameTracker> {
     // The frame pool is guarded by a plain spin::Mutex (inside
     // LockedFrameAllocator) that the preemption count can't see; disable
     // preemption around it so a preempted holder can't deadlock the next
@@ -54,6 +64,14 @@ pub fn alloc() -> Option<FrameTracker> {
 /// zeroed and then overwritten), which matters when a busybox `fork`
 /// duplicates a multi-thousand-page address space on every shell command.
 pub fn alloc_uninit() -> Option<FrameTracker> {
+    if let Some(f) = try_alloc_uninit() {
+        return Some(f);
+    }
+    crate::task::emergency_reclaim();
+    try_alloc_uninit()
+}
+
+fn try_alloc_uninit() -> Option<FrameTracker> {
     crate::sync::preempt_disable();
     let res = FRAME_ALLOC
         .lock()

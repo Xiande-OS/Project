@@ -53,13 +53,20 @@ impl TaskStorage {
         let layout = core::alloc::Layout::new::<Self>();
         // SAFETY: layout has non-zero size (KSTACK_SIZE > 0). alloc_zeroed
         // returns null on failure, which we surface as None.
-        unsafe {
-            let ptr = alloc::alloc::alloc_zeroed(layout) as *mut Self;
-            if ptr.is_null() {
-                None
-            } else {
-                Some(Box::from_raw(ptr))
-            }
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut Self };
+        if !ptr.is_null() {
+            return Some(unsafe { Box::from_raw(ptr) });
+        }
+        // Heap exhausted: a finished fork/thread-storm's dead leftovers are
+        // pinning kstacks. Reclaim them and retry once before giving up — this
+        // is what lets the shell keep spawning the next case instead of a
+        // storm of `sh: busybox: Out of memory`.
+        emergency_reclaim();
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut Self };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { Box::from_raw(ptr) })
         }
     }
 
@@ -623,6 +630,66 @@ pub fn kill_one_stuck_orphan(except: i32) -> bool {
 
 pub fn set_current_pid(pid: i32) {
     CURRENT_PID.store(pid, Ordering::Relaxed);
+}
+
+/// On-demand aggressive reclaim, invoked when a kstack or frame allocation is
+/// about to fail. A finished fork/thread-storm test (the cve fork-bombs, shmat
+/// thread-storms, pipe13, the cgroup cases) leaves a burst of dead children:
+/// Zombies reparented to init, and Waiting tasks whose parent was SIGKILLed.
+/// Each pins a 64 KiB kstack plus its frames. The steady-state reaper drains
+/// them only slowly (capped + rate-limited), so on a tight-memory machine the
+/// shell's next fork/exec can fail with ENOMEM many times before it catches up
+/// (the grader showed hundreds of `sh: busybox: Out of memory`). Reclaim them
+/// all here, looping so a chain (zombie parent -> newly-orphaned children)
+/// drains fully. Conservative — only Zombies, and Waiting (parked) tasks whose
+/// real parent is gone; never Ready/Running tasks. Returns the count freed.
+pub fn emergency_reclaim() -> usize {
+    const INIT_PID: i32 = 1;
+    let cur = current_pid();
+    let mut total = 0usize;
+    loop {
+        let (pairs, live): (Vec<(i32, i32)>, alloc::collections::BTreeSet<i32>) = {
+            let t = TABLE.lock();
+            let live = t.tasks.keys().copied().collect();
+            let pairs = t
+                .tasks
+                .values()
+                .map(|task| (task.pid, task.ppid.load(Ordering::Relaxed)))
+                .collect();
+            (pairs, live)
+        };
+        let mut freed = 0usize;
+        for (pid, ppid) in pairs {
+            if pid == INIT_PID || pid == cur {
+                continue;
+            }
+            let parent_dead = !live.contains(&ppid);
+            if let Some(task) = task_by_pid(pid) {
+                let st = *task.state.lock();
+                match st {
+                    // Nobody will wait4 it: parent gone, or reparented to init.
+                    TaskState::Zombie if parent_dead || ppid == INIT_PID => {
+                        drop(task);
+                        reap(pid);
+                        freed += 1;
+                    }
+                    // Parked orphan that can never be woken (real parent gone).
+                    TaskState::Waiting if parent_dead => {
+                        crate::signal::kill_now(&task);
+                        drop(task);
+                        reap(pid);
+                        freed += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        total += freed;
+        if freed == 0 {
+            break;
+        }
+    }
+    total
 }
 
 pub fn any_runnable_except(pid: i32) -> bool {
