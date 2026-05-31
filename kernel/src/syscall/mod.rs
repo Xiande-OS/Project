@@ -1904,6 +1904,8 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
     const F_GETLEASE: i32 = 1025;
     const F_SETPIPE_SZ: i32 = 1031;
     const F_GETPIPE_SZ: i32 = 1032;
+    const F_ADD_SEALS: i32 = 1033;
+    const F_GET_SEALS: i32 = 1034;
     // lease / lock types (also F_SETLEASE arg)
     const F_RDLCK: i32 = 0;
     const F_WRLCK: i32 = 1;
@@ -1913,6 +1915,24 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
 
     let task = current_task();
     match cmd {
+        // memfd file seals. Stored on the TmpfsFile inode so a subsequent
+        // F_GET_SEALS reads them back (memfd_create01 adds then verifies).
+        F_ADD_SEALS => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            match file.inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+                Some(tf) => {
+                    if tf.add_seals(arg as u32) { 0 } else { -1 } // EPERM if already F_SEAL_SEAL
+                }
+                None => -22, // EINVAL: not a seal-capable fd
+            }
+        }
+        F_GET_SEALS => {
+            let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+            match file.inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+                Some(tf) => tf.seals() as isize,
+                None => -22, // EINVAL
+            }
+        }
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let file = match task.fd_table.lock().get(fd) {
                 Some(f) => f,

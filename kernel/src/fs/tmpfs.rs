@@ -67,6 +67,27 @@ pub struct TmpfsFile {
     data: Mutex<Vec<u8>>,
     pub meta: Mutex<Meta>,
     xattrs: XattrStore,
+    /// F_SEAL_* bits set via fcntl(F_ADD_SEALS) — used by memfd_create. Stored
+    /// so F_GET_SEALS reads them back (memfd_create01 adds seals then checks).
+    seals: core::sync::atomic::AtomicU32,
+}
+
+impl TmpfsFile {
+    /// Current memfd seal bitmask (fcntl F_GET_SEALS).
+    pub fn seals(&self) -> u32 {
+        self.seals.load(Ordering::Relaxed)
+    }
+    /// Add seal bits (fcntl F_ADD_SEALS). Returns false if F_SEAL_SEAL is
+    /// already set (further sealing forbidden) — what memfd_create rejects.
+    pub fn add_seals(&self, add: u32) -> bool {
+        const F_SEAL_SEAL: u32 = 0x0001;
+        let cur = self.seals.load(Ordering::Relaxed);
+        if cur & F_SEAL_SEAL != 0 {
+            return false;
+        }
+        self.seals.fetch_or(add, Ordering::Relaxed);
+        true
+    }
 }
 
 impl Drop for TmpfsFile {
@@ -113,6 +134,7 @@ impl TmpfsFile {
             data: Mutex::new(Vec::new()),
             meta: Mutex::new(Meta::default()),
             xattrs: Mutex::new(BTreeMap::new()),
+            seals: core::sync::atomic::AtomicU32::new(0),
         }
     }
 }
