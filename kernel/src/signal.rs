@@ -383,17 +383,7 @@ pub fn raise_signal(target: &Arc<Task>, signo: u32) -> bool {
                 crate::sync::futex::interrupt_wait(t.pid);
             }
         }
-        let target_pid = target.pid;
-        let descendants = collect_descendants(target_pid);
-        for d in descendants {
-            d.signals.pending.fetch_or(sigbit(SIGKILL), Ordering::SeqCst);
-            let mut s = d.state.lock();
-            if *s == TaskState::Waiting {
-                *s = TaskState::Ready;
-            }
-            drop(s);
-            crate::sync::futex::interrupt_wait(d.pid);
-        }
+        post_sigkill_to_descendants(target.pid);
     }
     true
 }
@@ -452,6 +442,26 @@ fn collect_descendants(root_pid: i32) -> alloc::vec::Vec<Arc<crate::task::Task>>
     }
     included.remove(&root_pid);
     all.into_iter().filter(|t| included.contains(&t.pid)).collect()
+}
+
+/// Post SIGKILL to every descendant of `root_pid` (children, grandchildren, …)
+/// and wake any that are parked, so the whole subtree collapses when each is
+/// next scheduled. Shared by the kill(2) cascade and `kill_now` so that ANY
+/// forced termination of a process — by the userspace timeout, the watchdog,
+/// the fault-loop breaker, or the OOM reclaimer — also tears down the test's
+/// orphaned children instead of leaving them alive holding RAM (which is how a
+/// SIGKILLed fork test's leftovers used to pile up until the machine OOMed).
+pub fn post_sigkill_to_descendants(root_pid: i32) {
+    for d in collect_descendants(root_pid) {
+        d.signals.pending.fetch_or(sigbit(SIGKILL), Ordering::SeqCst);
+        {
+            let mut s = d.state.lock();
+            if *s == TaskState::Waiting {
+                *s = TaskState::Ready;
+            }
+        }
+        crate::sync::futex::interrupt_wait(d.pid);
+    }
 }
 
 /// Pop the lowest pending non-blocked signal. None if none deliverable.
@@ -718,6 +728,12 @@ pub fn has_pending_sigkill(task: &Arc<Task>) -> bool {
 pub fn kill_now(task: &Arc<Task>) {
     clear_pending(task, SIGKILL);
     deliver_default_terminate(task, SIGKILL as i32, false);
+    // Collapse the whole subtree too. kill_now is the kernel-internal kill
+    // (watchdog, fault-loop breaker, fault recovery, OOM reclaimer); unlike the
+    // kill(2) cascade it previously freed only this task + its threads, leaving
+    // a wedged test's child processes alive to pin RAM. Tear them down so the
+    // kill actually reclaims the memory.
+    post_sigkill_to_descendants(task.pid);
 }
 
 /// Release a terminated task's heavy resources NOW instead of at reap: free
