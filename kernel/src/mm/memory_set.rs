@@ -606,6 +606,23 @@ impl MemorySet {
             self.brk_cur = new_brk;
             return self.brk_cur;
         }
+        // Bound the heap. We eagerly back every brk page (no demand paging),
+        // so an unbounded grow — e.g. LTP sbrk02, which probes the limit by
+        // doubling the break until it fails — would allocate the entire frame
+        // pool one page at a time in the loop below, and with no signal check
+        // do so uninterruptibly (the per-case test timeout's SIGKILL can't
+        // land mid-loop, so the whole run wedges). Linux bounds brk by
+        // RLIMIT_DATA + the mmap gap and never backs a page until it faults;
+        // we approximate that with a fixed ceiling so an oversized request
+        // fails fast (userland gets the old break back = ENOMEM) instead of
+        // draining RAM. 128 MiB is far above any contest program's real heap
+        // (malloc routes large requests through mmap, not brk), yet well below
+        // the point where eagerly backing the grow would itself take long
+        // enough to look like a hang.
+        const BRK_MAX_HEAP: usize = 128 * 1024 * 1024;
+        if new_brk.0 > self.brk_base.0.saturating_add(BRK_MAX_HEAP) {
+            return self.brk_cur;
+        }
         // Grow.
         let old_top_vpn = self.brk_cur.ceil();
         let new_top_vpn = new_brk.ceil();
@@ -620,7 +637,17 @@ impl MemorySet {
             // Append frames.
             let area = &mut self.areas[i];
             let pte_flags = heap_perm.to_pte();
+            let killing = crate::task::current_task();
             for vpn_raw in old_top_vpn.0..new_top_vpn.0 {
+                // Stay killable on a large grow: a pending SIGKILL (the
+                // per-case test timeout) must end us instead of being
+                // deferred until this loop finishes draining memory. Check
+                // cheaply, every 1024 pages, and commit the partial break.
+                if vpn_raw & 1023 == 0 && crate::signal::has_pending_sigkill(&killing) {
+                    area.vpn_end = VirtPageNum(vpn_raw);
+                    self.brk_cur = VirtAddr(vpn_raw << crate::mm::address::PAGE_SIZE_BITS);
+                    return self.brk_cur;
+                }
                 let vpn = VirtPageNum(vpn_raw);
                 if area.frames.contains_key(&vpn) {
                     continue;
