@@ -203,6 +203,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
             else { sys_pwritev(a0 as i32, a1, a2, a3 as u64) }
         }
         nr::SYS_MINCORE => sys_mincore(a0, a1, a2),
+        nr::SYS_NAME_TO_HANDLE_AT => sys_name_to_handle_at(a0 as i32, a1, a2, a3, a4 as i32),
+        nr::SYS_OPEN_BY_HANDLE_AT => sys_open_by_handle_at(a0 as i32, a1, a2 as i32),
         nr::SYS_TIMERFD_CREATE => sys_timerfd_create(a0 as i32, a1 as i32),
         nr::SYS_TIMERFD_SETTIME => sys_timerfd_settime(a0 as i32, a1 as i32, a2, a3),
         nr::SYS_TIMERFD_GETTIME => sys_timerfd_gettime(a0 as i32, a1),
@@ -2290,6 +2292,109 @@ fn sys_mincore(addr: usize, length: usize, vec: usize) -> isize {
         return EFAULT;
     }
     0
+}
+
+/// name_to_handle_at / open_by_handle_at registry. name_to_handle_at hands the
+/// caller an opaque `struct file_handle` naming an inode; open_by_handle_at
+/// re-opens it. We encode the handle as an 8-byte registry id and keep the
+/// inode alive in this map so the reopen finds the same file. Bounded by the
+/// number of name_to_handle_at calls in a run (a few dozen across the LTP
+/// cases) — never reclaimed, like a real fs's persistent handles.
+static HANDLES: crate::sync::Mutex<alloc::collections::BTreeMap<u64, Arc<dyn Inode>>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
+static NEXT_HANDLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Our `f_handle` payload is the 8-byte registry id; total struct file_handle
+/// written is handle_bytes(4) + handle_type(4) + 8.
+const HANDLE_PAYLOAD: u32 = 8;
+const MAX_HANDLE_SZ: u32 = 128;
+
+fn sys_name_to_handle_at(dfd: i32, path: usize, handle: usize, mount_id: usize, flags: i32) -> isize {
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    const AT_SYMLINK_FOLLOW: i32 = 0x400;
+    const AT_HANDLE_FID: i32 = 0x200;
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_FOLLOW | AT_HANDLE_FID) != 0 {
+        return EINVAL;
+    }
+    let task = current_task();
+    // Read the caller's handle_bytes (its f_handle buffer capacity).
+    let Some(hdr) = task.copy_in_bytes(handle, 4) else { return EFAULT };
+    let cap = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+    if cap > MAX_HANDLE_SZ {
+        return EINVAL;
+    }
+    if cap < HANDLE_PAYLOAD {
+        // Report the size we need and fail, exactly as the kernel does so
+        // callers can resize and retry (name_to_handle_at01/02 EOVERFLOW case).
+        let _ = task.copy_out_bytes(handle, &HANDLE_PAYLOAD.to_le_bytes());
+        return -75; // EOVERFLOW
+    }
+    let Some(pstr) = copy_path(path) else { return EFAULT };
+    let inode = if pstr.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return ENOENT;
+        }
+        // The dirfd itself.
+        if dfd == -100 {
+            cwd_inode()
+        } else {
+            match task.fd_table.lock().get(dfd) {
+                Some(f) => f.inode.clone(),
+                None => return EBADF,
+            }
+        }
+    } else {
+        match resolve_at_with_err(dfd, &pstr) {
+            Ok(i) => i,
+            Err(e) => return e as isize,
+        }
+    };
+    let id = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    HANDLES.lock().insert(id, inode);
+    // struct file_handle: handle_bytes(4) + handle_type(4) + f_handle[8].
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&HANDLE_PAYLOAD.to_le_bytes());
+    out[4..8].copy_from_slice(&1i32.to_le_bytes()); // handle_type (nonzero)
+    out[8..16].copy_from_slice(&id.to_le_bytes());
+    if task.copy_out_bytes(handle, &out).is_none() {
+        return EFAULT;
+    }
+    if mount_id != 0 && task.copy_out_bytes(mount_id, &1i32.to_le_bytes()).is_none() {
+        return EFAULT;
+    }
+    0
+}
+
+fn sys_open_by_handle_at(mount_fd: i32, handle: usize, flags: i32) -> isize {
+    // Requires CAP_DAC_READ_SEARCH; open_by_handle_at02 drops to nobody and
+    // expects EPERM, checked before anything else.
+    if current_euid() != 0 {
+        return -1; // EPERM
+    }
+    let task = current_task();
+    let Some(hdr) = task.copy_in_bytes(handle, 8) else { return EFAULT };
+    let bytes = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+    if bytes < HANDLE_PAYLOAD || bytes > MAX_HANDLE_SZ {
+        return EINVAL;
+    }
+    // mount_fd must be a valid fd referring to the filesystem (EBADF otherwise).
+    if mount_fd != -100 && task.fd_table.lock().get(mount_fd).is_none() {
+        return EBADF;
+    }
+    let Some(full) = task.copy_in_bytes(handle, 8 + bytes as usize) else { return EFAULT };
+    let id = u64::from_le_bytes(full[8..16].try_into().unwrap());
+    let Some(inode) = HANDLES.lock().get(&id).cloned() else {
+        return -116; // ESTALE: handle doesn't name a known inode
+    };
+    let acc = flags & 0o3;
+    let readable = acc == 0 || acc == 2;
+    let writable = acc == 1 || acc == 2;
+    let file = Arc::new(File::from_inode(inode, readable, writable, false));
+    let res = task.fd_table.lock().alloc(file, false);
+    match res {
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
+    }
 }
 
 struct TimerFd {
