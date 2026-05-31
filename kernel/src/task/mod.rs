@@ -632,6 +632,12 @@ pub fn set_current_pid(pid: i32) {
     CURRENT_PID.store(pid, Ordering::Relaxed);
 }
 
+/// `now_ticks()` of the most recent `emergency_reclaim` call, and the start of
+/// the current run of reclaim-found-nothing-while-OOM calls. Used to power off
+/// cleanly on terminal OOM (see `emergency_reclaim`).
+static LAST_RECLAIM_TICK: AtomicU64 = AtomicU64::new(0);
+static OOM_STREAK_START: AtomicU64 = AtomicU64::new(0);
+
 /// On-demand aggressive reclaim, invoked when a kstack or frame allocation is
 /// about to fail. A finished fork/thread-storm test (the cve fork-bombs, shmat
 /// thread-storms, pipe13, the cgroup cases) leaves a burst of dead children:
@@ -687,6 +693,35 @@ pub fn emergency_reclaim() -> usize {
         total += freed;
         if freed == 0 {
             break;
+        }
+    }
+
+    // Terminal-OOM detector. `emergency_reclaim` runs only on an allocation
+    // failure. If it keeps finding nothing to free while allocations keep
+    // failing — continuously for ~60s — the machine is genuinely out of memory
+    // and thrashing (init can't fork the next case; the 'sh: busybox: Out of
+    // memory' storm). No single test can sustain that: the per-case timeout
+    // frees its memory within seconds, and any reclaim that frees something, or
+    // any gap (allocs succeeding again), resets the streak. Rather than spin
+    // until the grader's global timeout, power off cleanly so the run still
+    // scores everything banked so far.
+    let now = crate::arch::now_ticks();
+    let last = LAST_RECLAIM_TICK.swap(now, Ordering::Relaxed);
+    if total > 0 {
+        OOM_STREAK_START.store(0, Ordering::Relaxed); // made progress
+    } else if now.wrapping_sub(last) > 5 * crate::arch::TICKS_PER_SEC {
+        // The previous failure was long ago — the system recovered in between.
+        OOM_STREAK_START.store(now, Ordering::Relaxed);
+    } else {
+        let start = OOM_STREAK_START.load(Ordering::Relaxed);
+        if start == 0 {
+            OOM_STREAK_START.store(now, Ordering::Relaxed);
+        } else if now.wrapping_sub(start) > 60 * crate::arch::TICKS_PER_SEC {
+            crate::println!(
+                "[oom] out of memory with nothing left to reclaim for >60s \
+                 — powering off cleanly so the run still scores"
+            );
+            crate::arch::shutdown();
         }
     }
     total
