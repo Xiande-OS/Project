@@ -307,6 +307,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_INOTIFY_RM_WATCH => 0,
         nr::SYS_SIGNALFD4 => sys_signalfd4(a0 as i32, a1, a2 as usize, a3 as i32),
         nr::SYS_SOCKET => { crate::net::poll(); socket::sys_socket(a0 as i32, a1 as i32, a2 as i32) }
+        nr::SYS_SOCKETPAIR => socket::sys_socketpair(a0 as i32, a1 as i32, a2 as i32, a3),
         nr::SYS_BIND => { crate::net::poll(); socket::sys_bind(a0 as i32, a1, a2) }
         nr::SYS_LISTEN => { crate::net::poll(); socket::sys_listen(a0 as i32, a1 as i32) }
         nr::SYS_ACCEPT4 => { crate::net::poll(); socket::sys_accept4(a0 as i32, a1, a2, a3 as i32) }

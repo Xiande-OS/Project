@@ -1116,3 +1116,128 @@ pub fn sys_recvmsg(fd: i32, msg_ptr: usize, flags: i32) -> isize {
 // Avoid unused-import warning in some builds.
 #[allow(dead_code)]
 fn _touch_handle(_h: SocketHandle) {}
+
+// ───────────────────────── AF_UNIX socketpair ──────────────────────────────
+//
+// A connected pair of stream sockets, modeled as two byte queues (one per
+// direction). Each endpoint reads the queue its peer writes and writes the
+// queue its peer reads — so a write on fd[0] is readable on fd[1] and vice
+// versa. smoltcp does only IP, so this is a self-contained in-kernel pair,
+// enough for socketpair01 (bidirectional data) and the tests that use a
+// socketpair as scaffolding (splice05, etc.).
+
+const EPIPE: isize = -32;
+
+struct UnixPairInner {
+    a_to_b: alloc::collections::VecDeque<u8>,
+    b_to_a: alloc::collections::VecDeque<u8>,
+    a_closed: bool,
+    b_closed: bool,
+}
+
+pub struct UnixStream {
+    inner: Arc<crate::sync::Mutex<UnixPairInner>>,
+    /// true = endpoint A (reads b_to_a, writes a_to_b); false = endpoint B.
+    side_a: bool,
+}
+
+impl crate::fs::Inode for UnixStream {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn kind(&self) -> crate::fs::FileType {
+        crate::fs::FileType::Pipe
+    }
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> crate::fs::Result<usize> {
+        let mut g = self.inner.lock();
+        let q = if self.side_a { &mut g.b_to_a } else { &mut g.a_to_b };
+        let n = core::cmp::min(buf.len(), q.len());
+        for b in buf.iter_mut().take(n) {
+            *b = q.pop_front().unwrap();
+        }
+        Ok(n)
+    }
+    fn write_at(&self, _offset: u64, data: &[u8]) -> crate::fs::Result<usize> {
+        let mut g = self.inner.lock();
+        let peer_closed = if self.side_a { g.b_closed } else { g.a_closed };
+        if peer_closed {
+            return Err(EPIPE as i32);
+        }
+        let q = if self.side_a { &mut g.a_to_b } else { &mut g.b_to_a };
+        q.extend(data.iter().copied());
+        Ok(data.len())
+    }
+}
+
+impl Drop for UnixStream {
+    fn drop(&mut self) {
+        let mut g = self.inner.lock();
+        if self.side_a {
+            g.a_closed = true;
+        } else {
+            g.b_closed = true;
+        }
+    }
+}
+
+pub fn sys_socketpair(domain: i32, kind: i32, proto: i32, sv: usize) -> isize {
+    const AF_UNIX: i32 = 1; // == AF_LOCAL
+    const AF_INET6: i32 = 10;
+    // Match Linux's error taxonomy (socketpair01 pins it down): only AF_UNIX
+    // can be paired here; the IP families have no socketpair op (EOPNOTSUPP);
+    // an unknown family is EAFNOSUPPORT.
+    match domain {
+        AF_UNIX => {}
+        AF_INET | AF_INET6 => return EOPNOTSUPP,
+        _ => return EAFNOSUPPORT,
+    }
+    let base = kind & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if base != SOCK_STREAM && base != SOCK_DGRAM {
+        return EINVAL;
+    }
+    // AF_UNIX accepts only the default protocol (0); anything else is
+    // EPROTONOSUPPORT.
+    if proto != 0 {
+        return EPROTONOSUPPORT;
+    }
+    let cloexec = (kind & SOCK_CLOEXEC) != 0;
+    let inner = Arc::new(crate::sync::Mutex::new(UnixPairInner {
+        a_to_b: alloc::collections::VecDeque::new(),
+        b_to_a: alloc::collections::VecDeque::new(),
+        a_closed: false,
+        b_closed: false,
+    }));
+    let ea = Arc::new(File::from_inode(
+        Arc::new(UnixStream { inner: inner.clone(), side_a: true }),
+        true,
+        true,
+        false,
+    ));
+    let eb = Arc::new(File::from_inode(
+        Arc::new(UnixStream { inner: inner.clone(), side_a: false }),
+        true,
+        true,
+        false,
+    ));
+    let task = current_task();
+    let fd0 = match task.fd_table.lock().alloc(ea, cloexec) {
+        Ok(f) => f,
+        Err(e) => return e as isize,
+    };
+    let fd1 = match task.fd_table.lock().alloc(eb, cloexec) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = task.fd_table.lock().close(fd0);
+            return e as isize;
+        }
+    };
+    let mut out = [0u8; 8];
+    out[0..4].copy_from_slice(&(fd0 as i32).to_le_bytes());
+    out[4..8].copy_from_slice(&(fd1 as i32).to_le_bytes());
+    if task.copy_out_bytes(sv, &out).is_none() {
+        let _ = task.fd_table.lock().close(fd0);
+        let _ = task.fd_table.lock().close(fd1);
+        return EFAULT;
+    }
+    0
+}
