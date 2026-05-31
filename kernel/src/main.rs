@@ -220,6 +220,35 @@ nogroup:x:65533:\n",
             d.create_special("rtc0", fs::devfs::DevKind::Null).ok();
         }
     }
+    // /sys/kernel/mm/{ksm,transparent_hugepage} — tst_sys_conf in the ksm0*
+    // and THP cases saves/restores these tunables and TBROKs ("Path not found:
+    // /sys/kernel/mm/ksm/run") when absent. Build the dir tree under the (tmpfs)
+    // /sys mount and drop writable stub files so the save/set/restore succeeds.
+    if let Ok(sys_dir) = fs::root().lookup("sys") {
+        if let Some(sysd) = fs::tmpfs::downcast_dir(&sys_dir) {
+            use fs::Inode as _;
+            let kernel = fs::tmpfs::TmpfsDir::new_root();
+            let mm = fs::tmpfs::TmpfsDir::new_root();
+            let ksm = fs::tmpfs::TmpfsDir::new_root();
+            for (name, val) in [
+                ("run", &b"0\n"[..]),
+                ("pages_to_scan", b"100\n"),
+                ("sleep_millisecs", b"20\n"),
+                ("merge_across_nodes", b"1\n"),
+                ("max_page_sharing", b"256\n"),
+                ("full_scans", b"0\n"),
+                ("pages_shared", b"0\n"),
+                ("pages_sharing", b"0\n"),
+            ] {
+                if let Ok(f) = ksm.create(name, fs::FileType::Regular) {
+                    let _ = f.write_at(0, val);
+                }
+            }
+            mm.place_inode("ksm", ksm as alloc::sync::Arc<dyn fs::Inode>).ok();
+            kernel.place_inode("mm", mm as alloc::sync::Arc<dyn fs::Inode>).ok();
+            sysd.place_inode("kernel", kernel as alloc::sync::Arc<dyn fs::Inode>).ok();
+        }
+    }
     println!("[ok] heap + frame allocator + trap vector + vfs + /bin + /lib + /dev/shm");
 
     if let Some(_blk) = drivers::virtio_blk::init() {

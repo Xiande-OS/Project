@@ -85,6 +85,63 @@ impl Inode for ProcGenFile {
     // (e.g. oom_score_adj) must store per-process state, not blanket-accept.
 }
 
+/// A small procfs file that reports fixed content but ACCEPTS writes (the
+/// bytes are discarded). Unlike the blanket writable ProcGenFile that
+/// regressed oom_score_adj, this is opted into ONLY for the userns setup files
+/// (setgroups / uid_map / gid_map) whose tests merely need the write to
+/// succeed — they never read the value back expecting their own input.
+pub struct ProcWritableFile {
+    content: alloc::vec::Vec<u8>,
+}
+impl ProcWritableFile {
+    fn new(content: &[u8]) -> Arc<Self> {
+        Arc::new(Self { content: content.to_vec() })
+    }
+}
+impl Inode for ProcWritableFile {
+    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> FileType { FileType::Regular }
+    fn size(&self) -> u64 { self.content.len() as u64 }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let off = offset as usize;
+        if off >= self.content.len() { return Ok(0); }
+        let n = core::cmp::min(buf.len(), self.content.len() - off);
+        buf[..n].copy_from_slice(&self.content[off..off + n]);
+        Ok(n)
+    }
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {
+        Ok(buf.len()) // accept and discard — the userns setup just needs success
+    }
+    fn truncate(&self, _len: u64) -> Result<()> { Ok(()) }
+}
+
+/// /proc/<pid>/ns — one pseudo-file per namespace type. The ioctl_ns0* cases
+/// and the setns/unshare/clock_gettime03 setups open these just to obtain an
+/// fd referring to "the namespace"; we have a single global namespace, so each
+/// is a tiny readable file (its bytes are never interpreted — only the open
+/// and subsequent ioctl/setns matter, which we accept).
+pub struct ProcNsDir {
+    pid: i32,
+}
+impl Inode for ProcNsDir {
+    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> FileType { FileType::Directory }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        match name {
+            "mnt" | "pid" | "pid_for_children" | "net" | "ipc" | "uts" | "user"
+            | "cgroup" | "time" | "time_for_children" => {
+                let id = self.pid as u64;
+                Ok(ProcGenFile::new(move || alloc::format!("ns:[{}]\n", 4026531840u64 + id).into_bytes()))
+            }
+            _ => Err(ENOENT),
+        }
+    }
+    fn list(&self) -> Result<Vec<(String, FileType)>> {
+        Ok(["mnt","pid","net","ipc","uts","user","cgroup","time"]
+            .iter().map(|n| ((*n).into(), FileType::Regular)).collect())
+    }
+}
+
 /// Per-pid directory. Children are resolved on demand against the current
 /// state of `task::task_by_pid(pid)`; if the task has exited we return
 /// ENOENT just like real Linux.
@@ -133,6 +190,17 @@ impl Inode for ProcPidDir {
             "limits" => Ok(ProcGenFile::new(gen_limits)),
             "oom_score" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
             "oom_score_adj" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            // User-namespace setup files. tst_net.c (every cve-*/net case that
+            // unshares a netns) writes "deny" to setgroups then maps uid/gid;
+            // without these it TBROKs at setup ("Failed to open
+            // /proc/self/setgroups"). We have no real userns, but a writable
+            // file that accepts the write lets the test proceed.
+            "setgroups" => Ok(ProcWritableFile::new(b"allow\n")),
+            "uid_map" => Ok(ProcWritableFile::new(b"0 0 4294967295\n")),
+            "gid_map" => Ok(ProcWritableFile::new(b"0 0 4294967295\n")),
+            // /proc/self/ns/<type> — opened by ioctl_ns0*, clock_gettime03,
+            // and the setns/unshare cases just to get an fd to the namespace.
+            "ns" => Ok(Arc::new(ProcNsDir { pid }) as Arc<dyn Inode>),
             _ => Err(ENOENT),
         }
     }
@@ -153,6 +221,10 @@ impl Inode for ProcPidDir {
             ("mounts".into(), FileType::Regular),
             ("cgroup".into(), FileType::Regular),
             ("limits".into(), FileType::Regular),
+            ("setgroups".into(), FileType::Regular),
+            ("uid_map".into(), FileType::Regular),
+            ("gid_map".into(), FileType::Regular),
+            ("ns".into(), FileType::Directory),
             ("oom_score".into(), FileType::Regular),
             ("oom_score_adj".into(), FileType::Regular),
         ])
