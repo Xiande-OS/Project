@@ -273,7 +273,11 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 if crate::task::watchdog_overrun() {
                     return unsafe { crate::task::watchdog_kill_current(tf as *mut _) };
                 }
-                return unsafe { crate::task::preempt_current(tf as *mut _) };
+                // No mid-syscall preempt-switch — it loses wakeups across a
+                // blocking syscall's non-atomic check-then-park. Concurrency
+                // comes from the user-mode quantum tick + trap-boundary
+                // switching; a monopolising syscall is caught by the watchdog.
+                return tf as *mut _;
             }
         } else {
             crate::println!("[trap] unhandled interrupt, IS={:#x}; masking", is);

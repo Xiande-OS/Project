@@ -641,6 +641,41 @@ pub fn any_waiting() -> bool {
     t.tasks.values().any(|task| *task.state.lock() == TaskState::Waiting)
 }
 
+/// Diagnostic: dump why the scheduler can't make progress. Counts tasks by
+/// state and lists the Waiting/Running ones (with parent liveness) so a
+/// resource leak (hundreds of tasks) is distinguishable from a deadlock (a few
+/// stuck waiters). Retained for scheduler bring-up debugging.
+#[allow(dead_code)]
+pub fn dump_stuck_state(cur_pid: i32) {
+    let t = TABLE.lock();
+    let (mut ready, mut running, mut waiting, mut zombie) = (0u32, 0u32, 0u32, 0u32);
+    for task in t.tasks.values() {
+        match *task.state.lock() {
+            TaskState::Ready => ready += 1,
+            TaskState::Running => running += 1,
+            TaskState::Waiting => waiting += 1,
+            TaskState::Zombie => zombie += 1,
+        }
+    }
+    crate::println!(
+        "[stuck] cur={} total={} ready={} running={} waiting={} zombie={}",
+        cur_pid, t.tasks.len(), ready, running, waiting, zombie,
+    );
+    let mut n = 0;
+    for (&pid, task) in t.tasks.iter() {
+        if n >= 14 { break; }
+        let st = *task.state.lock();
+        if matches!(st, TaskState::Waiting | TaskState::Running) {
+            let ppid = task.ppid.load(Ordering::Relaxed);
+            crate::println!(
+                "[stuck]   pid={} {:?} ppid={} parent_alive={}",
+                pid, st, ppid, t.tasks.contains_key(&ppid),
+            );
+            n += 1;
+        }
+    }
+}
+
 /// Snapshot of every task in the table. Cloning Arcs keeps it cheap
 /// and avoids holding the table lock while callers iterate.
 pub fn all_tasks() -> Vec<Arc<Task>> {

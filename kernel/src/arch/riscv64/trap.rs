@@ -248,7 +248,15 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 if crate::task::watchdog_overrun() {
                     return unsafe { crate::task::watchdog_kill_current(tf as *mut _) };
                 }
-                return unsafe { crate::task::preempt_current(tf as *mut _) };
+                // Do NOT preempt-switch mid-syscall: a blocking syscall's
+                // "check condition then mark Waiting" is not atomic w.r.t. a
+                // waker, so switching in that window loses wakeups (a child
+                // exits, wakes a not-yet-Waiting parent = no-op, parent then
+                // parks forever). Concurrency is provided by the user-mode
+                // quantum tick + trap-boundary switching; a syscall that truly
+                // monopolises the hart is caught by the watchdog above. Just
+                // resume the syscall.
+                return tf as *mut _;
             }
             // User-mode quantum tick: fall through to the cooperative scheduler.
         }
