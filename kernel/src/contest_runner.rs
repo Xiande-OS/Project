@@ -465,22 +465,29 @@ fn order_scripts(scripts: &[String]) -> Vec<String> {
             n if n.starts_with("basic_") => 0,
             n if n.starts_with("lua_") => 1,
             n if n.starts_with("busybox_") => 2,
-            n if n.starts_with("libctest_") => 3,
-            n if n.starts_with("iperf_") => 4,
-            n if n.starts_with("netperf_") => 5,
-            n if n.starts_with("libcbench_") => 6,
-            n if n.starts_with("iozone_") => 7,
+            // LTP runs right after the three groups that complete reliably on
+            // every arch (basic/lua/busybox), and crucially BEFORE libctest.
+            // On loongarch64 a libctest case (entry-static.exe pthread_cond)
+            // drives an unkillable in-kernel wedge: the run dies inside
+            // libctest and never reaches a later group. With LTP after
+            // libctest (its old slot) that meant musl-la/glibc-la LTP scored
+            // 0 even though LA musl binaries run fine (basic-la/busybox-la do
+            // score). LTP is ~97% of the rubric, so it must bank before the
+            // first group that can hang. Its whitelist is bounded (~minutes),
+            // so moving it earlier costs the later groups nothing on archs
+            // that don't wedge (riscv64 still runs everything).
+            n if n.starts_with("ltp_") => 3,
+            n if n.starts_with("libctest_") => 4,
+            n if n.starts_with("iperf_") => 5,
+            n if n.starts_with("netperf_") => 6,
+            n if n.starts_with("libcbench_") => 7,
+            n if n.starts_with("iozone_") => 8,
             // Bench groups the top-scoring teams leave at 0 — let them
             // burn through a 1-second timeout quickly so they yield the
             // remaining budget to the big-ticket groups (LTP).
-            n if n.starts_with("cyclictest_") => 8,
-            n if n.starts_with("lmbench_") => 9,
-            n if n.starts_with("unixbench_") => 10,
-            // LTP last: it's by far the largest scoring opportunity
-            // (~10 000 cases ≈ 97% of the rubric total on the leading
-            // team's run), but it also takes the longest, so it goes
-            // last to let every smaller cert-paying group bank first.
-            n if n.starts_with("ltp_") => 11,
+            n if n.starts_with("cyclictest_") => 9,
+            n if n.starts_with("lmbench_") => 10,
+            n if n.starts_with("unixbench_") => 11,
             _ => 50,
         }
     };
