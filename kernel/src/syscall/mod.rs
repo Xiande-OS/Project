@@ -247,7 +247,21 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RENAMEAT2 => sys_renameat2(a0 as i32, a1, a2 as i32, a3, a4 as u32),
         nr::SYS_LINKAT => sys_linkat(a0 as i32, a1, a2 as i32, a3, a4 as i32),
         nr::SYS_SYMLINKAT => sys_symlinkat(a0, a1 as i32, a2),
+        // clone(2)'s register order is architecture-specific. riscv64 uses the
+        // ARM/x86_64 "backwards" layout (a3=tls, a4=child_tid); loongarch64
+        // uses the asm-generic standard layout (a3=child_tid, a4=tls). musl's
+        // per-arch clone.s encodes exactly this difference. If the kernel reads
+        // them in the wrong order on LA, the child's $tp is set to the
+        // child_tid pointer instead of the TLS base, so every musl thread's
+        // self pointer (derived from $tp) is garbage and it faults the instant
+        // it dereferences its pthread struct. glibc is unaffected because it
+        // spawns threads via clone3, which carries tls in a struct field with
+        // no positional ambiguity. sys_clone's params are
+        // (flags, child_sp, ptid, tls, ctid) — swap the last two on LA.
+        #[cfg(target_arch = "riscv64")]
         nr::SYS_CLONE => sys_clone(a0, a1, a2, a3, a4),
+        #[cfg(target_arch = "loongarch64")]
+        nr::SYS_CLONE => sys_clone(a0, a1, a2, a4, a3),
         nr::SYS_CLONE3 => sys_clone3(a0, a1),
         nr::SYS_EXECVE => sys_execve(a0, a1, a2),
         nr::SYS_EXECVEAT => sys_execveat(a0 as i32, a1, a2, a3, a4 as i32),
