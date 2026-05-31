@@ -266,14 +266,14 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 core::arch::asm!("csrwr {0}, 0x44", inout(reg) 1usize => _);
             }
             if !from_user {
-                // Nested tick during in-kernel syscall handling: run the
-                // watchdog. See riscv64 trap.rs for the rationale. Kill a
-                // wedged (overrun) syscall; otherwise resume it without
-                // rescheduling (no mid-syscall stack suspend/resume here).
+                // Nested tick during in-kernel syscall handling. See riscv64
+                // trap.rs: kill a wedged (overrun) syscall, else preempt — if no
+                // lock is held and another task is Ready, suspend this syscall
+                // and switch (it resumes here later); otherwise carry on.
                 if crate::task::watchdog_overrun() {
                     return unsafe { crate::task::watchdog_kill_current(tf as *mut _) };
                 }
-                return tf as *mut _;
+                return unsafe { crate::task::preempt_current(tf as *mut _) };
             }
         } else {
             crate::println!("[trap] unhandled interrupt, IS={:#x}; masking", is);

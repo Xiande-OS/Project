@@ -1491,13 +1491,20 @@ extern "C" fn task_first_run() -> ! {
 /// Park the currently-running task (`prev_pid`) and resume `next_pid` by
 /// switching kernel contexts. `next_pid` must already be published as
 /// CURRENT_PID, with its page table active and its pending signals delivered.
-/// Returns the now-running task's trap frame — in the resumed task's timeline
-/// that is its own frame, since we only return here once `prev_pid` runs again.
+/// `prev_tf` is the trap frame to resume `prev_pid` through when it next runs
+/// — its user TrapFrame at a trap-exit boundary, or the nested timer frame if
+/// `prev_pid` is being preempted mid-syscall. It is returned (on `prev_pid`'s
+/// timeline) once `prev_pid` is scheduled again, so the trap handler sret's to
+/// the right place (back to user, or back into the interrupted syscall).
 ///
 /// # Safety
 /// Call only from the scheduler at a point where no kernel lock is held; both
 /// pids must name live tasks with intact kernel stacks.
-unsafe fn context_switch_to(prev_pid: i32, next_pid: i32) -> *mut TrapFrame {
+unsafe fn context_switch_to(
+    prev_pid: i32,
+    next_pid: i32,
+    prev_tf: *mut TrapFrame,
+) -> *mut TrapFrame {
     let prev_kctx = task_by_pid(prev_pid).map(|t| t.kctx_ptr());
     let next_kctx = task_by_pid(next_pid).map(|t| t.kctx_ptr());
     if let (Some(p), Some(n)) = (prev_kctx, next_kctx) {
@@ -1515,8 +1522,8 @@ unsafe fn context_switch_to(prev_pid: i32, next_pid: i32) -> *mut TrapFrame {
         }
         unsafe { crate::arch::switch_context(p, n) };
     }
-    // Resumed: CURRENT_PID has been restored to us by whoever switched back.
-    current_task().tf_ptr()
+    // Resumed: continue `prev_pid` through the frame it parked on.
+    prev_tf
 }
 
 fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame {
@@ -1708,8 +1715,9 @@ fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame 
             if let Some(next_pid) = found {
                 // Switch kernel context to the chosen task. If `cur` is a
                 // Zombie its parked context is simply never resumed; if it is
-                // Waiting it resumes when later woken and re-runs its syscall.
-                return unsafe { context_switch_to(cur_pid, next_pid) };
+                // Waiting it resumes when later woken and re-runs its syscall
+                // through `current_tf`.
+                return unsafe { context_switch_to(cur_pid, next_pid, current_tf) };
             }
             // No live Ready task. If cur is Zombie we must NOT return
             // its tf. Wait for either a sleeper to mature, an I/O event
@@ -1793,10 +1801,62 @@ fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame 
         }
         CURRENT_PID.store(next.pid, Ordering::Relaxed);
         // Switch kernel contexts instead of just returning next's TrapFrame:
-        // `cur` (demoted to Ready above) parks here and resumes the next time
-        // the scheduler picks it; `next` resumes wherever it last parked.
-        return unsafe { context_switch_to(cur_pid, next.pid) };
+        // `cur` (demoted to Ready above) parks here and resumes through
+        // `current_tf` the next time the scheduler picks it; `next` resumes
+        // wherever it last parked.
+        return unsafe { context_switch_to(cur_pid, next.pid, current_tf) };
     }
 
     current_tf
+}
+
+/// Preempt the current task mid-syscall: if preemption is currently enabled (no
+/// lock held) and another task is Ready, switch to it so a long-running
+/// in-kernel syscall cannot monopolise the hart. Called from the nested timer
+/// trap (see each arch's handler). `cur_tf` is that nested frame — the current
+/// task resumes its syscall through it when later rescheduled. Unlike the
+/// trap-exit scheduler this does NOT deliver the current task's own signals
+/// (it is mid-syscall; its signals are handled when it returns to user), but
+/// it does deliver the incoming task's, exactly like the round-robin path.
+/// Returns the frame the trap handler should return through.
+///
+/// # Safety
+/// Call only from the nested-timer trap path; `cur_tf` must be that frame.
+pub unsafe fn preempt_current(cur_tf: *mut TrapFrame) -> *mut TrapFrame {
+    // A held lock means switching away could deadlock the next task on it.
+    if !crate::sync::preempt_enabled() {
+        return cur_tf;
+    }
+    let cur_pid = current_pid();
+    let cur_satp = task_by_pid(cur_pid).map(|t| t.memory_set.lock().satp());
+    while let Some(next) = pick_ready(cur_pid) {
+        let next_satp = next.memory_set.lock().satp();
+        if cur_satp != Some(next_satp) {
+            crate::arch::activate_page_table(next_satp);
+        }
+        let next_tf = next.tf_ptr();
+        crate::signal::check_signals(&next, &mut *next_tf);
+        if matches!(*next.state.lock(), TaskState::Zombie) {
+            // Killed by its own signal on arrival — restore satp, try another.
+            if let Some(s) = cur_satp {
+                if Some(next_satp) != cur_satp {
+                    crate::arch::activate_page_table(s);
+                }
+            }
+            continue;
+        }
+        // Demote the (mid-syscall) current task to Ready so it is re-picked
+        // later, publish the new current, and switch. `cur` parks in the
+        // nested timer frame and resumes its syscall there when rescheduled.
+        if let Some(cur) = task_by_pid(cur_pid) {
+            let mut s = cur.state.lock();
+            if *s == TaskState::Running {
+                *s = TaskState::Ready;
+            }
+        }
+        CURRENT_PID.store(next.pid, Ordering::Relaxed);
+        return context_switch_to(cur_pid, next.pid, cur_tf);
+    }
+    // Nobody else is Ready: resume the current syscall.
+    cur_tf
 }

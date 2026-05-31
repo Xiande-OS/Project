@@ -6,6 +6,30 @@
 //! kmalloc needs through M5 easily.
 
 use buddy_system_allocator::LockedHeap;
+use core::alloc::{GlobalAlloc, Layout};
+
+/// Preempt-safe global allocator. The buddy `LockedHeap` guards its free lists
+/// with a plain `spin::Mutex` that the preemption count cannot see, so a task
+/// preempted mid-allocation would strand that lock and deadlock the next task's
+/// allocation on this single hart. Bracket every alloc/dealloc with
+/// preempt_disable/enable so the scheduler never switches away while the heap
+/// lock is held. (realloc/alloc_zeroed use the default impls, which route
+/// through these.)
+struct PreemptHeap(LockedHeap<32>);
+
+unsafe impl GlobalAlloc for PreemptHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        crate::sync::preempt_disable();
+        let p = self.0.alloc(layout);
+        crate::sync::preempt_enable();
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        crate::sync::preempt_disable();
+        self.0.dealloc(ptr, layout);
+        crate::sync::preempt_enable();
+    }
+}
 
 // libc-bench's b_stdio_putcgetc et al. allocate ~8 MB scratch buffers
 // per bench. The contest harness also forks many short-lived ELFs whose
@@ -17,11 +41,12 @@ const KERNEL_HEAP_SIZE: usize = 256 * 1024 * 1024;
 static mut KERNEL_HEAP: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 
 #[global_allocator]
-static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
+static HEAP_ALLOCATOR: PreemptHeap = PreemptHeap(LockedHeap::empty());
 
 pub fn init() {
     unsafe {
         HEAP_ALLOCATOR
+            .0
             .lock()
             .init(KERNEL_HEAP.as_mut_ptr() as usize, KERNEL_HEAP_SIZE);
     }

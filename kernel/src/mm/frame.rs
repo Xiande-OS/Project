@@ -30,10 +30,16 @@ pub fn init(pa_start: PhysAddr, pa_end: PhysAddr) {
 }
 
 pub fn alloc() -> Option<FrameTracker> {
+    // The frame pool is guarded by a plain spin::Mutex (inside
+    // LockedFrameAllocator) that the preemption count can't see; disable
+    // preemption around it so a preempted holder can't deadlock the next
+    // allocator on this single hart.
+    crate::sync::preempt_disable();
     let res = FRAME_ALLOC
         .lock()
         .alloc(1)
         .map(|ppn_usize| FrameTracker::new_zeroed(PhysPageNum(ppn_usize)));
+    crate::sync::preempt_enable();
     if res.is_some() {
         ALLOCATED_PAGES.fetch_add(1, Ordering::Relaxed);
     }
@@ -48,10 +54,12 @@ pub fn alloc() -> Option<FrameTracker> {
 /// zeroed and then overwritten), which matters when a busybox `fork`
 /// duplicates a multi-thousand-page address space on every shell command.
 pub fn alloc_uninit() -> Option<FrameTracker> {
+    crate::sync::preempt_disable();
     let res = FRAME_ALLOC
         .lock()
         .alloc(1)
         .map(|ppn_usize| FrameTracker { ppn: PhysPageNum(ppn_usize) });
+    crate::sync::preempt_enable();
     if res.is_some() {
         ALLOCATED_PAGES.fetch_add(1, Ordering::Relaxed);
     }
@@ -59,7 +67,9 @@ pub fn alloc_uninit() -> Option<FrameTracker> {
 }
 
 pub fn dealloc(ppn: PhysPageNum) {
+    crate::sync::preempt_disable();
     FRAME_ALLOC.lock().dealloc(ppn.0, 1);
+    crate::sync::preempt_enable();
     ALLOCATED_PAGES.fetch_sub(1, Ordering::Relaxed);
 }
 

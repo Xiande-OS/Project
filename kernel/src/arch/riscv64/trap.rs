@@ -238,17 +238,17 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             arm_timer();
             if !from_user {
                 // Nested tick: the timer fired while we were in-kernel handling
-                // a syscall (interrupts are enabled across dispatch). This is
-                // the watchdog. If the syscall has overrun its budget it has
-                // wedged uninterruptibly — abandon it like a kernel fault so
-                // the run continues. Otherwise resume the syscall WITHOUT
-                // rescheduling: this cooperative kernel can't suspend and later
-                // resume a mid-syscall kernel stack, so the only way it leaves a
-                // running syscall early is by killing it.
+                // a syscall (interrupts are enabled across dispatch). First the
+                // watchdog: if the syscall has overrun its budget it has wedged
+                // uninterruptibly — abandon it like a kernel fault so the run
+                // continues. Otherwise preempt — if no lock is held and another
+                // task is Ready, suspend this syscall and switch to it (it
+                // resumes here later). preempt_current returns this same frame
+                // when it can't switch, so the syscall just carries on.
                 if crate::task::watchdog_overrun() {
                     return unsafe { crate::task::watchdog_kill_current(tf as *mut _) };
                 }
-                return tf as *mut _;
+                return unsafe { crate::task::preempt_current(tf as *mut _) };
             }
             // User-mode quantum tick: fall through to the cooperative scheduler.
         }
