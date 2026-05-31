@@ -206,6 +206,9 @@ pub fn dispatch(tf: &mut TrapFrame) {
             else { sys_pwritev(a0 as i32, a1, a2, a3 as u64) }
         }
         nr::SYS_MINCORE => sys_mincore(a0, a1, a2),
+        nr::SYS_MSYNC => sys_msync(a0, a1, a2 as i32),
+        nr::SYS_PROCESS_VM_READV => process_vm_xfer(a0 as i32, a1, a2, a3, a4, a5, true),
+        nr::SYS_PROCESS_VM_WRITEV => process_vm_xfer(a0 as i32, a1, a2, a3, a4, a5, false),
         nr::SYS_SPLICE => sys_splice(a0 as i32, a1, a2 as i32, a3, a4, a5 as u32),
         nr::SYS_NAME_TO_HANDLE_AT => sys_name_to_handle_at(a0 as i32, a1, a2, a3, a4 as i32),
         nr::SYS_OPEN_BY_HANDLE_AT => sys_open_by_handle_at(a0 as i32, a1, a2 as i32),
@@ -2376,6 +2379,147 @@ fn sys_splice(fd_in: i32, off_in: usize, fd_out: i32, off_out: usize, len: usize
         let _ = task.copy_out_bytes(off_out, &(out_off + n_written as u64).to_le_bytes());
     }
     n_written as isize
+}
+
+/// msync(addr, length, flags): flush a mapping. We validate the way msync03
+/// expects (page-aligned addr, valid + non-contradictory flags, mapped range)
+/// then no-op — our file mappings write through their inode, so there is no
+/// dirty page cache to flush.
+fn sys_msync(addr: usize, length: usize, flags: i32) -> isize {
+    const MS_ASYNC: i32 = 1;
+    const MS_INVALIDATE: i32 = 2;
+    const MS_SYNC: i32 = 4;
+    let page = crate::mm::address::PAGE_SIZE;
+    if addr % page != 0 {
+        return EINVAL;
+    }
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 {
+        return EINVAL;
+    }
+    if (flags & MS_ASYNC != 0) && (flags & MS_SYNC != 0) {
+        return EINVAL;
+    }
+    let pages = (length + page - 1) / page;
+    let task = current_task();
+    let ms = task.memory_set.lock();
+    for i in 0..pages {
+        let va = match addr.checked_add(i * page) {
+            Some(v) => v,
+            None => return -12, // ENOMEM
+        };
+        if ms.translate(crate::mm::VirtAddr(va)).is_none() {
+            return -12; // ENOMEM: unmapped page in range
+        }
+    }
+    0
+}
+
+/// Read a user iovec[] into a Vec<IoVec>.
+fn read_iov_array(task: &Arc<crate::task::Task>, ptr: usize, cnt: usize) -> Option<alloc::vec::Vec<IoVec>> {
+    if cnt == 0 {
+        return Some(alloc::vec::Vec::new());
+    }
+    if cnt > 1024 {
+        return None;
+    }
+    let raw = task.copy_in_bytes(ptr, cnt * 16)?;
+    let mut v = alloc::vec::Vec::with_capacity(cnt);
+    for i in 0..cnt {
+        let o = i * 16;
+        v.push(IoVec {
+            base: usize::from_le_bytes(raw[o..o + 8].try_into().unwrap()),
+            len: usize::from_le_bytes(raw[o + 8..o + 16].try_into().unwrap()),
+        });
+    }
+    Some(v)
+}
+
+/// process_vm_readv / process_vm_writev: copy between the caller's address
+/// space (local_iov) and another process's (remote_iov). `read` = readv (pull
+/// from the remote into local); otherwise writev (push local into the remote).
+/// Gather the source side into one buffer then scatter it across the dest iovs,
+/// copying min(sum local, sum remote) bytes. Requires the target exist (ESRCH)
+/// and be owned by the caller or root (EPERM) — what process_vm_*02 check.
+fn process_vm_xfer(
+    pid: i32,
+    local_iov: usize,
+    liovcnt: usize,
+    remote_iov: usize,
+    riovcnt: usize,
+    flags: usize,
+    read: bool,
+) -> isize {
+    if flags != 0 {
+        return EINVAL;
+    }
+    let me = current_task();
+    let Some(target) = crate::task::task_by_pid(pid) else { return -3 }; // ESRCH
+    if current_euid() != 0 {
+        let tc = creds_of(target.tgid.load(core::sync::atomic::Ordering::Relaxed));
+        if tc[1] != current_euid() {
+            return -1; // EPERM
+        }
+    }
+    let Some(locals) = read_iov_array(&me, local_iov, liovcnt) else { return EFAULT };
+    let Some(remotes) = read_iov_array(&me, remote_iov, riovcnt) else { return EFAULT };
+    // Sum saturating, and reject an iov set whose total exceeds SSIZE_MAX —
+    // process_vm01 probes iov_len = -1 (SIZE_MAX) expecting EINVAL, which would
+    // otherwise overflow the capacity of the gather buffer.
+    let total_l = locals.iter().fold(0usize, |a, v| a.saturating_add(v.len));
+    let total_r = remotes.iter().fold(0usize, |a, v| a.saturating_add(v.len));
+    if total_l > isize::MAX as usize || total_r > isize::MAX as usize {
+        return EINVAL;
+    }
+    let want = total_l.min(total_r);
+    if want == 0 {
+        return 0;
+    }
+
+    // Gather `want` bytes from the source side. Reserve fallibly so a large
+    // (but in-range) request surfaces as an error rather than panicking.
+    let mut src = alloc::vec::Vec::new();
+    if src.try_reserve(want).is_err() {
+        return EFAULT;
+    }
+    let mut left = want;
+    if read {
+        let tms = target.memory_set.lock();
+        for v in &remotes {
+            if left == 0 { break; }
+            let n = v.len.min(left);
+            let Some(chunk) = crate::task::copy_in_via(&tms, v.base, n) else { return EFAULT };
+            src.extend_from_slice(&chunk);
+            left -= n;
+        }
+    } else {
+        for v in &locals {
+            if left == 0 { break; }
+            let n = v.len.min(left);
+            let Some(chunk) = me.copy_in_bytes(v.base, n) else { return EFAULT };
+            src.extend_from_slice(&chunk);
+            left -= n;
+        }
+    }
+
+    // Scatter into the destination side.
+    let mut pos = 0usize;
+    if read {
+        for v in &locals {
+            if pos >= src.len() { break; }
+            let n = v.len.min(src.len() - pos);
+            if me.copy_out_bytes(v.base, &src[pos..pos + n]).is_none() { return EFAULT; }
+            pos += n;
+        }
+    } else {
+        let tms = target.memory_set.lock();
+        for v in &remotes {
+            if pos >= src.len() { break; }
+            let n = v.len.min(src.len() - pos);
+            if crate::task::copy_out_via(&tms, v.base, &src[pos..pos + n]).is_none() { return EFAULT; }
+            pos += n;
+        }
+    }
+    src.len() as isize
 }
 
 /// openat2(dirfd, pathname, struct open_how *how, size): the extended openat.
