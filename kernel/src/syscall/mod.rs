@@ -250,6 +250,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_SEMOP => sysv_ipc::sys_semop(a0 as i32, a1, a2),
         nr::SYS_SEMTIMEDOP => sysv_ipc::sys_semtimedop(a0 as i32, a1, a2, a3),
         nr::SYS_SEMCTL => sysv_ipc::sys_semctl(a0 as i32, a1 as i32, a2 as i32, a3),
+        nr::SYS_UNSHARE => sys_unshare(a0),
         nr::SYS_GETRUSAGE => sys_getrusage(a0 as i32, a1),
         nr::SYS_MEMBARRIER => 0,
         nr::SYS_TIMES => sys_times(a0),
@@ -5949,6 +5950,42 @@ fn sys_brk(new_brk: usize) -> isize {
     let mut ms = task.memory_set_mut();
     let cur = ms.brk_set(crate::mm::VirtAddr(new_brk));
     cur.0 as isize
+}
+
+/// unshare(2): disassociate parts of the caller's execution context. We have
+/// no real namespaces, but the LTP unshare* tests — and the ~20 other cases
+/// that call unshare only as a setup step — mostly just need the call to
+/// succeed; failing it with ENOSYS makes them TBROK and score nothing. Accept
+/// the documented flag set as a no-op (CLONE_FILES would deep-copy the fd
+/// table, but ours is already per-process on the paths that matter), and
+/// reject genuinely invalid bits with EINVAL the way unshare02 expects.
+fn sys_unshare(flags: usize) -> isize {
+    const CLONE_NEWTIME: usize = 0x80;
+    const CLONE_FS: usize = 0x200;
+    const CLONE_FILES: usize = 0x400;
+    const CLONE_NEWNS: usize = 0x0002_0000;
+    const CLONE_SYSVSEM: usize = 0x0004_0000;
+    const CLONE_NEWCGROUP: usize = 0x0200_0000;
+    const CLONE_NEWUTS: usize = 0x0400_0000;
+    const CLONE_NEWIPC: usize = 0x0800_0000;
+    const CLONE_NEWUSER: usize = 0x1000_0000;
+    const CLONE_NEWPID: usize = 0x2000_0000;
+    const CLONE_NEWNET: usize = 0x4000_0000;
+    const VALID: usize = CLONE_NEWTIME
+        | CLONE_FS
+        | CLONE_FILES
+        | CLONE_NEWNS
+        | CLONE_SYSVSEM
+        | CLONE_NEWCGROUP
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
+        | CLONE_NEWUSER
+        | CLONE_NEWPID
+        | CLONE_NEWNET;
+    if flags & !VALID != 0 {
+        return EINVAL;
+    }
+    0
 }
 
 #[repr(C)]

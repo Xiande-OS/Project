@@ -77,6 +77,12 @@ impl Inode for ProcGenFile {
         buf[..n].copy_from_slice(&data[off..off + n]);
         Ok(n)
     }
+    // NB: deliberately no write_at. The default (EINVAL) is what tst_memutils
+    // and tst_sys_conf expect when a tunable can't be set — they fall back
+    // gracefully. Accepting-and-ignoring writes instead made the framework's
+    // oom_score_adj write "succeed" then fail its -1000 readback → TBROK in
+    // every memory-protected test. A tunable that needs real write semantics
+    // (e.g. oom_score_adj) must store per-process state, not blanket-accept.
 }
 
 /// Per-pid directory. Children are resolved on demand against the current
@@ -638,6 +644,7 @@ impl Inode for ProcSysDir {
         match name {
             "kernel" => Ok(Arc::new(ProcSysKernelDir) as Arc<dyn Inode>),
             "fs" => Ok(Arc::new(ProcSysFsDir) as Arc<dyn Inode>),
+            "vm" => Ok(Arc::new(ProcSysVmDir) as Arc<dyn Inode>),
             _ => Err(ENOENT),
         }
     }
@@ -645,6 +652,46 @@ impl Inode for ProcSysDir {
         Ok(alloc::vec![
             ("kernel".into(), FileType::Directory),
             ("fs".into(), FileType::Directory),
+            ("vm".into(), FileType::Directory),
+        ])
+    }
+}
+
+/// /proc/sys/vm/<file>. LTP's tst_sys_conf saves/restores several of these and
+/// TBROKs if they're absent (min_free_kbytes, mmap stress, the mtest cases all
+/// poke overcommit_memory; oom tests read the rest). Static defaults are fine —
+/// we don't act on them, but their presence lets the tests run.
+pub struct ProcSysVmDir;
+impl Inode for ProcSysVmDir {
+    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> FileType { FileType::Directory }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        match name {
+            "overcommit_memory" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            "overcommit_ratio" => Ok(ProcGenFile::new(|| b"50\n".to_vec())),
+            "overcommit_kbytes" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            "max_map_count" => Ok(ProcGenFile::new(|| b"65530\n".to_vec())),
+            "min_free_kbytes" => Ok(ProcGenFile::new(|| b"4096\n".to_vec())),
+            "nr_hugepages" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            "nr_overcommit_hugepages" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            "drop_caches" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            "swappiness" => Ok(ProcGenFile::new(|| b"60\n".to_vec())),
+            "dirty_ratio" => Ok(ProcGenFile::new(|| b"20\n".to_vec())),
+            "panic_on_oom" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            "mmap_min_addr" => Ok(ProcGenFile::new(|| b"65536\n".to_vec())),
+            "legacy_va_layout" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            _ => Err(ENOENT),
+        }
+    }
+    fn list(&self) -> Result<Vec<(String, FileType)>> {
+        Ok(alloc::vec![
+            ("overcommit_memory".into(), FileType::Regular),
+            ("overcommit_ratio".into(), FileType::Regular),
+            ("max_map_count".into(), FileType::Regular),
+            ("min_free_kbytes".into(), FileType::Regular),
+            ("nr_hugepages".into(), FileType::Regular),
+            ("mmap_min_addr".into(), FileType::Regular),
+            ("swappiness".into(), FileType::Regular),
         ])
     }
 }

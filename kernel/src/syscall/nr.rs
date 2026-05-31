@@ -98,6 +98,7 @@ pub const SYS_GETGID: usize = 176;
 pub const SYS_GETEGID: usize = 177;
 pub const SYS_GETTID: usize = 178;
 pub const SYS_SYSINFO: usize = 179;
+pub const SYS_UNSHARE: usize = 97;
 pub const SYS_MSGGET: usize = 186;
 pub const SYS_MSGCTL: usize = 187;
 pub const SYS_MSGRCV: usize = 188;
