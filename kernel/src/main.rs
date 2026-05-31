@@ -86,7 +86,8 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("xiande-os booting on hart {}", hartid);
     println!("  dtb @ {:#x}", dtb_pa);
 
-    mm::init();
+    mm::init(dtb_pa);
+    println!("  RAM end @ {:#x}", mm::mm_end());
     arch::trap_init();
     // Parse the embedded vDSO once (panics early on any layout problem).
     vdso::init();
