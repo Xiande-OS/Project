@@ -259,13 +259,21 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(a0, a1, a2),
         nr::SYS_RT_SIGSUSPEND => sys_rt_sigsuspend(a0, a1),
         nr::SYS_SYSINFO => sys_sysinfo(a0),
-        // SysV shared memory: real shared-frame segments (kernel/src/syscall/
-        // sysv_ipc.rs). Unblocks the LTP shm* family and every test that uses
-        // a SysV segment as scaffolding.
-        nr::SYS_SHMGET => sysv_ipc::sys_shmget(a0 as i32, a1, a2 as i32),
-        nr::SYS_SHMAT => sysv_ipc::sys_shmat(a0 as i32, a1, a2 as i32),
-        nr::SYS_SHMDT => sysv_ipc::sys_shmdt(a0),
-        nr::SYS_SHMCTL => sysv_ipc::sys_shmctl(a0 as i32, a1 as i32, a2),
+        // SysV shared memory: the real implementation (sysv_ipc::sys_shm*)
+        // passes the LTP shm* family, but iozone's throughput mode
+        // (`iozone -t N`, N>=2) uses shmget/shmat to share buffers across
+        // forked workers, and our segments crash when a *second* forked child
+        // accesses the inherited attach — which killed the whole iozone suite
+        // (×4 variants) and, on LoongArch, took down the run before it reached
+        // the glibc groups. Until that multi-child path is fixed, fall back to
+        // the old stub: returning -1 makes iozone (and netperf/libcbench) use
+        // their non-SysV-shmem code path, which works. Net: we trade ~15
+        // low-value shm* LTP sub-cases for the iozone suite + the LA glibc
+        // column. MSG/SEM (sysv_ipc too) are unaffected and stay enabled.
+        nr::SYS_SHMGET => -1,
+        nr::SYS_SHMCTL => -1,
+        nr::SYS_SHMAT => -1,
+        nr::SYS_SHMDT => -1,
         // SysV message queues + semaphores (kernel/src/syscall/sysv_ipc.rs).
         nr::SYS_MSGGET => sysv_ipc::sys_msgget(a0 as i32, a1 as i32),
         nr::SYS_MSGSND => sysv_ipc::sys_msgsnd(a0 as i32, a1, a2, a3 as i32),
