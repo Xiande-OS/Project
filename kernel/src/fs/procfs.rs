@@ -545,6 +545,12 @@ fn gen_status(pid: i32) -> Vec<u8> {
          VmData:\t{} kB\n\
          VmStk:\t{} kB\n\
          VmExe:\t{} kB\n\
+         VmLck:\t0 kB\n\
+         VmPin:\t0 kB\n\
+         VmHWM:\t{} kB\n\
+         VmLib:\t0 kB\n\
+         VmPTE:\t0 kB\n\
+         VmSwap:\t0 kB\n\
          Threads:\t1\n\
          SigQ:\t0/0\n\
          SigPnd:\t0000000000000000\n\
@@ -561,7 +567,7 @@ fn gen_status(pid: i32) -> Vec<u8> {
          Cpus_allowed_list:\t0\n\
          voluntary_ctxt_switches:\t0\n\
          nonvoluntary_ctxt_switches:\t0\n",
-        comm, st_char, st_word, pid, pid, ppid, vm, vm, vm, 64, 64,
+        comm, st_char, st_word, pid, pid, ppid, vm, vm, vm, 64, 64, vm,
     );
     s.into_bytes()
 }
