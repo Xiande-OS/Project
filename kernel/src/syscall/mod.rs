@@ -211,6 +211,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_PROCESS_VM_WRITEV => process_vm_xfer(a0 as i32, a1, a2, a3, a4, a5, false),
         nr::SYS_SPLICE => sys_splice(a0 as i32, a1, a2 as i32, a3, a4, a5 as u32),
         nr::SYS_TEE => sys_tee(a0 as i32, a1 as i32, a2, a3 as u32),
+        nr::SYS_VMSPLICE => sys_vmsplice(a0 as i32, a1, a2, a3 as u32),
         nr::SYS_SYNC_FILE_RANGE => sys_sync_file_range(a0 as i32, a1 as i64, a2 as i64, a3 as u32),
         nr::SYS_NAME_TO_HANDLE_AT => sys_name_to_handle_at(a0 as i32, a1, a2, a3, a4 as i32),
         nr::SYS_OPEN_BY_HANDLE_AT => sys_open_by_handle_at(a0 as i32, a1, a2 as i32),
@@ -2522,6 +2523,50 @@ fn process_vm_xfer(
         }
     }
     src.len() as isize
+}
+
+/// vmsplice(fd, iov, nr_segs, flags): splice user memory to/from a pipe. fd
+/// must be a pipe end; a write end gathers the iov bytes into the pipe, a read
+/// end scatters pipe data into the iovs. We copy through a bounce buffer rather
+/// than gifting pages, which is observably equivalent.
+fn sys_vmsplice(fd: i32, iov: usize, nr_segs: usize, _flags: u32) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    let inode = file.inode.clone();
+    let Some(pipe) = inode.as_any().downcast_ref::<crate::fs::pipe::PipeEnd>() else {
+        return EINVAL; // vmsplice requires a pipe fd
+    };
+    let Some(iovs) = read_iov_array(&task, iov, nr_segs) else { return EINVAL };
+    let mut total = 0isize;
+    if pipe.is_writer() {
+        for v in &iovs {
+            if v.len == 0 { continue; }
+            let Some(data) = task.copy_in_bytes(v.base, v.len) else {
+                return if total == 0 { EFAULT } else { total };
+            };
+            match inode.write_at(0, &data) {
+                Ok(n) => { total += n as isize; if n < v.len { break; } }
+                Err(e) => return if total == 0 { err_to_isize(e) } else { total },
+            }
+        }
+    } else {
+        for v in &iovs {
+            if v.len == 0 { continue; }
+            let mut buf = alloc::vec![0u8; v.len];
+            match inode.read_at(0, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if task.copy_out_bytes(v.base, &buf[..n]).is_none() {
+                        return if total == 0 { EFAULT } else { total };
+                    }
+                    total += n as isize;
+                    if n < v.len { break; }
+                }
+                Err(e) => return if total == 0 { err_to_isize(e) } else { total },
+            }
+        }
+    }
+    total
 }
 
 /// tee(fd_in, fd_out, len, flags): duplicate up to `len` bytes from one pipe
