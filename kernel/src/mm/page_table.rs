@@ -282,6 +282,32 @@ impl PageTable {
         }
     }
 
+    /// Map a 2 MiB-aligned VPN as a single Sv39 *megapage*: a leaf PTE at
+    /// the middle level (level 1) covering 512 contiguous 4 KiB pages. Both
+    /// `vpn` and `ppn` must be 2 MiB-aligned (low 9 bits zero). Used only for
+    /// the kernel/MMIO identity ranges, which are huge, 2 MiB-aligned, and
+    /// never unmapped per-process — one leaf replaces 512 ordinary entries,
+    /// so building a fresh address space (on every fork/execve) no longer
+    /// walks a quarter-million PTEs. Returns silently on PT-node OOM (same
+    /// best-effort contract as `map`).
+    pub fn map_megapage(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PteFlags) {
+        let indices = vpn.indices(); // [root, mid, leaf]; mid is the 2 MiB level
+        // Walk/allocate the root -> middle directory, then plant a leaf at
+        // the middle level instead of descending to the 4 KiB level.
+        let root_pte = unsafe { &mut *(self.root.ppn.base().kernel_ptr::<Pte>()).add(indices[0]) };
+        let mid_ppn = if root_pte.is_valid() {
+            root_pte.ppn()
+        } else {
+            let Some(frame) = alloc_frame() else { return; };
+            let p = frame.ppn;
+            *root_pte = Pte::new_dir(p);
+            self.intermediate.push(frame);
+            p
+        };
+        let mid_pte = unsafe { &mut *(mid_ppn.base().kernel_ptr::<Pte>()).add(indices[1]) };
+        *mid_pte = Pte::new(ppn, flags | PteFlags::V);
+    }
+
     pub fn unmap(&mut self, vpn: VirtPageNum) -> Option<Pte> {
         let pte = self.find_or_create(vpn)?;
         if pte.is_valid() {

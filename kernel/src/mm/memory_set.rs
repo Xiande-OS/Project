@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 
 use super::address::{PhysPageNum, VirtAddr, VirtPageNum, PAGE_SIZE};
-use super::frame::{alloc as alloc_frame, FrameTracker};
+use super::frame::{alloc as alloc_frame, alloc_uninit as alloc_uninit_frame, FrameTracker};
 use super::page_table::{PageTable, PteFlags};
 
 /// Split a BTreeMap so the returned half contains keys < `pivot` and the
@@ -157,23 +157,38 @@ impl MemorySet {
     /// space, with R|W|X permissions and no U bit. Required so that the
     /// CPU keeps executing the kernel after we switch satp to this table.
     pub fn map_kernel_identity(&mut self, k_start: usize, k_end: usize) {
-        let start_vpn = VirtAddr(k_start).floor();
-        let end_vpn = VirtAddr(k_end).ceil();
         let perm = PteFlags::V | PteFlags::R | PteFlags::W | PteFlags::X;
-        for vpn_raw in start_vpn.0..end_vpn.0 {
-            self.page_table
-                .map(VirtPageNum(vpn_raw), PhysPageNum(vpn_raw), perm);
-        }
+        self.map_identity_range(k_start, k_end, perm);
     }
 
     /// Map an MMIO region identity (R|W, no U).
     pub fn map_mmio(&mut self, pa_start: usize, pa_end: usize) {
-        let start_vpn = VirtAddr(pa_start).floor();
-        let end_vpn = VirtAddr(pa_end).ceil();
         let perm = PteFlags::V | PteFlags::R | PteFlags::W;
-        for vpn_raw in start_vpn.0..end_vpn.0 {
-            self.page_table
-                .map(VirtPageNum(vpn_raw), PhysPageNum(vpn_raw), perm);
+        self.map_identity_range(pa_start, pa_end, perm);
+    }
+
+    /// Identity-map `[pa_start, pa_end)` using 2 MiB megapages wherever the
+    /// span is 2 MiB-aligned, falling back to 4 KiB pages for any ragged
+    /// ends. The kernel image (≈1 GiB up to MEMORY_END) and the PLIC window
+    /// (64 MiB) are 2 MiB-aligned, so this turns the ~261 k per-spawn PTE
+    /// writes of the old page-at-a-time loop into a few hundred — fork and
+    /// execve rebuild the kernel half of every address space, so this was
+    /// ~40 ms of pure overhead on each shell command. These ranges are
+    /// identity-mapped, never unmapped per-process, and live in page-table
+    /// slots disjoint from every user region, so a coarser leaf is safe.
+    fn map_identity_range(&mut self, pa_start: usize, pa_end: usize, perm: PteFlags) {
+        const MEGA: usize = 2 * 1024 * 1024;
+        let mut addr = pa_start & !(PAGE_SIZE - 1);
+        let end = (pa_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        while addr < end {
+            let vpn = VirtPageNum(addr / PAGE_SIZE);
+            if addr % MEGA == 0 && addr + MEGA <= end {
+                self.page_table.map_megapage(vpn, PhysPageNum(vpn.0), perm);
+                addr += MEGA;
+            } else {
+                self.page_table.map(vpn, PhysPageNum(vpn.0), perm);
+                addr += PAGE_SIZE;
+            }
         }
     }
 
@@ -200,16 +215,29 @@ impl MemorySet {
         let mut copied = 0usize;
         for vpn_raw in area.vpn_start.0..area.vpn_end.0 {
             let vpn = VirtPageNum(vpn_raw);
-            let Some(frame) = alloc_frame() else { return Err(()); };
+            // Grab an *unzeroed* frame and initialise it exactly once: copy
+            // the init bytes that land on this page, then zero only the
+            // remainder. The old path zero-filled every frame in `alloc`
+            // and then immediately overwrote most of it with the copy — a
+            // second full-page write per page. For a 1.4 MiB busybox image
+            // (~350 text pages) that doubled the bytes touched on every
+            // execve, and execve runs ~100×/fs_bind case. Zeroing the tail
+            // here preserves the .bss / page-padding guarantee callers rely
+            // on (uninitialised user memory must read as 0).
+            let Some(frame) = alloc_uninit_frame() else { return Err(()); };
             let ppn = frame.ppn;
-            // Copy initial bytes (if any) into the frame.
-            if let Some(data) = init_data {
-                if copied < data.len() {
-                    let dst = ppn.as_byte_slice();
+            let dst = ppn.as_byte_slice();
+            let n = match init_data {
+                Some(data) if copied < data.len() => {
                     let n = core::cmp::min(PAGE_SIZE, data.len() - copied);
                     dst[..n].copy_from_slice(&data[copied..copied + n]);
                     copied += n;
+                    n
                 }
+                _ => 0,
+            };
+            if n < PAGE_SIZE {
+                dst[n..].fill(0);
             }
             self.page_table.map(vpn, ppn, pte_flags);
             area.frames.insert(vpn, Arc::new(frame));
@@ -339,11 +367,32 @@ impl MemorySet {
                     frames: head_frames,
                 });
             }
-            // Middle with new perm — rewrite PTEs.
-            let mid_frames = split_off_le(&mut frames, cut_end);
-            for (&vpn, frame) in &mid_frames {
-                self.page_table.map(vpn, frame.ppn, new_pte);
-                super::page_table::local_flush_va(vpn);
+            // Middle with new perm — rewrite PTEs. If this makes pages
+            // writable, break any cross-address-space sharing first: fork()
+            // hands a read-only page to the child as the *same* physical
+            // frame (Arc refcount > 1), so turning it writable here would let
+            // writes leak across the fork boundary. Copy such an aliased
+            // frame to a private one before remapping it writable. MAP_SHARED
+            // areas (a_shared) are deliberately exempt — their writes are
+            // meant to be mutually visible. There is no COW fault path, so
+            // mprotect is the only place an RO-shared page can become
+            // writable; guarding it here keeps fork's RO-sharing sound.
+            let mut mid_frames = split_off_le(&mut frames, cut_end);
+            let make_writable = perm.contains(VmPerm::W);
+            for (vpn, frame) in mid_frames.iter_mut() {
+                if make_writable && !a_shared && Arc::strong_count(frame) > 1 {
+                    if let Some(copy) = super::frame::alloc_uninit() {
+                        copy.ppn
+                            .as_byte_slice()
+                            .copy_from_slice(frame.ppn.as_byte_slice());
+                        *frame = Arc::new(copy);
+                    }
+                    // On OOM we fall through and reuse the shared frame: the
+                    // mprotect still succeeds, and the (rare) aliased write is
+                    // a lesser evil than failing the syscall or panicking.
+                }
+                self.page_table.map(*vpn, frame.ppn, new_pte);
+                super::page_table::local_flush_va(*vpn);
             }
             new_areas.push(VmArea {
                 vpn_start: cut_start,
@@ -381,15 +430,28 @@ impl MemorySet {
         for area in &self.areas {
             let mut new_frames = alloc::collections::BTreeMap::new();
             let pte_flags = area.perm.to_pte();
+            // Read-only areas (program text, rodata) can never diverge
+            // between parent and child: a write faults to SIGSEGV in both,
+            // exactly as it would against a private copy. So the child maps
+            // the SAME physical frames (Arc refcount bump) instead of
+            // allocating and memcpying a byte-identical duplicate — the
+            // observable behaviour is unchanged but a busybox-sized text
+            // segment (~260 pages) is no longer copied on every fork. The
+            // common shell pattern fork()+execve() then drops the shared
+            // refs at exec teardown, so nothing is pinned.
+            let share = area.shared || !area.perm.contains(VmPerm::W);
             for (&vpn, frame) in &area.frames {
-                if area.shared {
-                    // MAP_SHARED anon: child maps the SAME physical frame
-                    // (Arc bumps the refcount); the frame is freed only when
-                    // both address spaces drop it. Writes are mutually visible.
+                if share {
+                    // MAP_SHARED anon (mutually-visible writes) OR a
+                    // read-only page: map the same frame in the child.
                     new_ms.page_table.map(vpn, frame.ppn, pte_flags);
                     new_frames.insert(vpn, Arc::clone(frame));
                 } else {
-                    let new_frame = super::frame::alloc()?; // None -> ENOMEM
+                    // Writable private page: a real copy is required (there
+                    // is no copy-on-write fault path). `alloc_uninit` skips
+                    // the zero-fill since the very next line overwrites the
+                    // whole page.
+                    let new_frame = super::frame::alloc_uninit()?; // None -> ENOMEM
                     let src = frame.ppn.as_byte_slice();
                     let dst = new_frame.ppn.as_byte_slice();
                     dst.copy_from_slice(src);
