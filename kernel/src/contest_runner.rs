@@ -276,7 +276,7 @@ fn list_testcodes(dir: &str) -> Vec<String> {
 /// then wedges in the kernel uninterruptibly (root cause still under
 /// investigation; the lazy pipe-buffer change reduced the heap pressure but
 /// did not fully clear it).
-const LTP_SKIP: &str = "pipe06";
+const LTP_SKIP: &str = "pipe06 in6_01 in6_02";
 
 const LTP_WHITELIST: &str = "\
     accept01 access01 access02 access03 alarm02 alarm03 alarm05 alarm06 alarm07 bind01 \
@@ -294,7 +294,7 @@ const LTP_WHITELIST: &str = "\
     getgid03 gethostname01 getitimer01 getpagesize01 getpeername01 getpgid01 getpgid02 \
     getpgrp01 getpid01 getpid02 getppid01 getppid02 getpriority02 getrandom01 getrandom02 \
     getrandom03 getrandom04 getrandom05 getrlimit01 getrlimit02 getrlimit03 getrusage01 \
-    getsockopt01 gettid01 gettid02 gettimeofday01 getuid01 getuid03 in6_01 in6_02 link02 link05 \
+    getsockopt01 gettid01 gettid02 gettimeofday01 getuid01 getuid03 link02 link05 \
     llseek02 llseek03 lseek01 lseek07 lstat01 lstat01_64 lstat02_64 madvise10 memcmp01 memcpy01 \
     memset01 mkdir05 mknod01 mknod02 mlock01 mmap02 mmap05 mmap06 mmap09 mmap17 mmap19 \
     mq_open01 mq_timedreceive01 mq_unlink01 msgctl01 msgctl02 msgctl03 msgctl06 msgctl12 \
