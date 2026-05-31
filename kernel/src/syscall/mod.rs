@@ -6451,6 +6451,14 @@ fn read_string_array(addr: usize) -> Option<alloc::vec::Vec<String>> {
 const WNOHANG: i32 = 1;
 
 fn sys_wait4(pid: i32, status_addr: usize, options: i32) -> isize {
+    // Reject invalid option bits up front (waitpid04 passes 0xffffffff and
+    // expects EINVAL, not ECHILD). Valid wait4 options: WNOHANG | WUNTRACED |
+    // WCONTINUED | __WNOTHREAD | __WALL | __WCLONE. This only rejects bit
+    // patterns no legitimate caller passes, so it can't regress real waits.
+    const WAIT4_VALID: u32 = 0xE000_000B;
+    if options as u32 & !WAIT4_VALID != 0 {
+        return EINVAL;
+    }
     let me = current_task();
     let zombie = {
         let children = me.children.lock();
