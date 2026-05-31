@@ -210,6 +210,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_PROCESS_VM_READV => process_vm_xfer(a0 as i32, a1, a2, a3, a4, a5, true),
         nr::SYS_PROCESS_VM_WRITEV => process_vm_xfer(a0 as i32, a1, a2, a3, a4, a5, false),
         nr::SYS_SPLICE => sys_splice(a0 as i32, a1, a2 as i32, a3, a4, a5 as u32),
+        nr::SYS_TEE => sys_tee(a0 as i32, a1 as i32, a2, a3 as u32),
+        nr::SYS_SYNC_FILE_RANGE => sys_sync_file_range(a0 as i32, a1 as i64, a2 as i64, a3 as u32),
         nr::SYS_NAME_TO_HANDLE_AT => sys_name_to_handle_at(a0 as i32, a1, a2, a3, a4 as i32),
         nr::SYS_OPEN_BY_HANDLE_AT => sys_open_by_handle_at(a0 as i32, a1, a2 as i32),
         nr::SYS_TIMERFD_CREATE => sys_timerfd_create(a0 as i32, a1 as i32),
@@ -2520,6 +2522,49 @@ fn process_vm_xfer(
         }
     }
     src.len() as isize
+}
+
+/// tee(fd_in, fd_out, len, flags): duplicate up to `len` bytes from one pipe
+/// into another WITHOUT consuming the source (both ends must be pipes).
+fn sys_tee(fd_in: i32, fd_out: i32, len: usize, _flags: u32) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    let task = current_task();
+    let Some(fin) = task.fd_table.lock().get(fd_in) else { return EBADF };
+    let Some(fout) = task.fd_table.lock().get(fd_out) else { return EBADF };
+    let in_inode = fin.inode.clone();
+    let Some(pin) = in_inode.as_any().downcast_ref::<crate::fs::pipe::PipeEnd>() else {
+        return EINVAL; // tee requires both ends be pipes
+    };
+    if !fout.inode.as_any().is::<crate::fs::pipe::PipeEnd>() {
+        return EINVAL;
+    }
+    let data = pin.peek(core::cmp::min(len, 65536));
+    if data.is_empty() {
+        return 0;
+    }
+    match fout.inode.write_at(0, &data) {
+        Ok(n) => n as isize,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+/// sync_file_range(fd, offset, nbytes, flags): a hint to write back a file
+/// range. We validate the way sync_file_range02 expects (valid flags,
+/// non-negative offset/nbytes, real fd, ESPIPE on a pipe) then no-op — our
+/// writes already reach the inode.
+fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> isize {
+    const VALID: u32 = 7; // WAIT_BEFORE | WRITE | WAIT_AFTER
+    if flags & !VALID != 0 || offset < 0 || nbytes < 0 {
+        return EINVAL;
+    }
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    if file.inode.as_any().is::<crate::fs::pipe::PipeEnd>() {
+        return -29; // ESPIPE
+    }
+    0
 }
 
 /// openat2(dirfd, pathname, struct open_how *how, size): the extended openat.

@@ -175,6 +175,7 @@ pub const SYS_PWRITEV: usize = 70;
 pub const SYS_VMSPLICE: usize = 75;
 pub const SYS_SPLICE: usize = 76;
 pub const SYS_TEE: usize = 77;
+pub const SYS_SYNC_FILE_RANGE: usize = 84;
 pub const SYS_MSYNC: usize = 227;
 pub const SYS_MINCORE: usize = 232;
 pub const SYS_PROCESS_VM_READV: usize = 270;

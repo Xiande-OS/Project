@@ -46,6 +46,13 @@ impl PipeEnd {
     pub fn buffered(&self) -> usize {
         self.inner.lock().buf.len()
     }
+    /// Copy up to `max` buffered bytes WITHOUT consuming them — tee(2)
+    /// duplicates a pipe's data into another pipe, leaving the source readable.
+    pub fn peek(&self, max: usize) -> alloc::vec::Vec<u8> {
+        let pipe = self.inner.lock();
+        let n = core::cmp::min(max, pipe.buf.len());
+        pipe.buf.iter().take(n).copied().collect()
+    }
     /// Current pipe capacity in bytes (fcntl F_GETPIPE_SZ).
     pub fn capacity(&self) -> usize {
         self.inner.lock().capacity
