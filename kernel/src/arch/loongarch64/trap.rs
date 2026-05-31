@@ -1,6 +1,13 @@
 //! loongarch64 trap dispatch (general exceptions, interrupts, syscalls).
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Consecutive kernel-mode faults with no intervening return to user. Reset
+/// whenever a trap arrives from user mode (proof the machine made forward
+/// progress). A run of them means persistent corruption — power off cleanly so
+/// the run still scores everything up to here rather than looping on the fault.
+static KERNEL_FAULTS: AtomicUsize = AtomicUsize::new(0);
 
 global_asm!(include_str!("trap.S"));
 
@@ -258,6 +265,12 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
     let is = estat & 0x1fff;
     let from_user = (tf.prmd & 0x3) != 0;
 
+    // A user-originated trap proves we returned to userspace since any earlier
+    // kernel fault, so the consecutive-fault run is broken.
+    if from_user {
+        KERNEL_FAULTS.store(0, Ordering::Relaxed);
+    }
+
     if ecode == 0 {
         // Interrupt. Timer == IS bit 11.
         if is & (1 << 11) != 0 {
@@ -346,10 +359,40 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             }
             _ => {
                 let badv = csrrd(0x7);
-                panic!(
-                    "kernel exception ecode={:#x}\n  era  = {:#x}\n  badv = {:#x}\n  prmd = {:#x}",
-                    ecode, tf.era, badv, tf.prmd,
-                );
+                // Kernel-mode fault while servicing a syscall — e.g. a
+                // fork/thread-storm under memory pressure dereferenced a bad
+                // pointer (LTP cve-2017-17052 hit ecode=0x8 ADE here and
+                // panicked, killing the whole LoongArch run mid-ltp-musl).
+                // Mirror riscv64: don't bring the machine down. If there is a
+                // live task to blame, force-release any lock the abandoned
+                // operation held, kill that task, and let the scheduler carry
+                // on — the run keeps scoring. Only a fault with no current task
+                // (early boot / the idle scheduler) or a storm of consecutive
+                // kernel faults (persistent corruption) is fatal.
+                if crate::task::has_current_task() {
+                    unsafe { crate::task::force_release_locks_after_fault(); }
+                    if KERNEL_FAULTS.fetch_add(1, Ordering::Relaxed) + 1 >= 3 {
+                        crate::println!(
+                            "[kernel fault storm] ecode={:#x} era={:#x} badv={:#x} — powering off cleanly so the run still scores",
+                            ecode, tf.era, badv,
+                        );
+                        crate::arch::shutdown();
+                    }
+                    crate::println!(
+                        "[kernel-mode fault recovered] pid={} ecode={:#x} era={:#x} badv={:#x} — killing task",
+                        crate::task::current_pid(), ecode, tf.era, badv,
+                    );
+                    let task = crate::task::current_task();
+                    crate::signal::kill_now(&task);
+                    // Fall through to schedule_next_after_trap: kill_now marked
+                    // the task Zombie, so the scheduler picks another runnable
+                    // task instead of returning to the faulting instruction.
+                } else {
+                    panic!(
+                        "kernel exception ecode={:#x}\n  era  = {:#x}\n  badv = {:#x}\n  prmd = {:#x}",
+                        ecode, tf.era, badv, tf.prmd,
+                    );
+                }
             }
         }
     }
