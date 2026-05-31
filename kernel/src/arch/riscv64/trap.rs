@@ -220,15 +220,37 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
     match cause.cause() {
         Trap::Exception(Exception::UserEnvCall) => {
             tf.sepc += 4;
+            // Run the syscall with the timer enabled so a nested tick can drive
+            // the in-kernel watchdog if this call wedges (see task::watchdog_*).
+            // SIE is cleared again before scheduling so the cooperative
+            // scheduler itself is never interrupted.
+            crate::task::watchdog_arm();
+            unsafe { sstatus::set_sie(); }
             crate::syscall::dispatch(tf);
+            unsafe { sstatus::clear_sie(); }
+            crate::task::watchdog_disarm();
         }
         Trap::Exception(Exception::Breakpoint) => {
             tf.sepc += instr_len_at(tf.sepc);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
-            // Re-arm and let schedule_next_after_trap do its thing.
-            // No fault, no syscall to dispatch — just a quantum tick.
+            // Re-arm the periodic timer first so it keeps ticking regardless.
             arm_timer();
+            if !from_user {
+                // Nested tick: the timer fired while we were in-kernel handling
+                // a syscall (interrupts are enabled across dispatch). This is
+                // the watchdog. If the syscall has overrun its budget it has
+                // wedged uninterruptibly — abandon it like a kernel fault so
+                // the run continues. Otherwise resume the syscall WITHOUT
+                // rescheduling: this cooperative kernel can't suspend and later
+                // resume a mid-syscall kernel stack, so the only way it leaves a
+                // running syscall early is by killing it.
+                if crate::task::watchdog_overrun() {
+                    return unsafe { crate::task::watchdog_kill_current(tf as *mut _) };
+                }
+                return tf as *mut _;
+            }
+            // User-mode quantum tick: fall through to the cooperative scheduler.
         }
         Trap::Exception(e) if from_user => {
             crate::println!(

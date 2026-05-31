@@ -265,6 +265,16 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             unsafe {
                 core::arch::asm!("csrwr {0}, 0x44", inout(reg) 1usize => _);
             }
+            if !from_user {
+                // Nested tick during in-kernel syscall handling: run the
+                // watchdog. See riscv64 trap.rs for the rationale. Kill a
+                // wedged (overrun) syscall; otherwise resume it without
+                // rescheduling (no mid-syscall stack suspend/resume here).
+                if crate::task::watchdog_overrun() {
+                    return unsafe { crate::task::watchdog_kill_current(tf as *mut _) };
+                }
+                return tf as *mut _;
+            }
         } else {
             crate::println!("[trap] unhandled interrupt, IS={:#x}; masking", is);
             // Mask further interrupts by clearing ECFG.LIE.
@@ -277,7 +287,17 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             0x0B => {
                 // syscall: step past the `syscall` instruction, then run.
                 tf.era += 4;
+                // Run with CRMD.IE set so the periodic timer can fire as a
+                // nested trap and drive the in-kernel watchdog if this call
+                // wedges (see task::watchdog_*). Restore IE=0 before the
+                // scheduler runs so it is never itself interrupted.
+                crate::task::watchdog_arm();
+                let set = csrrd(0x0) | (1usize << 2);
+                unsafe { core::arch::asm!("csrwr {0}, 0x0", inout(reg) set => _); }
                 crate::syscall::dispatch(tf);
+                let clr = csrrd(0x0) & !(1usize << 2);
+                unsafe { core::arch::asm!("csrwr {0}, 0x0", inout(reg) clr => _); }
+                crate::task::watchdog_disarm();
             }
             0x0C => {
                 // breakpoint
