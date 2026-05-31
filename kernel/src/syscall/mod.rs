@@ -203,6 +203,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
             else { sys_pwritev(a0 as i32, a1, a2, a3 as u64) }
         }
         nr::SYS_MINCORE => sys_mincore(a0, a1, a2),
+        nr::SYS_SPLICE => sys_splice(a0 as i32, a1, a2 as i32, a3, a4, a5 as u32),
         nr::SYS_NAME_TO_HANDLE_AT => sys_name_to_handle_at(a0 as i32, a1, a2, a3, a4 as i32),
         nr::SYS_OPEN_BY_HANDLE_AT => sys_open_by_handle_at(a0 as i32, a1, a2 as i32),
         nr::SYS_TIMERFD_CREATE => sys_timerfd_create(a0 as i32, a1 as i32),
@@ -2308,6 +2309,70 @@ static NEXT_HANDLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// written is handle_bytes(4) + handle_type(4) + 8.
 const HANDLE_PAYLOAD: u32 = 8;
 const MAX_HANDLE_SZ: u32 = 128;
+
+/// splice(fd_in, off_in, fd_out, off_out, len, flags): move up to `len` bytes
+/// between two fds, at least one of which must be a pipe. We move through a
+/// bounce buffer (no real zero-copy, but the observable behaviour matches): a
+/// NULL offset means "use the file position" (advanced by File::read/write); a
+/// non-NULL offset names a position and is written back. Offsets are illegal on
+/// a pipe end (ESPIPE). splice0* in LTP pipe files through a pipe and back.
+fn sys_splice(fd_in: i32, off_in: usize, fd_out: i32, off_out: usize, len: usize, _flags: u32) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    let task = current_task();
+    let Some(fin) = task.fd_table.lock().get(fd_in) else { return EBADF };
+    let Some(fout) = task.fd_table.lock().get(fd_out) else { return EBADF };
+    let in_pipe = fin.inode.as_any().is::<crate::fs::pipe::PipeEnd>();
+    let out_pipe = fout.inode.as_any().is::<crate::fs::pipe::PipeEnd>();
+    // splice requires at least one pipe end.
+    if !in_pipe && !out_pipe {
+        return EINVAL;
+    }
+    if (in_pipe && off_in != 0) || (out_pipe && off_out != 0) {
+        return -29; // ESPIPE: a pipe has no seekable offset
+    }
+
+    let cap = core::cmp::min(len, 65536);
+    let mut buf = alloc::vec![0u8; cap];
+
+    // Read side.
+    let in_off = if off_in != 0 {
+        let Some(b) = task.copy_in_bytes(off_in, 8) else { return EFAULT };
+        u64::from_le_bytes(b[..8].try_into().unwrap())
+    } else {
+        0
+    };
+    let n_read = if off_in != 0 {
+        match fin.inode.read_at(in_off, &mut buf) { Ok(n) => n, Err(e) => return err_to_isize(e) }
+    } else {
+        match fin.read(&mut buf) { Ok(n) => n, Err(e) => return err_to_isize(e) }
+    };
+    if n_read == 0 {
+        return 0;
+    }
+
+    // Write side.
+    let out_off = if off_out != 0 {
+        let Some(b) = task.copy_in_bytes(off_out, 8) else { return EFAULT };
+        u64::from_le_bytes(b[..8].try_into().unwrap())
+    } else {
+        0
+    };
+    let n_written = if off_out != 0 {
+        match fout.inode.write_at(out_off, &buf[..n_read]) { Ok(n) => n, Err(e) => return err_to_isize(e) }
+    } else {
+        match fout.write(&buf[..n_read]) { Ok(n) => n, Err(e) => return err_to_isize(e) }
+    };
+
+    if off_in != 0 {
+        let _ = task.copy_out_bytes(off_in, &(in_off + n_read as u64).to_le_bytes());
+    }
+    if off_out != 0 {
+        let _ = task.copy_out_bytes(off_out, &(out_off + n_written as u64).to_le_bytes());
+    }
+    n_written as isize
+}
 
 fn sys_name_to_handle_at(dfd: i32, path: usize, handle: usize, mount_id: usize, flags: i32) -> isize {
     const AT_EMPTY_PATH: i32 = 0x1000;
