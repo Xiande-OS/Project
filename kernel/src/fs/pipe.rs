@@ -5,7 +5,7 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::any::Any;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use super::{FileType, Inode, Result, EBADF, EINVAL};
 

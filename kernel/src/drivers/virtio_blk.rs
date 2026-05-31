@@ -10,7 +10,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
-use spin::{Mutex, Once};
+use crate::sync::Mutex; use spin::Once;
 use virtio_drivers::device::blk::VirtIOBlk;
 use virtio_drivers::transport::mmio::MmioTransport;
 #[cfg(not(target_arch = "loongarch64"))]

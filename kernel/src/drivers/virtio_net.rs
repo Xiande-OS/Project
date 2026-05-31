@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 #[cfg(not(target_arch = "loongarch64"))]
 use core::ptr::NonNull;
-use spin::{Mutex, Once};
+use crate::sync::Mutex; use spin::Once;
 use virtio_drivers::device::net::VirtIONet;
 #[cfg(not(target_arch = "loongarch64"))]
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};

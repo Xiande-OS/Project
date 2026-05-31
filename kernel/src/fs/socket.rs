@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicU16, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::wire::Ipv4Address;

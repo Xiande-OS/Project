@@ -23,7 +23,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use super::tmpfs::{TmpfsDir, TmpfsFile};
 use super::{FileType, Inode, Result, EEXIST, EINVAL, ENOENT};

@@ -31,7 +31,7 @@
 use alloc::sync::Arc;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 pub type SigActions = [KSigAction; (NSIG + 1) as usize];
 

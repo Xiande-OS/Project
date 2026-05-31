@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::{Mutex, Once};
+use crate::sync::Mutex; use spin::Once;
 
 pub mod devfs;
 pub mod ext4;

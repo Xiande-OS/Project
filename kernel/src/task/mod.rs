@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use spin::{Lazy, Mutex};
+use crate::sync::Mutex; use spin::Lazy;
 
 use crate::arch::TrapFrame;
 use crate::loader::LoadedElf;
@@ -191,7 +191,7 @@ impl Task {
         copy_out_via(&ms, va, bytes)
     }
 
-    pub fn memory_set_mut(&self) -> spin::MutexGuard<'_, MemorySet> {
+    pub fn memory_set_mut(&self) -> crate::sync::MutexGuard<'_, MemorySet> {
         self.memory_set.lock()
     }
 
@@ -311,6 +311,11 @@ pub fn has_current_task() -> bool {
 /// Must only be called from the trap handler when abandoning a faulted
 /// kernel operation on a single hart.
 pub unsafe fn force_release_locks_after_fault() {
+    // The abandoned stack's lock guards will never run their destructors, so
+    // the preemption-disable count they bumped would otherwise leak upward and
+    // wedge preemption off forever. Zero it — we are force-releasing the locks
+    // and switching to a fresh task anyway.
+    crate::sync::preempt_reset();
     TABLE.force_unlock();
     // The abandoned operation may also be holding the *current task's own*
     // per-process locks — e.g. a syscall that wedged or faulted mid fd-table
@@ -650,8 +655,8 @@ pub fn all_tasks() -> Vec<Arc<Task>> {
 /// `timeout` (a polling daemon doing `nanosleep + kill(self_parent,0)`)
 /// would hold the CPU forever and the actual wrapped command never got
 /// scheduled.
-static SLEEPING_UNTIL: spin::Mutex<alloc::collections::BTreeMap<i32, u64>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static SLEEPING_UNTIL: crate::sync::Mutex<alloc::collections::BTreeMap<i32, u64>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 pub fn sleep_until(pid: i32, deadline_ticks: u64) {
     SLEEPING_UNTIL.lock().insert(pid, deadline_ticks);
@@ -744,8 +749,8 @@ pub fn wake_expired_sleepers(now: u64) {
 
 /// ITIMER_REAL deadlines: per-pid (next_deadline_ticks, interval_ticks).
 /// `interval_ticks == 0` means single-shot (don't rearm).
-static IT_REAL_DEADLINES: spin::Mutex<alloc::collections::BTreeMap<i32, (u64, u64)>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static IT_REAL_DEADLINES: crate::sync::Mutex<alloc::collections::BTreeMap<i32, (u64, u64)>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 /// Install / replace this pid's ITIMER_REAL. `next == 0` disarms it.
 pub fn itimer_real_set(pid: i32, next_deadline_ticks: u64, interval_ticks: u64) {
@@ -817,8 +822,8 @@ pub fn wake_vfork_parent_of(child_pid: i32) {
 /// Mark this task as blocked on socket activity rather than wait4/futex.
 /// `wake_socket_waiters` only wakes tasks in this set, so a wait4 caller
 /// doesn't get spuriously bounced back to Ready every trap.
-static SOCKET_WAITERS: spin::Mutex<alloc::collections::BTreeSet<i32>> =
-    spin::Mutex::new(alloc::collections::BTreeSet::new());
+static SOCKET_WAITERS: crate::sync::Mutex<alloc::collections::BTreeSet<i32>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeSet::new());
 
 pub fn mark_socket_waiter(pid: i32) {
     SOCKET_WAITERS.lock().insert(pid);

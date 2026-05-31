@@ -18,7 +18,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI32, Ordering};
-use spin::{Lazy, Mutex};
+use crate::sync::Mutex; use spin::Lazy;
 
 use crate::task::{current_task, task_by_pid, Task, TaskState};
 

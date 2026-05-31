@@ -1784,7 +1784,7 @@ fn release_record_locks(pid: i32) {
 
 // ---------- flock (advisory, per-inode) ----------
 
-use spin::Mutex as SpinMutex;
+use crate::sync::Mutex as SpinMutex;
 
 #[derive(Default)]
 struct LockState {
@@ -2529,9 +2529,9 @@ fn default_rlimit(resource: u32) -> Rlimit {
 /// and the test spins forever opening fds. We don't actually enforce
 /// the limit in the fd allocator; just remember the user's setting so
 /// the round-trip set/get matches.
-static RLIMIT_OVERRIDES: spin::Mutex<
+static RLIMIT_OVERRIDES: crate::sync::Mutex<
     alloc::collections::BTreeMap<(i32, u32), (u64, u64)>,
-> = spin::Mutex::new(alloc::collections::BTreeMap::new());
+> = crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 fn rlimit_for(pid: i32, resource: u32) -> Rlimit {
     if let Some(&(c, m)) = RLIMIT_OVERRIDES.lock().get(&(pid, resource)) {
@@ -2545,8 +2545,8 @@ fn rlimit_for(pid: i32, resource: u32) -> Rlimit {
 /// when those returned ENOSYS the tests TBROK'd in setup ("setuid() failed:
 /// ENOSYS") before exercising anything. Track them per tgid so getuid/
 /// geteuid/... reflect a prior set, and always succeed.
-static CREDS: spin::Mutex<alloc::collections::BTreeMap<i32, [u32; 4]>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static CREDS: crate::sync::Mutex<alloc::collections::BTreeMap<i32, [u32; 4]>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 fn cur_tgid() -> i32 {
     current_task().tgid.load(core::sync::atomic::Ordering::Relaxed)
@@ -2574,7 +2574,7 @@ pub fn forget_creds(pid: i32) {
 /// creds already; only call this when the tgids differ.
 pub fn inherit_creds(parent_tgid: i32, child_tgid: i32) {
     // Bind each lookup to a local first so the read guard is released before
-    // we re-lock to insert — spin::Mutex is not reentrant, and an `if let`
+    // we re-lock to insert — crate::sync::Mutex is not reentrant, and an `if let`
     // scrutinee would otherwise hold the guard across the body and deadlock.
     let creds = CREDS.lock().get(&parent_tgid).copied();
     if let Some(c) = creds {
@@ -2596,8 +2596,8 @@ pub fn inherit_creds(parent_tgid: i32, child_tgid: i32) {
 
 /// Saved set-uid / set-gid, kept beside CREDS (which stays [ruid,euid,rgid,egid]
 /// so its many readers are unchanged). Default root, like CREDS.
-static SAVED_IDS: spin::Mutex<alloc::collections::BTreeMap<i32, (u32, u32)>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static SAVED_IDS: crate::sync::Mutex<alloc::collections::BTreeMap<i32, (u32, u32)>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 fn saved_ids_of(tgid: i32) -> (u32, u32) {
     SAVED_IDS.lock().get(&tgid).copied().unwrap_or((0, 0))
@@ -2606,8 +2606,8 @@ fn saved_ids_of(tgid: i32) -> (u32, u32) {
 /// Filesystem uid/gid, used for file-access checks. They follow the effective
 /// ids until overridden by setfsuid/setfsgid; we only need the value to
 /// round-trip, so it is stored lazily and seeded from the effective id.
-static FS_IDS: spin::Mutex<alloc::collections::BTreeMap<i32, (u32, u32)>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static FS_IDS: crate::sync::Mutex<alloc::collections::BTreeMap<i32, (u32, u32)>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 /// getresuid(2)/getresgid(2): write the real, effective and saved id to the
 /// three user pointers. setresuid03 and friends call these to confirm the
@@ -2963,8 +2963,8 @@ const PRIO_USER: i32 = 2;
 
 /// Nice values set via setpriority(2), keyed by (which, who). We don't run a
 /// priority scheduler, but the values must round-trip for getpriority(2).
-static NICE_VALUES: spin::Mutex<alloc::collections::BTreeMap<(i32, i32), i32>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static NICE_VALUES: crate::sync::Mutex<alloc::collections::BTreeMap<(i32, i32), i32>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 /// Normalise `who == 0` ("the calling process/group/user") to a concrete id so
 /// a set/get pair keyed by it agrees regardless of which form the caller used.
@@ -3050,8 +3050,8 @@ const SCHED_IDLE: i32 = 5;
 
 /// Per-pid scheduling policy + realtime priority. We don't run a realtime
 /// scheduler, but the sched_* group requires these to validate and round-trip.
-static SCHED_POLICY: spin::Mutex<alloc::collections::BTreeMap<i32, (i32, i32)>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static SCHED_POLICY: crate::sync::Mutex<alloc::collections::BTreeMap<i32, (i32, i32)>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 /// Drop a reaped pid's stored policy so a recycled pid starts fresh.
 pub fn forget_sched(pid: i32) {
@@ -3177,8 +3177,8 @@ fn sys_sched_get_priority_min(policy: i32) -> isize {
 }
 
 /// Per-process execution domain (personality(2)). Default 0 (PER_LINUX).
-static PERSONALITY: spin::Mutex<alloc::collections::BTreeMap<i32, u32>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static PERSONALITY: crate::sync::Mutex<alloc::collections::BTreeMap<i32, u32>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 pub fn forget_personality(pid: i32) {
     PERSONALITY.lock().remove(&pid);
@@ -4083,8 +4083,8 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
 /// Supplementary group list per thread-group (default empty). getgroups/
 /// setgroups round-trip it; the contest runs as root so the permission gate
 /// only bites tests that drop privilege.
-static SUPP_GROUPS: spin::Mutex<alloc::collections::BTreeMap<i32, alloc::vec::Vec<u32>>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static SUPP_GROUPS: crate::sync::Mutex<alloc::collections::BTreeMap<i32, alloc::vec::Vec<u32>>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 const NGROUPS_MAX: i32 = 65536;
 
@@ -4174,10 +4174,10 @@ struct PosixTimer {
 /// All POSIX timers, keyed by (pid, timer_id). Per-process ids start at 0 and
 /// only ever increase (a deleted id is not reused) so a stale id reliably
 /// reports EINVAL.
-static POSIX_TIMERS: spin::Mutex<alloc::collections::BTreeMap<(i32, i32), PosixTimer>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
-static POSIX_TIMER_NEXT: spin::Mutex<alloc::collections::BTreeMap<i32, i32>> =
-    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static POSIX_TIMERS: crate::sync::Mutex<alloc::collections::BTreeMap<(i32, i32), PosixTimer>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
+static POSIX_TIMER_NEXT: crate::sync::Mutex<alloc::collections::BTreeMap<i32, i32>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
 
 /// Drop every timer owned by a reaped pid.
 pub fn forget_timers(pid: i32) {
@@ -5470,7 +5470,7 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
 /// task table + kstack freed) on the next scheduling boundary. We can't
 /// reap inline because the scheduler still needs to observe our Zombie
 /// state to switch off us.
-static SELF_REAP_LIST: spin::Mutex<alloc::vec::Vec<i32>> = spin::Mutex::new(alloc::vec::Vec::new());
+static SELF_REAP_LIST: crate::sync::Mutex<alloc::vec::Vec<i32>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
 
 fn mark_for_self_reap(pid: i32) {
     SELF_REAP_LIST.lock().push(pid);
@@ -5965,17 +5965,17 @@ fn write_field_bytes(dst: &mut [u8; 65], s: &[u8]) {
 
 /// System-wide host/domain name set via sethostname/setdomainname and reported
 /// by uname. Empty means "use the built-in default".
-static HOSTNAME: spin::Mutex<alloc::vec::Vec<u8>> =
-    spin::Mutex::new(alloc::vec::Vec::new());
-static DOMAINNAME: spin::Mutex<alloc::vec::Vec<u8>> =
-    spin::Mutex::new(alloc::vec::Vec::new());
+static HOSTNAME: crate::sync::Mutex<alloc::vec::Vec<u8>> =
+    crate::sync::Mutex::new(alloc::vec::Vec::new());
+static DOMAINNAME: crate::sync::Mutex<alloc::vec::Vec<u8>> =
+    crate::sync::Mutex::new(alloc::vec::Vec::new());
 
 const UTS_LEN: usize = 64; // __NEW_UTS_LEN; utsname fields are 65 = +NUL
 
 /// sethostname(2)/setdomainname(2) share validation: CAP_SYS_ADMIN (root) is
 /// required (EPERM otherwise), the length must be 0..=64 (EINVAL), and the
 /// user buffer must be readable (EFAULT). The accepted name is stored.
-fn set_uts_name(store: &spin::Mutex<alloc::vec::Vec<u8>>, ptr: usize, len: i64) -> isize {
+fn set_uts_name(store: &crate::sync::Mutex<alloc::vec::Vec<u8>>, ptr: usize, len: i64) -> isize {
     if current_euid() != 0 {
         return EPERM;
     }

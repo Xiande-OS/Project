@@ -28,7 +28,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// One direction's byte pipe. ~64 KiB cap matches a typical TCP window;
 /// when full the writer returns short / EAGAIN.

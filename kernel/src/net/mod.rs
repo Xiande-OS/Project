@@ -9,7 +9,7 @@
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use spin::{Mutex, Once};
+use crate::sync::Mutex; use spin::Once;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};

@@ -12,7 +12,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryInto;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use super::{FileType, Inode, Result, EINVAL, ENOENT};
 use crate::drivers::virtio_blk::{self, BlockDevice};
