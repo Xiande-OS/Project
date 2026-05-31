@@ -5026,7 +5026,7 @@ fn exec_resolved(
         if let Err(e) = interp_inode.read_at(0, &mut interp_image) {
             return err_to_isize(e);
         }
-        let interp_aligned: alloc::vec::Vec<u8> = aligned_clone(&interp_image);
+        let interp_aligned: alloc::vec::Vec<u8> = ensure_aligned(interp_image);
         let argv_refs: alloc::vec::Vec<&str> = new_argv.iter().map(|s| s.as_str()).collect();
         let envp_refs: alloc::vec::Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
         return match crate::task::execve_current_with_path(
@@ -5037,8 +5037,10 @@ fn exec_resolved(
         };
     }
 
-    // Ensure aligned (xmas-elf requires 8-byte alignment).
-    let elf_aligned: alloc::vec::Vec<u8> = aligned_clone(&elf_image);
+    // Ensure aligned (xmas-elf requires 8-byte alignment). Consumes the
+    // image buffer and returns it untouched when already aligned (the usual
+    // case), avoiding a full-image copy on every exec.
+    let elf_aligned: alloc::vec::Vec<u8> = ensure_aligned(elf_image);
 
     let argv_refs: alloc::vec::Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
     let envp_refs: alloc::vec::Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
@@ -5102,23 +5104,28 @@ fn sys_execveat(dirfd: i32, path_addr: usize, argv_addr: usize, envp_addr: usize
     exec_resolved(inode, path, argv, envp)
 }
 
-fn aligned_clone(src: &[u8]) -> alloc::vec::Vec<u8> {
-    // Vec data has 8-byte (or stricter) alignment by default — alloc gives
-    // pointer aligned to mem::align_of::<u8>() == 1, but in practice the
-    // allocator returns >=8 byte aligned blocks. Re-allocate via a u64
-    // buffer to be safe.
-    let nwords = (src.len() + 7) / 8;
+fn ensure_aligned(buf: alloc::vec::Vec<u8>) -> alloc::vec::Vec<u8> {
+    // xmas-elf requires the image to be 8-byte aligned. A Vec<u8> from the
+    // global allocator is in practice already >=8-byte aligned (allocators
+    // return blocks aligned to at least the word size), so the common path —
+    // an execve image freshly read into a `try_zeroed_buf` Vec — needs no
+    // work and we hand the buffer straight through. Only re-allocate (via a
+    // u64 buffer) in the rare case a caller passes something underaligned,
+    // turning what used to be an unconditional ~1 MiB copy of every busybox
+    // exec into a pointer check.
+    if buf.as_ptr() as usize % 8 == 0 {
+        return buf;
+    }
+    let nwords = (buf.len() + 7) / 8;
     let mut words = alloc::vec![0u64; nwords];
     unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), words.as_mut_ptr() as *mut u8, src.len());
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), words.as_mut_ptr() as *mut u8, buf.len());
     }
-    // Re-interpret as Vec<u8>. Easier: just copy into a Vec<u8> created from words.
-    let mut bytes = alloc::vec::Vec::with_capacity(src.len());
+    let mut bytes = alloc::vec::Vec::with_capacity(buf.len());
     unsafe {
-        core::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, bytes.as_mut_ptr(), src.len());
-        bytes.set_len(src.len());
+        core::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, bytes.as_mut_ptr(), buf.len());
+        bytes.set_len(buf.len());
     }
-    drop(words);
     bytes
 }
 
