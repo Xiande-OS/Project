@@ -7,16 +7,75 @@ use alloc::vec::Vec;
 use crate::sync::Mutex;
 
 use core::any::Any;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
     devfs, xattr_store_get, xattr_store_list, xattr_store_remove, xattr_store_set, FileType,
     Inode, Result, XattrStore, EEXIST, EINVAL, ENOENT, ENOSPC,
 };
 
+/// Global ceiling on the kernel heap consumed by tmpfs file data, summed
+/// across every in-memory mount (root /, /tmp, /dev/shm). tmpfs files live in
+/// the 256 MiB kernel heap as `Vec<u8>`; that same heap also backs every task
+/// struct and kernel stack. Without a cap, one LTP test that writes a
+/// multi-hundred-MB temp file (mmap2/mmap3/the growfiles family) fills the
+/// heap, and — because a SIGKILLed test never runs its own cleanup — those
+/// files leak. Once the heap is full, every `fork()` (task-struct alloc) fails
+/// with ENOMEM and the run drowns in `sh: busybox: Out of memory`, never
+/// recovering. A real Linux tmpfs defaults to half of RAM and enforces it,
+/// returning ENOSPC so the *rest* of memory stays usable for processes. Mirror
+/// that: cap tmpfs at half the heap so a runaway file gets ENOSPC (a localized,
+/// recoverable error) instead of wedging the whole kernel. The contest runner
+/// also wipes /tmp between cases, so this is only ever the per-case ceiling.
+const TMPFS_CAP: usize = 128 * 1024 * 1024;
+static TMPFS_USED: AtomicUsize = AtomicUsize::new(0);
+
+/// Reserve `bytes` of the global tmpfs budget. Returns false (caller surfaces
+/// ENOSPC) if that would exceed the cap.
+fn tmpfs_charge(bytes: usize) -> bool {
+    loop {
+        let cur = TMPFS_USED.load(Ordering::Relaxed);
+        let next = cur.saturating_add(bytes);
+        if next > TMPFS_CAP {
+            return false;
+        }
+        if TMPFS_USED
+            .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+/// Return `bytes` to the global tmpfs budget (file shrunk or freed).
+fn tmpfs_uncharge(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let mut cur = TMPFS_USED.load(Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_sub(bytes);
+        match TMPFS_USED.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 pub struct TmpfsFile {
     data: Mutex<Vec<u8>>,
     pub meta: Mutex<Meta>,
     xattrs: XattrStore,
+}
+
+impl Drop for TmpfsFile {
+    fn drop(&mut self) {
+        // Credit back the heap this file's data was holding so a deleted (or
+        // GC'd) tmpfs file frees its slice of the global budget.
+        let cap = self.data.get_mut().capacity();
+        tmpfs_uncharge(cap);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,8 +149,31 @@ impl Inode for TmpfsFile {
             // block isn't available (LTP fills a multi-hundred-MB temp file).
             // Reserve fallibly and surface ENOSPC instead — the in-memory fs
             // is simply full.
-            let need = end - data.len();
-            data.try_reserve(need).map_err(|_| ENOSPC)?;
+            if data.capacity() < end {
+                let need = end - data.len();
+                // Refuse before allocating if the global tmpfs budget is spent,
+                // so one test's runaway file can't eat the heap that fork()/exec
+                // need (the `sh: busybox: Out of memory` storm). Charge the real
+                // heap growth (capacity delta), not just the logical length, so
+                // amortized doubling can't slip past the cap.
+                if !tmpfs_charge(need) {
+                    return Err(ENOSPC);
+                }
+                let before = data.capacity();
+                if let Err(e) = data.try_reserve(need) {
+                    tmpfs_uncharge(need);
+                    let _ = e;
+                    return Err(ENOSPC);
+                }
+                // Reconcile the estimate (`need`) against the allocator's actual
+                // capacity growth so the budget tracks true heap use.
+                let grew = data.capacity() - before;
+                if grew >= need {
+                    tmpfs_charge(grew - need);
+                } else {
+                    tmpfs_uncharge(need - grew);
+                }
+            }
             data.resize(end, 0);
         }
         data[off..end].copy_from_slice(buf);
@@ -101,10 +183,33 @@ impl Inode for TmpfsFile {
         let mut data = self.data.lock();
         let new_len = len as usize;
         if new_len > data.len() {
-            let need = new_len - data.len();
-            data.try_reserve(need).map_err(|_| ENOSPC)?;
+            if data.capacity() < new_len {
+                let need = new_len - data.len();
+                if !tmpfs_charge(need) {
+                    return Err(ENOSPC);
+                }
+                let before = data.capacity();
+                if let Err(_e) = data.try_reserve(need) {
+                    tmpfs_uncharge(need);
+                    return Err(ENOSPC);
+                }
+                let grew = data.capacity() - before;
+                if grew >= need {
+                    tmpfs_charge(grew - need);
+                } else {
+                    tmpfs_uncharge(need - grew);
+                }
+            }
+            data.resize(new_len, 0);
+        } else if new_len < data.len() {
+            // Shrinking: hand the freed heap back to the global budget. resize()
+            // alone keeps the old capacity, so a test that truncates a huge temp
+            // file to 0 (a common teardown) would otherwise keep pinning it.
+            let before = data.capacity();
+            data.truncate(new_len);
+            data.shrink_to_fit();
+            tmpfs_uncharge(before.saturating_sub(data.capacity()));
         }
-        data.resize(new_len, 0);
         Ok(())
     }
     fn xattr_get(&self, name: &str) -> Result<Vec<u8>> {

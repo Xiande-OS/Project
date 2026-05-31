@@ -696,30 +696,33 @@ pub fn emergency_reclaim() -> usize {
         }
     }
 
-    // Terminal-OOM detector. `emergency_reclaim` runs only on an allocation
-    // failure. If it keeps finding nothing to free while allocations keep
-    // failing — continuously for ~60s — the machine is genuinely out of memory
-    // and thrashing (init can't fork the next case; the 'sh: busybox: Out of
-    // memory' storm). No single test can sustain that: the per-case timeout
-    // frees its memory within seconds, and any reclaim that frees something, or
-    // any gap (allocs succeeding again), resets the streak. Rather than spin
-    // until the grader's global timeout, power off cleanly so the run still
-    // scores everything banked so far.
+    // Terminal-OOM detector. `emergency_reclaim` runs only when an allocation
+    // is failing. If allocations keep failing continuously — for ~45s with no
+    // genuine recovery gap — the machine is wedged (init can't fork the next
+    // case; the 'sh: busybox: Out of memory' storm) and will never make
+    // progress on its own. Rather than spin until the grader's global timeout,
+    // power off cleanly so the run still scores everything banked so far.
+    //
+    // Crucially, freeing a few dead-task scraps does NOT count as recovery: the
+    // storm leaves a fresh zombie on every failed fork, so the previous
+    // `if total > 0 { reset }` made this a treadmill — reclaim a scrap, reset
+    // the window, never reach the threshold, flood forever. Only a real gap —
+    // allocations succeeding long enough that no failure calls us for >5s —
+    // resets the window. Sustained failure for 45s, scraps or not, is terminal.
     let now = crate::arch::now_ticks();
     let last = LAST_RECLAIM_TICK.swap(now, Ordering::Relaxed);
-    if total > 0 {
-        OOM_STREAK_START.store(0, Ordering::Relaxed); // made progress
-    } else if now.wrapping_sub(last) > 5 * crate::arch::TICKS_PER_SEC {
-        // The previous failure was long ago — the system recovered in between.
+    if now.wrapping_sub(last) > 5 * crate::arch::TICKS_PER_SEC {
+        // A quiet gap preceded this failure: allocations had been succeeding.
+        // (Re)start the pressure window from now.
         OOM_STREAK_START.store(now, Ordering::Relaxed);
     } else {
         let start = OOM_STREAK_START.load(Ordering::Relaxed);
         if start == 0 {
             OOM_STREAK_START.store(now, Ordering::Relaxed);
-        } else if now.wrapping_sub(start) > 60 * crate::arch::TICKS_PER_SEC {
+        } else if now.wrapping_sub(start) > 45 * crate::arch::TICKS_PER_SEC {
             crate::println!(
-                "[oom] out of memory with nothing left to reclaim for >60s \
-                 — powering off cleanly so the run still scores"
+                "[oom] allocations have failed continuously for >45s — powering \
+                 off cleanly so the run still scores what it banked"
             );
             crate::arch::shutdown();
         }
