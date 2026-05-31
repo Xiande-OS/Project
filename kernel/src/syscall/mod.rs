@@ -190,6 +190,19 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_FSTATFS => sys_fstatfs(a0 as i32, a1),
         nr::SYS_PREADV => sys_preadv(a0 as i32, a1, a2, a3 as u64),
         nr::SYS_PWRITEV => sys_pwritev(a0 as i32, a1, a2, a3 as u64),
+        // preadv2/pwritev2 = preadv/pwritev plus an RWF_* flags word. A -1
+        // offset means "use the file's current position" (like readv/writev).
+        // We honor the offset and ignore the advisory flags (the bytes moved
+        // are identical; RWF_NOWAIT etc. are best-effort) — preadv202/pwritev202.
+        nr::SYS_PREADV2 => {
+            if a3 as u64 == u64::MAX { sys_readv(a0 as i32, a1, a2) }
+            else { sys_preadv(a0 as i32, a1, a2, a3 as u64) }
+        }
+        nr::SYS_PWRITEV2 => {
+            if a3 as u64 == u64::MAX { sys_writev(a0 as i32, a1, a2) }
+            else { sys_pwritev(a0 as i32, a1, a2, a3 as u64) }
+        }
+        nr::SYS_MINCORE => sys_mincore(a0, a1, a2),
         nr::SYS_TIMERFD_CREATE => sys_timerfd_create(a0 as i32, a1 as i32),
         nr::SYS_TIMERFD_SETTIME => sys_timerfd_settime(a0 as i32, a1 as i32, a2, a3),
         nr::SYS_TIMERFD_GETTIME => sys_timerfd_gettime(a0 as i32, a1),
@@ -2234,6 +2247,49 @@ fn sys_pwritev(fd: i32, iov: usize, count: usize, off: u64) -> isize {
         }
     }
     total
+}
+
+/// mincore(addr, length, vec): report which pages of [addr, addr+length) are
+/// resident — one byte per page, bit 0 = resident. We eager-map, so any mapped
+/// page is resident; an unmapped page in the range is ENOMEM and a non-page-
+/// aligned addr is EINVAL, which is exactly what mincore01 checks. mincore02
+/// then verifies a freshly-faulted/locked region reads back as resident.
+fn sys_mincore(addr: usize, length: usize, vec: usize) -> isize {
+    let page = crate::mm::address::PAGE_SIZE;
+    if addr % page != 0 {
+        return EINVAL;
+    }
+    let pages = (length + page - 1) / page;
+    if pages == 0 {
+        return 0;
+    }
+    let task = current_task();
+    // Allocate the residency vector FALLIBLY. mincore01 probes a deliberately
+    // enormous length expecting ENOMEM; an infallible `vec![0; pages]` there
+    // tries to allocate petabytes and panics the kernel. A range too large to
+    // even hold the result is, by definition, not all-resident → ENOMEM.
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if out.try_reserve(pages).is_err() {
+        return -12; // ENOMEM
+    }
+    out.resize(pages, 0);
+    {
+        let ms = task.memory_set.lock();
+        for i in 0..pages {
+            let va = match addr.checked_add(i * page) {
+                Some(v) => v,
+                None => return -12, // ENOMEM: range wraps the address space
+            };
+            if ms.translate(crate::mm::VirtAddr(va)).is_none() {
+                return -12; // ENOMEM: an unmapped hole in the range
+            }
+            out[i] = 1; // mapped => resident
+        }
+    }
+    if task.copy_out_bytes(vec, &out).is_none() {
+        return EFAULT;
+    }
+    0
 }
 
 struct TimerFd {
