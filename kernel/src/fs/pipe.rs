@@ -109,7 +109,16 @@ fn wake_pipe_readers(waiters: &[i32]) {
 impl PipeEnd {
     fn new_pair() -> (Arc<Self>, Arc<Self>) {
         let inner = Arc::new(Mutex::new(PipeBuffer {
-            buf: VecDeque::with_capacity(PIPE_CAP),
+            // Start empty and grow on write (up to `capacity`, the 64 KiB
+            // high-water mark enforced in write_at). Pre-reserving the full
+            // PIPE_CAP here cost 64 KiB of heap *per pipe* even for pipes that
+            // never carry data — LTP pipe06 opens ~1000 pipes to probe the fd
+            // limit, which reserved ~64 MiB of empty buffers and exhausted the
+            // kernel heap; the allocator then spun instead of returning, so
+            // pipe2() never returned and the whole run wedged uninterruptibly.
+            // Lazy allocation (like Linux, which only commits pipe pages on
+            // demand) keeps an idle pipe at ~0 bytes.
+            buf: VecDeque::new(),
             closed_read: false,
             closed_write: false,
             read_waiters: alloc::vec::Vec::new(),
