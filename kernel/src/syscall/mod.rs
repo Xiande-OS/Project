@@ -104,7 +104,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_FCHMODAT => sys_fchmodat(a0 as i32, a1, a2 as u32),
         nr::SYS_FCHOWN => sys_fchown(a0 as i32, a1 as u32, a2 as u32),
         nr::SYS_FCHOWNAT => sys_fchownat(a0 as i32, a1, a2 as u32, a3 as u32, a4 as i32),
-        nr::SYS_UMASK => 0o022,
+        nr::SYS_UMASK => sys_umask(a0 as u32),
         nr::SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2 as i32),
         nr::SYS_FLOCK => sys_flock(a0 as i32, a1 as i32),
         nr::SYS_FSYNC => 0,
@@ -831,7 +831,7 @@ fn resolve_at_parent(dfd: i32, path: &str) -> fs::Result<(Arc<dyn Inode>, String
     fs::split_parent(start, path)
 }
 
-fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
+fn sys_openat(dfd: i32, path: usize, flags: i32, mode: i32) -> isize {
     let Some(path_str) = copy_path(path) else {
         return EFAULT;
     };
@@ -958,6 +958,11 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, _mode: i32) -> isize {
             }
             match parent.create(&name, FileType::Regular) {
                 Ok(i) => {
+                    // A newly O_CREAT'd file takes `mode & ~umask`. Previously
+                    // the create mode was ignored entirely (files landed at the
+                    // tmpfs default 0o644), so umask01 — which creats a file
+                    // under every umask value and checks its mode — failed.
+                    apply_mode(&i, mode as u32 & !current_umask() & 0o7777);
                     stamp_creator(&i, &parent);
                     i
                 }
@@ -1075,13 +1080,11 @@ fn sys_mkdirat(dfd: i32, path: usize, mode: u32) -> isize {
     }
     match parent.create(&name, FileType::Directory) {
         Ok(inode) => {
-            // Apply the requested mode (minus the standard 0o022 umask — we
-            // don't track per-process umask; SYS_UMASK is a 0o022 stub and
-            // the tests that care set umask(022) anyway). tmpfs create()
-            // defaults to 0o755, so without this a mkdir(path, 0444) stays
-            // searchable and permission tests that create a no-X directory
-            // (access01, mkdir09) never see the EACCES they expect.
-            let m = mode & !0o022 & 0o7777;
+            // Apply the requested mode masked by the process umask. tmpfs
+            // create() defaults to 0o755, so without this a mkdir(path, 0444)
+            // stays searchable and permission tests that create a no-X
+            // directory (access01, mkdir09) never see the EACCES they expect.
+            let m = mode & !current_umask() & 0o7777;
             apply_mode(&inode, m);
             // After the mode is set, stamp ownership and let a set-gid parent
             // pass its group + set-gid bit down to the new directory.
@@ -1131,7 +1134,7 @@ fn sys_mknodat(dirfd: i32, path: usize, mode: u32, _dev: u64) -> isize {
     match parent.create(&name, FileType::Regular) {
         Ok(i) => {
             stamp_creator(&i, &parent);
-            apply_mode(&i, mode & 0o7777);
+            apply_mode(&i, mode & !current_umask() & 0o7777);
             0
         }
         Err(e) => err_to_isize(e),
@@ -3207,6 +3210,39 @@ fn sys_personality(persona: u32) -> isize {
         g.insert(tgid, persona);
     }
     cur as isize
+}
+
+/// Per-process file-mode creation mask (umask(2)). Default 0o022. Inherited by
+/// fork (inherit_umask), shared by threads (keyed by tgid). Applied to the mode
+/// of every newly created file/dir/node so `mode & ~umask` lands on disk —
+/// previously SYS_UMASK was a 0o022 stub and openat ignored the create mode
+/// entirely, so umask01 failed all ~1021 of its mode/return-value assertions.
+static UMASK: crate::sync::Mutex<alloc::collections::BTreeMap<i32, u32>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
+
+pub fn forget_umask(tgid: i32) {
+    UMASK.lock().remove(&tgid);
+}
+
+pub fn inherit_umask(parent_tgid: i32, child_tgid: i32) {
+    let v = UMASK.lock().get(&parent_tgid).copied();
+    if let Some(v) = v {
+        UMASK.lock().insert(child_tgid, v);
+    }
+}
+
+/// The calling process's current umask (default 0o022).
+fn current_umask() -> u32 {
+    UMASK.lock().get(&cur_tgid()).copied().unwrap_or(0o022)
+}
+
+/// umask(mask): set the file-mode creation mask, return the previous one.
+fn sys_umask(mask: u32) -> isize {
+    let tgid = cur_tgid();
+    let mut g = UMASK.lock();
+    let old = g.get(&tgid).copied().unwrap_or(0o022);
+    g.insert(tgid, mask & 0o777);
+    old as isize
 }
 
 /// sched_rr_get_interval(pid, tp): report the round-robin time quantum. We

@@ -491,6 +491,7 @@ pub fn reap(pid: i32) {
     crate::syscall::forget_sched(pid);
     crate::syscall::forget_timers(pid);
     crate::syscall::forget_personality(pid);
+    crate::syscall::forget_umask(pid);
 }
 
 /// Reap orphan zombies — Zombie tasks whose parent is no longer in the table
@@ -1428,6 +1429,7 @@ pub fn clone_current(
     let parent_tgid = parent.tgid.load(Ordering::Relaxed);
     if tgid != parent_tgid {
         crate::syscall::inherit_creds(parent_tgid, tgid);
+        crate::syscall::inherit_umask(parent_tgid, tgid);
     }
 
     // loongarch64: the child inherits the parent's vector-unit state. We're
