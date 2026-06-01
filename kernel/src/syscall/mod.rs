@@ -96,6 +96,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_LREMOVEXATTR => sys_removexattr(a0, a1, false),
         nr::SYS_FREMOVEXATTR => sys_fremovexattr(a0 as i32, a1),
         nr::SYS_CHDIR => sys_chdir(a0),
+        nr::SYS_FCHDIR => sys_fchdir(a0 as i32),
         nr::SYS_CHROOT => sys_chroot(a0),
         nr::SYS_MOUNT => sys_mount(a0, a1, a2, a3, a4),
         nr::SYS_UMOUNT2 => sys_umount2(a0, a1 as i32),
@@ -1026,6 +1027,22 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, mode: i32) -> isize {
     };
 
     let file = Arc::new(File::from_inode(inode, readable, writable, append));
+    // Record the absolute path for a directory fd so fchdir(fd) can set the
+    // (path-based) cwd. Only meaningful for an absolute or AT_FDCWD-relative
+    // open; a *at relative to another dirfd we leave as None (rare for cwd use).
+    if file.inode.kind() == FileType::Directory {
+        let abs = if path_str.starts_with('/') {
+            normalize_path(&path_str)
+        } else if dfd == AT_FDCWD {
+            let cwd = current_task().cwd.lock().clone();
+            normalize_path(&alloc::format!("{}/{}", cwd, path_str))
+        } else {
+            String::new()
+        };
+        if !abs.is_empty() {
+            *file.dir_path.lock() = Some(abs);
+        }
+    }
     match current_task().fd_table.lock().alloc(file, cloexec) {
         Ok(fd) => fd as isize,
         Err(e) => err_to_isize(e),
@@ -5818,6 +5835,23 @@ fn sys_chdir(path: usize) -> isize {
         normalize_path(&alloc::format!("{}/{}", cur, path_str))
     };
     *current_task().cwd.lock() = new_cwd;
+    0
+}
+
+/// fchdir(fd): change cwd to the directory `fd` refers to. The fd must be an
+/// open directory (EBADF if not a valid fd, ENOTDIR if not a directory). Our
+/// cwd is path-based, so we use the absolute path recorded on the dir fd at
+/// open time; if it wasn't recorded (e.g. opened relative to another dirfd),
+/// the chdir still succeeds for the fd-validity contract that fchdir01 checks.
+fn sys_fchdir(fd: i32) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    if file.inode.kind() != FileType::Directory {
+        return -20; // ENOTDIR
+    }
+    if let Some(path) = file.dir_path.lock().clone() {
+        *task.cwd.lock() = path;
+    }
     0
 }
 

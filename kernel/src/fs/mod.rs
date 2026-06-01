@@ -295,6 +295,10 @@ pub struct File {
     pub async_io: core::sync::atomic::AtomicBool,
     /// fcntl(F_SETLEASE): current lease (F_RDLCK=0, F_WRLCK=1, F_UNLCK=2).
     pub lease: core::sync::atomic::AtomicI32,
+    /// Absolute path this fd was opened at, recorded only for directory fds so
+    /// fchdir(fd) can set the cwd string (our cwd is path-based). None for
+    /// non-directory fds and internally-created files.
+    pub dir_path: Mutex<Option<alloc::string::String>>,
 }
 
 impl File {
@@ -310,6 +314,7 @@ impl File {
             owner: core::sync::atomic::AtomicI32::new(0),
             async_io: core::sync::atomic::AtomicBool::new(false),
             lease: core::sync::atomic::AtomicI32::new(2),
+            dir_path: Mutex::new(None),
         }
     }
 
@@ -325,6 +330,7 @@ impl File {
             owner: core::sync::atomic::AtomicI32::new(0),
             async_io: core::sync::atomic::AtomicBool::new(false),
             lease: core::sync::atomic::AtomicI32::new(2),
+            dir_path: Mutex::new(None),
         }
     }
 
