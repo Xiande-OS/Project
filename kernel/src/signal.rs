@@ -193,10 +193,13 @@ pub struct SignalState {
 pub struct SigSource {
     pub code: i32,
     pub pid: i32,
+    /// si_value payload (sigqueue/rt_sigqueueinfo). Delivered at siginfo
+    /// offset 24 so an SA_SIGINFO handler reads back sival_int/sival_ptr.
+    pub value: u64,
 }
 impl Default for SigSource {
     fn default() -> Self {
-        Self { code: SI_USER, pid: 0 }
+        Self { code: SI_USER, pid: 0, value: 0 }
     }
 }
 
@@ -333,7 +336,7 @@ pub fn raise_signal(target: &Arc<Task>, signo: u32) -> bool {
     {
         let code = if signo >= SIGRTMIN { SI_TKILL } else { SI_USER };
         let pid = target.tgid.load(Ordering::Relaxed);
-        target.signals.siginfo.lock()[signo as usize] = SigSource { code, pid };
+        target.signals.siginfo.lock()[signo as usize] = SigSource { code, pid, value: 0 };
     }
 
     // Wake from blocking syscalls.
@@ -386,6 +389,17 @@ pub fn raise_signal(target: &Arc<Task>, signo: u32) -> bool {
         post_sigkill_to_descendants(target.pid);
     }
     true
+}
+
+/// Override the siginfo a pending signal will deliver. Used by
+/// rt_sigqueueinfo/sigqueue to carry the caller-supplied si_code and si_value
+/// (sival_int) through to the SA_SIGINFO handler. Call right after
+/// raise_signal so the recorded source isn't clobbered.
+pub fn set_siginfo(target: &Arc<Task>, signo: u32, code: i32, pid: i32, value: u64) {
+    if signo == 0 || signo > NSIG {
+        return;
+    }
+    target.signals.siginfo.lock()[signo as usize] = SigSource { code, pid, value };
 }
 
 /// Linux `force_sig` semantics for a **synchronous, CPU-generated** fault
@@ -889,6 +903,9 @@ fn deliver_user_handler(
     let pad = &mut frame.info._pad;
     pad[16 - 12..16 - 12 + 4].copy_from_slice(&src.pid.to_le_bytes());
     pad[20 - 12..20 - 12 + 4].copy_from_slice(&0i32.to_le_bytes()); // uid
+    // si_value (sigval union) at offset 24 for SI_QUEUE/sigqueue — the
+    // SA_SIGINFO handler reads sival_int (low 4 bytes) / sival_ptr (8 bytes).
+    pad[24 - 12..24 - 12 + 8].copy_from_slice(&src.value.to_le_bytes());
 
     // ucontext
     frame.uc.uc_flags = 0;

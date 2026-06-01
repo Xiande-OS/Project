@@ -132,6 +132,10 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGPENDING => sys_rt_sigpending(a0, a1),
         nr::SYS_REBOOT => sys_reboot(a0 as u32, a1 as u32, a2 as u32),
+        nr::SYS_RT_SIGQUEUEINFO => sys_rt_sigqueueinfo(a0 as i32, a1 as i32, a2),
+        // tgsigqueueinfo(tgid, tid, sig, uinfo): we deliver to the tid; the
+        // tgid is advisory for our single-namespace model.
+        nr::SYS_RT_TGSIGQUEUEINFO => sys_rt_sigqueueinfo(a1 as i32, a2 as i32, a3),
         nr::SYS_RT_SIGRETURN => {
             // Restore tf (incl. syscall ret slot) from the rt_sigframe.
             // The returned value matches what set_syscall_ret would write,
@@ -7490,6 +7494,34 @@ fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> isize {
         return 0;
     }
     if raise_signal(&t, signo) { 0 } else { EINVAL }
+}
+
+/// rt_sigqueueinfo(tgid, sig, uinfo): queue `sig` to task `tgid` carrying the
+/// caller-supplied siginfo (si_code + si_value). rt_sigqueueinfo01 installs an
+/// SA_SIGINFO handler and checks it receives the signal with
+/// info->si_value.sival_int == the value it queued. We read si_code (offset 8)
+/// and si_value (offset 24) from the user siginfo, raise the signal, then
+/// stamp the recorded source so delivery reproduces them.
+fn sys_rt_sigqueueinfo(tgid: i32, sig: i32, uinfo: usize) -> isize {
+    use crate::signal::*;
+    let signo = sig as u32;
+    if sig != 0 && !is_valid_signo(signo) {
+        return EINVAL;
+    }
+    let task = current_task();
+    let Some(bytes) = task.copy_in_bytes(uinfo, 32) else { return EFAULT };
+    let si_code = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let si_value = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    // Target the thread/process `tgid` (rt_sigqueueinfo01 passes a tid).
+    let Some(t) = crate::task::task_by_pid(tgid) else { return ESRCH };
+    if sig == 0 {
+        return 0;
+    }
+    if !raise_signal(&t, signo) {
+        return EINVAL;
+    }
+    set_siginfo(&t, signo, si_code, task.pid, si_value);
+    0
 }
 
 fn tasks_in_pgrp(pgid: i32) -> alloc::vec::Vec<Arc<crate::task::Task>> {
