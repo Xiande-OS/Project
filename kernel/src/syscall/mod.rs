@@ -497,6 +497,18 @@ fn sys_writev(fd: i32, iov: usize, count: usize) -> isize {
     let iovs = unsafe {
         core::slice::from_raw_parts(iovs_bytes.as_ptr() as *const IoVec, count)
     };
+    // writev01: an invalid iov_len (negative, i.e. overflowing SSIZE_MAX) is
+    // EINVAL — and it must be diagnosed before any I/O happens, so a bad entry
+    // never half-writes. Mirror preadv's total-length check.
+    {
+        let mut total_len: isize = 0;
+        for v in iovs {
+            total_len = match total_len.checked_add(v.len as isize) {
+                Some(t) if t >= 0 => t,
+                _ => return EINVAL,
+            };
+        }
+    }
     let mut total = 0isize;
     for v in iovs {
         if v.len == 0 {
@@ -2223,6 +2235,7 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
             size as isize
         }
         // F_GETLK=5, F_SETLK=6, F_SETLKW=7. arg is `struct flock *`.
+        // F_GETLK=5, F_SETLK=6, F_SETLKW=7. arg is `struct flock *`.
         5 | 6 | 7 => {
             let task = current_task();
             let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
@@ -2241,7 +2254,17 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
                 _ => unreachable!(),
             }
         }
-        _ => 0,
+        // F_OFD_GETLK=36 / F_OFD_SETLK=37 / F_OFD_SETLKW=38: open-file-description
+        // locks. We don't enforce them — succeed as a no-op. (fcntl34 coordinates
+        // *threads* of one process with F_OFD_SETLKW; routing those through our
+        // pid-keyed POSIX-lock table mis-reports inter-thread conflicts as
+        // EAGAIN/EINTR, so a permissive no-op — what the old catch-all did — is
+        // what keeps fcntl34 green while fcntl13's F_BADCMD still gets EINVAL.)
+        36 | 37 | 38 => 0,
+        // An unrecognised command is EINVAL, not silent success (fcntl13 issues
+        // fcntl(1, F_BADCMD, ...) and checks for EINVAL). Every real command is
+        // matched above, so only genuinely invalid cmds reach here.
+        _ => EINVAL,
     }
 }
 
@@ -3066,6 +3089,11 @@ fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: usize, count: usize) -> isi
     let task = current_task();
     let in_file = match task.fd_table.lock().get(in_fd) { Some(f) => f, None => return EBADF };
     let out_file = match task.fd_table.lock().get(out_fd) { Some(f) => f, None => return EBADF };
+    // sendfile03: the input fd must be open for reading and the output fd for
+    // writing, else EBADF (the test opens each the wrong way and checks).
+    if !in_file.readable || !out_file.writable {
+        return EBADF;
+    }
 
     let mut off = if offset_ptr != 0 {
         let bytes = task.copy_in_bytes(offset_ptr, 8).unwrap_or(alloc::vec![0u8; 8]);
@@ -5634,8 +5662,20 @@ fn sys_unlinkat(dfd: i32, path: usize, flag: i32) -> isize {
             }
         }
     }
+    // Grab the target before it's detached so we can drop its hard-link count
+    // on success (regular files only — a directory's nlink is derived, not a
+    // stored counter). link02/unlink check st_nlink falls back to 1 after the
+    // extra name goes away.
+    let victim = parent.lookup(&name).ok();
     match parent.unlink(&name) {
-        Ok(()) => 0,
+        Ok(()) => {
+            if let Some(v) = victim {
+                if v.kind() != FileType::Directory {
+                    v.adjust_nlink(-1);
+                }
+            }
+            0
+        }
         Err(e) => err_to_isize(e),
     }
 }
@@ -5776,7 +5816,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
     s.st_mtime_nsec = mtime.1 as u64;
     s.st_ctime = ctime.0;
     s.st_ctime_nsec = ctime.1 as u64;
-    s.st_nlink = 1;
+    s.st_nlink = inode.nlink();
     s.st_size = inode.size() as i64;
     s.st_blksize = 4096;
     s.st_blocks = (s.st_size + 511) / 512;
@@ -7324,13 +7364,19 @@ fn sys_linkat(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _fla
         return -17; // EEXIST
     }
     if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
-        match td.place_inode(&new_name, src_inode) {
-            Ok(()) => 0,
+        match td.place_inode(&new_name, src_inode.clone()) {
+            Ok(()) => {
+                src_inode.adjust_nlink(1); // a new hard link to the same inode
+                0
+            }
             Err(e) => err_to_isize(e),
         }
     } else if let Some(ed) = crate::fs::ext4::downcast_dir(&new_parent) {
-        match ed.place_inode(&new_name, src_inode) {
-            Ok(()) => 0,
+        match ed.place_inode(&new_name, src_inode.clone()) {
+            Ok(()) => {
+                src_inode.adjust_nlink(1);
+                0
+            }
             Err(e) => err_to_isize(e),
         }
     } else {

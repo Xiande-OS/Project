@@ -265,6 +265,17 @@ pub trait Inode: Send + Sync + core::any::Any {
     fn set_owner(&self, _uid: u32, _gid: u32) -> bool {
         false
     }
+    /// Hard-link count for st_nlink. Default 1 (a single name). A directory
+    /// reports 2 + its subdirectory count (`.`, its entry in the parent, and
+    /// each child's `..`); a regular file bumps this per extra hard link.
+    fn nlink(&self) -> u32 {
+        1
+    }
+    /// Adjust the hard-link count by `delta` (link()/unlink()). Default no-op;
+    /// only the in-memory fs tracks it. Returns the new count.
+    fn adjust_nlink(&self, _delta: i32) -> u32 {
+        1
+    }
 }
 
 /// In-memory symlink: stores the target path plus its own xattr table (the

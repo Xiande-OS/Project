@@ -77,6 +77,9 @@ pub struct TmpfsFile {
     /// F_SEAL_* bits set via fcntl(F_ADD_SEALS) — used by memfd_create. Stored
     /// so F_GET_SEALS reads them back (memfd_create01 adds seals then checks).
     seals: core::sync::atomic::AtomicU32,
+    /// Hard-link count (st_nlink). Starts at 1; link() bumps it, unlink() drops
+    /// it. fstat02/link02 create a second name and check st_nlink == 2.
+    links: core::sync::atomic::AtomicU32,
 }
 
 impl TmpfsFile {
@@ -143,6 +146,7 @@ impl TmpfsFile {
             meta: Mutex::new(Meta::default()),
             xattrs: Mutex::new(BTreeMap::new()),
             seals: core::sync::atomic::AtomicU32::new(0),
+            links: core::sync::atomic::AtomicU32::new(1),
         }
     }
 }
@@ -164,6 +168,20 @@ impl Inode for TmpfsFile {
         if uid != u32::MAX { m.uid = uid; }
         if gid != u32::MAX { m.gid = gid; }
         true
+    }
+    fn nlink(&self) -> u32 {
+        self.links.load(Ordering::Relaxed).max(1)
+    }
+    fn adjust_nlink(&self, delta: i32) -> u32 {
+        if delta >= 0 {
+            self.links.fetch_add(delta as u32, Ordering::Relaxed) + delta as u32
+        } else {
+            let dec = (-delta) as u32;
+            let cur = self.links.load(Ordering::Relaxed);
+            let new = cur.saturating_sub(dec);
+            self.links.store(new, Ordering::Relaxed);
+            new
+        }
     }
     fn kind(&self) -> FileType {
         FileType::Regular
@@ -346,6 +364,17 @@ impl Inode for TmpfsDir {
         if uid != u32::MAX { m.uid = uid; }
         if gid != u32::MAX { m.gid = gid; }
         true
+    }
+    fn nlink(&self) -> u32 {
+        // A directory's link count is 2 (`.` and its name in the parent) plus
+        // one for every subdirectory (each child dir's `..` points back here).
+        let subdirs = self
+            .entries
+            .lock()
+            .values()
+            .filter(|i| i.kind() == FileType::Directory)
+            .count();
+        2 + subdirs as u32
     }
     fn kind(&self) -> FileType {
         FileType::Directory
