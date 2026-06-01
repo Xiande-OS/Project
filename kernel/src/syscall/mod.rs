@@ -6318,6 +6318,15 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
         // collects them — otherwise a SIGKILLed test's orphaned grandchildren
         // pin frames forever and eventually wedge the run (fork07 ENOMEM).
         crate::task::reparent_children_to_init(task.pid);
+        // If this leader is itself a session leader (the per-case `setsid
+        // timeout ./foo` wrapper), tear down the rest of its session — the
+        // case's leftover forked children. Otherwise a fork/memory-bomb case
+        // leaks them (reparented to init, still allocating) until the run OOMs.
+        // The init session (sid 1: init + driver shells) is left alone.
+        let my_sid = task.sid.load(core::sync::atomic::Ordering::Relaxed);
+        if my_sid == task.pid {
+            crate::task::kill_session(my_sid, task.pid);
+        }
         let ppid = task.ppid.load(core::sync::atomic::Ordering::Relaxed);
         if let Some(parent) = crate::task::task_by_pid(ppid) {
             {

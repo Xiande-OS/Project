@@ -544,6 +544,36 @@ pub fn reparent_children_to_init(dead_pid: i32) {
     }
 }
 
+/// A session leader has exited — post SIGKILL to every other member of its
+/// session. The contest runs each LTP case as `setsid timeout -s KILL N ./foo`,
+/// so the timeout wrapper is a per-case session leader. When it exits (after
+/// killing the case's main process), its session still contains the case's
+/// leftover forked children: a fork/memory bomb (oom0*, page01, the cve
+/// fork-bombs) reparents them to init and they keep allocating, never wait4'd,
+/// until the run OOMs and powers off. Tearing the session down here reclaims
+/// them on a clean exit event — no allocation-time thrash, no forced reap (they
+/// die through the normal trap path), and the children's sid stays set to this
+/// session even after they're reparented to init, so we still catch them.
+///
+/// The init session (sid <= 1: init + the driver shells, which are never
+/// setsid'd per-case) is never touched.
+pub fn kill_session(sid: i32, except_pid: i32) {
+    if sid <= 1 {
+        return;
+    }
+    let members: Vec<Arc<Task>> = {
+        let t = TABLE.lock();
+        t.tasks
+            .values()
+            .filter(|task| task.sid.load(Ordering::Relaxed) == sid && task.pid != except_pid)
+            .cloned()
+            .collect()
+    };
+    for m in members {
+        crate::signal::raise_signal(&m, crate::signal::SIGKILL);
+    }
+}
+
 pub fn reap_orphan_zombies(except: i32) {
     // Snapshot (pid, ppid) and the live-pid set under the table lock, then
     // release it before touching per-task state locks (TABLE-then-state would
