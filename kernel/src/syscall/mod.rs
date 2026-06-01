@@ -106,7 +106,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_FCHOWN => sys_fchown(a0 as i32, a1 as u32, a2 as u32),
         nr::SYS_FCHOWNAT => sys_fchownat(a0 as i32, a1, a2 as u32, a3 as u32, a4 as i32),
         nr::SYS_UMASK => sys_umask(a0 as u32),
-        nr::SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2 as i32),
+        nr::SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2 as i32, a2),
         nr::SYS_FLOCK => sys_flock(a0 as i32, a1 as i32),
         nr::SYS_FSYNC => 0,
         nr::SYS_UTIMENSAT => sys_utimensat(a0 as i32, a1, a2, a3 as i32),
@@ -1960,7 +1960,15 @@ fn sys_flock(fd: i32, op: i32) -> isize {
     }
 }
 
-fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
+// `arg` is the fcntl argument truncated to 32 bits — correct for the
+// integer commands (F_DUPFD min-fd, F_SETFL flags, F_SETOWN pid, F_SETSIG,
+// F_SETLEASE, pipe size, ...). `arg_ptr` is the SAME register kept at full
+// 64-bit width, used only by the commands whose argument is a userspace
+// POINTER (F_GETOWN_EX/F_SETOWN_EX's struct f_owner_ex, F_GETLK/F_SETLK's
+// struct flock). Truncating those to i32 mangled the address — harmless on
+// riscv where user stacks sit in the low 2 GiB, but EFAULT on loongarch
+// whose user pointers have high bits set (fcntl15/22/31 failed LA-only).
+fn sys_fcntl(fd: i32, cmd: i32, arg: i32, arg_ptr: usize) -> isize {
     const F_DUPFD: i32 = 0;
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
@@ -2134,14 +2142,14 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
             let mut buf = [0u8; 8];
             buf[0..4].copy_from_slice(&otype.to_le_bytes());
             buf[4..8].copy_from_slice(&opid.to_le_bytes());
-            if task.copy_out_bytes(arg as usize, &buf).is_none() {
+            if task.copy_out_bytes(arg_ptr, &buf).is_none() {
                 return EFAULT;
             }
             0
         }
         F_SETOWN_EX => {
             let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
-            let Some(b) = task.copy_in_bytes(arg as usize, 8) else { return EFAULT };
+            let Some(b) = task.copy_in_bytes(arg_ptr, 8) else { return EFAULT };
             let otype = i32::from_le_bytes(b[0..4].try_into().unwrap_or([0; 4]));
             let opid = i32::from_le_bytes(b[4..8].try_into().unwrap_or([0; 4]));
             // F_OWNER_PGRP(2) -> negated pgid; F_OWNER_TID(0)/F_OWNER_PID(1) -> pid.
@@ -2239,14 +2247,14 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
         5 | 6 | 7 => {
             let task = current_task();
             let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
-            let Some(buf) = task.copy_in_bytes(arg as usize, core::mem::size_of::<Flock>()) else { return EFAULT };
+            let Some(buf) = task.copy_in_bytes(arg_ptr, core::mem::size_of::<Flock>()) else { return EFAULT };
             let mut flock = Flock::default();
             unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), &mut flock as *mut _ as *mut u8, core::mem::size_of::<Flock>()); }
             match cmd {
                 5 => {
                     let out = fcntl_getlk(&file, &flock);
                     let bytes = unsafe { core::slice::from_raw_parts(&out as *const _ as *const u8, core::mem::size_of::<Flock>()) };
-                    let _ = task.copy_out_bytes(arg as usize, bytes);
+                    let _ = task.copy_out_bytes(arg_ptr, bytes);
                     0
                 }
                 6 => fcntl_setlk(&file, &flock, false),
