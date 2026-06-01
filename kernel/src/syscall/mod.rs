@@ -727,10 +727,24 @@ fn sys_readv(fd: i32, iov: usize, count: usize) -> isize {
 }
 
 fn sys_pread(fd: i32, buf: usize, len: usize, off: u64) -> isize {
+    // pread02 argument checks: a negative offset (arrives as a u64 with the top
+    // bit set) → EINVAL; an fd not open for reading → EBADF; a directory →
+    // EISDIR; a pipe/FIFO (no seekable offset) → ESPIPE.
+    if (off as i64) < 0 {
+        return EINVAL;
+    }
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
+    if !file.readable {
+        return EBADF;
+    }
+    match file.inode.kind() {
+        FileType::Directory => return -21, // EISDIR
+        FileType::Pipe => return -29,      // ESPIPE
+        _ => {}
+    }
     let mut tmp = io_bounce_buf(len);
     match file.inode.read_at(off, &mut tmp) {
         Ok(n) => {
@@ -744,10 +758,21 @@ fn sys_pread(fd: i32, buf: usize, len: usize, off: u64) -> isize {
 }
 
 fn sys_pwrite(fd: i32, buf: usize, len: usize, off: u64) -> isize {
+    // pwrite02 mirrors pread02: negative offset → EINVAL; fd not open for
+    // writing → EBADF; a pipe/FIFO (unseekable) → ESPIPE.
+    if (off as i64) < 0 {
+        return EINVAL;
+    }
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
+    if !file.writable {
+        return EBADF;
+    }
+    if file.inode.kind() == FileType::Pipe {
+        return -29; // ESPIPE
+    }
     let Some(bytes) = task.copy_in_bytes(buf, len) else {
         return EFAULT;
     };
@@ -3605,6 +3630,11 @@ fn sys_capset(hdr: usize, data: usize) -> isize {
 }
 
 fn sys_prlimit64(pid: i32, resource: u32, new_lim: usize, old_lim: usize) -> isize {
+    // RLIM_NLIMITS == 16: anything at/above it (incl. a negative resource that
+    // arrived as a huge u32) is invalid. getrlimit02/setrlimit tests this.
+    if resource >= 16 {
+        return EINVAL;
+    }
     let task = current_task();
     let target_pid = if pid == 0 { task.pid } else { pid };
     let cur = rlimit_for(target_pid, resource);
@@ -6487,6 +6517,28 @@ fn try_zeroed_buf(len: usize) -> Option<alloc::vec::Vec<u8>> {
     Some(v)
 }
 
+/// Heuristic: does this file look like a text script (vs. raw binary data)?
+/// A real shebang-less shell script is printable text; LTP's binary data
+/// files (sched_datafile, ...) are not. We scan the head: any NUL byte, or
+/// more than ~30% non-text bytes, means "binary" → execve returns ENOEXEC.
+fn looks_like_text(data: &[u8]) -> bool {
+    let scan = &data[..data.len().min(512)];
+    if scan.is_empty() {
+        return false;
+    }
+    let mut bad = 0usize;
+    for &b in scan {
+        if b == 0 {
+            return false; // NUL never appears in text
+        }
+        let textish = matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7e) || b >= 0x80;
+        if !textish {
+            bad += 1;
+        }
+    }
+    bad * 100 < scan.len() * 30
+}
+
 fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
     let Some(path) = copy_path(path_addr) else {
         return EFAULT;
@@ -6537,7 +6589,17 @@ fn exec_resolved(
     // interpreter line; otherwise fall back to /bin/busybox sh.
     let is_elf = elf_image.len() >= 4 && &elf_image[..4] == b"\x7fELF";
     if !is_elf {
-        let (interp, interp_arg) = if elf_image.len() >= 2 && &elf_image[..2] == b"#!" {
+        let has_shebang = elf_image.len() >= 2 && &elf_image[..2] == b"#!";
+        // A non-ELF file with no `#!` is only a script if it's actually text.
+        // The LTP suite ships binary *data* files in testcases/bin (e.g.
+        // sched_datafile); feeding raw binary to `busybox sh` used to run
+        // arbitrary garbage as shell commands and could take the whole run
+        // down. Linux returns ENOEXEC for an unrecognised binary format —
+        // do the same so the caller (`timeout ./foo`) just fails fast.
+        if !has_shebang && !looks_like_text(&elf_image) {
+            return -8; // ENOEXEC: not ELF, not a shebang script, binary data
+        }
+        let (interp, interp_arg) = if has_shebang {
             let nl = elf_image.iter().position(|&b| b == b'\n').unwrap_or(elf_image.len());
             let line = core::str::from_utf8(&elf_image[2..nl]).unwrap_or("").trim();
             let mut parts = line.splitn(2, char::is_whitespace);
