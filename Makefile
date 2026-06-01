@@ -68,9 +68,29 @@ endif
 endif
 # -------------------------------------------------------------------------
 
-.PHONY: all prepare kernel-rv kernel-la clean
+.PHONY: all prepare kernel-rv kernel-la disks clean
 
-all: kernel-rv kernel-la
+# Writable scratch disks attached as the SECOND virtio-blk device (x1,
+# virtio-mmio-bus.1). The grader runs these as `-drive file=disk.img` /
+# `-drive file=disk-la.img` iff we generate them. They are zeroed here
+# (sparse, instant, no mke2fs build dependency) and the kernel formats
+# them to ext2 at boot — that in-kernel mkfs also backs `.format_device`
+# LTP cases. The read-only test image stays on x0; this never touches it.
+DISK_RV   := disk.img
+DISK_LA   := disk-la.img
+DISK_SIZE := 256M
+
+all: kernel-rv kernel-la disks
+
+disks: $(DISK_RV) $(DISK_LA)
+
+$(DISK_RV):
+	@truncate -s $(DISK_SIZE) $(DISK_RV) 2>/dev/null \
+	  || dd if=/dev/zero of=$(DISK_RV) bs=1M count=256 status=none 2>/dev/null || true
+
+$(DISK_LA):
+	@truncate -s $(DISK_SIZE) $(DISK_LA) 2>/dev/null \
+	  || dd if=/dev/zero of=$(DISK_LA) bs=1M count=256 status=none 2>/dev/null || true
 
 # Recreate the hidden cargo configuration the contest harness stripped,
 # and best-effort ensure the riscv64 + loongarch64 target stds are present.
@@ -107,4 +127,4 @@ kernel-la: prepare
 	fi
 
 clean:
-	rm -rf target kernel-rv kernel-la .cargo kernel/.cargo
+	rm -rf target kernel-rv kernel-la .cargo kernel/.cargo $(DISK_RV) $(DISK_LA)
