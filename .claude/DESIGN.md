@@ -1,11 +1,23 @@
 # 设计语言（DESIGN）
 
 > 这个文件记录关键架构决策与设计语言（包括"为什么"）。任何重大改动后更新此文件并在 PROGRESS.md 记录日期。
-> 最近更新：2026-05-28（第三轮校准：保留全栈设计，但当前实施只到 M0）
+> 最近更新：2026-06-01（现状校准：M0–M8 全部落地；记录几处被推翻的原始决策）
+
+## 现状（2026-06-01）：设计已全部落地，有几处原始决策被推翻
+本文件记录的是**立项时的架构意图**，大部分仍准确（Sv39、virtio-mmio、内存布局、锁层次、双架构…），但下面这些早期决策在实现中被推翻；正文相应处已就地更正，决策日志有对应条目：
+
+| 原始决策 | 实际落地 |
+|---|---|
+| 内核内部全 `async/await` + WaitQueue | **协作式调度 + trap 边界抢占 + per-syscall 看门狗**（内核里 0 个 `async fn`） |
+| 仅 musl，不支持 glibc | **musl + glibc 双支持**（绑 glibc ld-linux、libc.so.6、按变体设 LD_LIBRARY_PATH） |
+| sigreturn 用栈 trampoline，不做 vDSO | **改用 vDSO**（`vdso.rs` 的 `__vdso_rt_sigreturn` 带 CFI 供 glibc unwind） |
+| 持久 FS 起步 FAT32，ext4 后期可选 | **ext4 只读是评测主路径**，fat32 仅本地 dev 盘 |
+
+文末「实施分期」表是 M0 时期的，**已作废**（全部已实现），仅留作历史。
 
 ## 整体形态
 - **形态**：宏内核（monolithic），单地址空间内核（所有内核代码共享高半区映射）
-- **执行模型**：内核内部用 **Rust async/await**，所有可阻塞 syscall（read/write/poll/futex/socket）实现为 `async fn`。每个 hart 跑一个简单的轮询执行器，所有阻塞点统一为 `WaitQueue`（push waker / 条件唤醒）。**不引入 embassy**，自己写极小 runtime
+- **执行模型**（⚠️ 与原计划不同，未采用 async）：单 hart **协作式调度 + trap 边界抢占**。syscall 同步执行；阻塞型 syscall 在内核里轮询/挂队列并在每次 trap 出口重新调度；`dispatch` 期间开 SIE，让嵌套 timer tick 驱动 **per-syscall 看门狗**（单条 syscall 在内核里 >8s 视为 wedge，按内核 fault 恢复路径丢弃该 case 让评测继续）。原计划的"全 `async fn` + `WaitQueue` + 自写 runtime"**未实现**（内核里 0 个 async fn）
 - **语言契约**：内核 crate `#![no_std]`、`#![no_main]`；avoid panic in critical paths；用 newtype 包装物理/虚拟地址；锁的持有时间最小化
 
 ## 硬件 / 启动
@@ -76,13 +88,13 @@
 ## Linux ABI（riscv64）
 - **syscall 编号**：直接采用 Linux `include/uapi/asm-generic/unistd.h` 的 generic riscv64 表
 - **errno**：直接采用 Linux asm-generic errno（EPERM=1 .. ENOSYS=38 ...）
-- **libc 目标**：**仅 musl**（不支持 glibc）；理由：musl 单文件 ld、依赖 syscall 少（不依赖 `clone3/membarrier/rseq/io_uring`）、容易准备 sysroot
+- **libc 目标**（⚠️ 已扩展为 musl + glibc）：musl 先打通（单文件 ld、依赖 syscall 少、不依赖 `clone3/membarrier/rseq/io_uring`）；glibc 后续补齐——它把内核当真 Linux 用，挑剔 ABI 精确度（uc_mcontext 偏移、st_rdev、vDSO+CFI、futex 绝对超时…），逐一啃通。`contest_runner` 绑 glibc 的 `ld-linux-riscv64-lp64d.so.1` / `libc.so.6` / `libm.so.6` 并按变体设 `LD_LIBRARY_PATH`
 - **ELF 加载**：
   - 静态：映射所有 PT_LOAD，跳到 `e_entry`
   - 动态：解析 PT_INTERP → 加载 ld.so 到高地址 → 入口 = ld.so 的 `e_entry`，主程序信息通过 auxv 传给 ld.so
 - **初始栈布局**（musl 强依赖）：从高到低 = [字符串区] [auxv] [envp + NULL] [argv + NULL] [argc]，sp 16 字节对齐
 - **必填 auxv**：AT_PHDR/PHENT/PHNUM/PAGESZ/BASE/ENTRY/RANDOM/UID/EUID/GID/EGID/HWCAP/PLATFORM/SECURE/EXECFN——**AT_RANDOM 必须可读 16 字节**，缺它 musl 早期 crash
-- **信号 sigreturn trampoline**：栈方案（在 sigframe 后写 `li a7,139; ecall`，要求栈页可执行），不做 vDSO。后期再切 vDSO
+- **信号 sigreturn**（⚠️ 已切到 vDSO）：内核映射一个极小 vDSO（`vdso.rs` + `vdso/rt_sigreturn.S`），`__vdso_rt_sigreturn` 的 `.eh_frame` 带 `.cfi_signal_frame` CFI——glibc/libgcc 的 unwinder 需要它才能正确回溯信号帧。早期"在栈上写 `li a7,139; ecall`"的 trampoline 方案已弃用
 
 ## 网络
 - **栈**：`smoltcp` 0.11+，作为单例 `NetStack { iface, sockets }`，spin Mutex 保护
@@ -149,7 +161,9 @@ xiande-os/
     └── HANDOFF.md
 ```
 
-## 实施分期（架构 vs. 代码落地）
+## 实施分期（架构 vs. 代码落地）— ⚠️ 已作废（2026-06-01）
+> 下表是 M0 时期"先实现哪些"的规划。**现在所有模块均已实现**，保留作历史，勿据此判断现状（看 PROGRESS.md）。
+
 | 设计模块 | 当前阶段 (M0) 是否要写代码 | 备注 |
 |---|---|---|
 | boot.S 单 hart 入口 | ✅ 必须 | M0 验收的核心 |
@@ -163,9 +177,15 @@ xiande-os/
 | 块设备 / FAT32 | ⛔ M7 | 留 trait |
 | 网络栈 / socket | ⛔ M8 | 留 trait 与 `net/` 目录 |
 
-**原则：M0 只写 M0 需要的代码。设计文档里其他部分是给未来 milestone 的 contract，不要现在就实现。**
+**（历史原则）M0 只写 M0 需要的代码，其余是未来 milestone 的 contract——此约束已随 M0–M8 完成而作废。**
 
 ## 决策日志（增量追加，每条配日期）
 - 2026-05-28（立项）：确定 Sv39 起步、SMP 架构层支持但单核 bring-up、musl-only、initramfs 走 cpio、virtio-mmio 用 `virtio-drivers` crate、smoltcp 作为唯一网络栈、sigreturn 用栈 trampoline 而非 vDSO
 - 2026-05-28（pivot 提议）：曾短暂收窄到"单核 + 静态 git"，并把 SMP / 网络 / 动态链接 / async 移到"已撤销"段
-- 2026-05-28（第三轮校准，本次）：**撤回 pivot**。架构设计恢复到立项原状（保留 SMP/网络/动态链接/async 全栈设计），但实施节奏改为"**只做 M0**，跑通后停下来汇报"。原因：用户希望先把基本 demo 跑起来，但不希望在设计层就把后续能力封死——"留接口，demo 先不要"
+- 2026-05-28（第三轮校准）：**撤回 pivot**。架构设计恢复到立项原状（保留 SMP/网络/动态链接/async 全栈设计），但实施节奏改为"**只做 M0**，跑通后停下来汇报"。原因：用户希望先把基本 demo 跑起来，但不希望在设计层就把后续能力封死——"留接口，demo 先不要"
+- 2026-06-01（现状校准）：M0–M8 全部落地后，记录几处**被推翻的原始决策**（正文已就地更正）：
+  - **async → 协作式 + 抢占 + 看门狗**：全 async/WaitQueue 未采用；改为同步 syscall + trap 边界抢占调度，dispatch 期间开 SIE 让 per-syscall 看门狗（>8s）兜住内核内 wedge。原因：协作式更易推理 lost-wakeup（见 commit `2db1b76` "defer mid-syscall preemption"），async 收益不抵复杂度。
+  - **musl-only → musl + glibc**：评测盘有 glibc 变体，glibc 的 ABI 精确度要求（uc_mcontext、st_rdev、vDSO+CFI、futex 绝对超时）逐一补齐。
+  - **栈 trampoline → vDSO**：glibc/libgcc unwinder 需要 `.cfi_signal_frame`，故映射带 CFI 的 vDSO（`vdso.rs`）。
+  - **FAT32 起步 → ext4 只读为评测主路径**（fat32 仅本地 dev 盘）。
+  - 工具链：**不钉 nightly、不放 `rust-toolchain.toml`**（rustup 升级在评测机跨挂载点 rename 报 EXDEV）；内核零 unstable feature，stable 即可构建。

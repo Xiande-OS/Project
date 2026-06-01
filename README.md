@@ -10,10 +10,15 @@ the contest test suite by exec'ing busybox-sh with full `fork`+`execve`.
 
 ## Build
 
-Requirements: `qemu-system-riscv64` 9.x and the nightly toolchain pinned by
-`rust-toolchain.toml` (the first `cargo` invocation installs it
-automatically). All third-party crates are vendored under `vendor/`, so the
-judge machine does not need network access.
+Requirements: `qemu-system-riscv64` (the contest targets 9.x) and a recent
+**stable** Rust toolchain. The kernel uses zero unstable features, so we
+deliberately ship **no** `rust-toolchain.toml` — `make all` builds with
+whatever stable toolchain the build host already has. (Pinning a channel
+triggered a rustup self-upgrade that failed with `EXDEV` on the judge's
+split-filesystem layout; see the `Makefile` header.) The only rustup
+operation that may run is `rustup target add` for the riscv64/loongarch64
+std. All third-party crates are vendored under `vendor/`, so the judge
+machine needs no network access for the crate graph.
 
 ```sh
 make all
@@ -22,7 +27,9 @@ make all
 This produces two ELF files at the repository root:
 
 - `kernel-rv` — the RISC-V64 kernel
-- `kernel-la` — a LoongArch64 placeholder (the LA port is not yet implemented)
+- `kernel-la` — the LoongArch64 kernel, built from the same crate via the
+  `src/arch/loongarch64` backend. It falls back to a placeholder ELF only when
+  the `loongarch64-unknown-none` target std is unavailable on the build host.
 
 Because the judge strips every hidden directory (including `.cargo`), the
 `prepare` step of `make all` first copies `cargo/` to `.cargo/` and
@@ -47,7 +54,10 @@ At boot the kernel:
 1. mounts the EXT4 test disk at `/mnt` and enumerates the two variant
    directories `musl/` and `glibc/`;
 2. for each variant, walks the `*_testcode.sh` scripts in priority order
-   (`basic` → `lua` → `busybox` → `libctest` → benchmarks);
+   (`basic` → `lua` → `busybox` → `ltp` → `libctest` → `iperf`/`netperf` →
+   benchmarks). `ltp` runs before `libctest` because a libctest case can drive
+   an unkillable wedge on some arches, and LTP is the bulk of the score, so it
+   must bank first;
 3. feeds each script to busybox-sh, wrapping each in `busybox timeout` so a
    single stuck test cannot hang the whole suite;
 4. the test scripts themselves print the
