@@ -246,8 +246,10 @@ pub fn report(
     if !active() {
         return;
     }
-    // Snapshot live groups, then release the registry lock before touching
-    // any group (avoids holding two locks across the fan-out).
+    // Fan to fanotify groups too (basic event bits share inotify's values).
+    report_fanotify(target, mask as u64, is_dir);
+    // Snapshot live inotify groups, then release the registry lock before
+    // touching any group (avoids holding two locks across the fan-out).
     let groups: Vec<Arc<InotifyGroup>> = {
         let g = GROUPS.lock();
         g.iter().filter_map(|w| w.upgrade()).collect()
@@ -349,6 +351,235 @@ impl Inode for InotifyFd {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize> {
         // Non-blocking at the inode level: return what's queued (0 if empty).
         // sys_read parks the caller on an empty queue for the blocking case.
+        Ok(self.group.read_events(buf))
+    }
+}
+
+// ===================== fanotify =====================
+//
+// Built on the same op hooks: report() also fans events to fanotify groups.
+// The basic notification mask bits share inotify's values (FAN_ACCESS=0x1,
+// FAN_MODIFY=0x2, FAN_CLOSE_WRITE=0x8, FAN_CLOSE_NOWRITE=0x10, FAN_OPEN=0x20),
+// so the hooks need no new plumbing. A fanotify event carries an *open fd* to
+// the affected object (allocated in the reader at read time), not a name.
+
+pub const FAN_ACCESS: u64 = 0x0000_0001;
+pub const FAN_MODIFY: u64 = 0x0000_0002;
+pub const FAN_CLOSE_WRITE: u64 = 0x0000_0008;
+pub const FAN_CLOSE_NOWRITE: u64 = 0x0000_0010;
+pub const FAN_OPEN: u64 = 0x0000_0020;
+pub const FAN_ONDIR: u64 = 0x4000_0000;
+pub const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
+
+// fanotify_mark flags
+pub const FAN_MARK_ADD: u32 = 0x0000_0001;
+pub const FAN_MARK_REMOVE: u32 = 0x0000_0002;
+pub const FAN_MARK_FLUSH: u32 = 0x0000_0080;
+pub const FAN_MARK_MOUNT: u32 = 0x0000_0010;
+pub const FAN_MARK_FILESYSTEM: u32 = 0x0000_0100;
+
+const FANOTIFY_METADATA_VERSION: u8 = 3;
+
+struct FanMark {
+    inode: Arc<dyn Inode>,
+    mask: u64,
+    mount: bool, // a mount/filesystem-wide mark: matches any object
+}
+
+struct FanEvent {
+    mask: u64,
+    inode: Arc<dyn Inode>,
+}
+
+pub struct FanotifyGroup {
+    marks: Mutex<Vec<FanMark>>,
+    events: Mutex<VecDeque<FanEvent>>,
+    read_waiters: Mutex<Vec<i32>>,
+    pub nonblock: bool,
+}
+
+static FAN_GROUPS: Mutex<Vec<Weak<FanotifyGroup>>> = Mutex::new(Vec::new());
+
+impl FanotifyGroup {
+    pub fn new(nonblock: bool) -> Arc<Self> {
+        let g = Arc::new(Self {
+            marks: Mutex::new(Vec::new()),
+            events: Mutex::new(VecDeque::new()),
+            read_waiters: Mutex::new(Vec::new()),
+            nonblock,
+        });
+        let mut reg = FAN_GROUPS.lock();
+        reg.retain(|w| w.strong_count() > 0);
+        reg.push(Arc::downgrade(&g));
+        g
+    }
+
+    pub fn add_mark(&self, inode: Arc<dyn Inode>, mask: u64, mount: bool) {
+        let mut m = self.marks.lock();
+        for mk in m.iter_mut() {
+            if Arc::ptr_eq(&mk.inode, &inode) && mk.mount == mount {
+                mk.mask |= mask;
+                return;
+            }
+        }
+        m.push(FanMark { inode, mask, mount });
+        WATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn remove_mark(&self, inode: &Arc<dyn Inode>, mask: u64, mount: bool) {
+        let mut m = self.marks.lock();
+        let mut removed = 0;
+        m.retain_mut(|mk| {
+            if Arc::ptr_eq(&mk.inode, inode) && mk.mount == mount {
+                mk.mask &= !mask;
+                if mk.mask == 0 {
+                    removed += 1;
+                    return false;
+                }
+            }
+            true
+        });
+        if removed > 0 {
+            WATCH_COUNT.fetch_sub(removed, Ordering::Relaxed);
+        }
+    }
+
+    pub fn flush(&self, mount: bool) {
+        let mut m = self.marks.lock();
+        let before = m.len();
+        m.retain(|mk| mk.mount != mount);
+        let removed = before - m.len();
+        if removed > 0 {
+            WATCH_COUNT.fetch_sub(removed, Ordering::Relaxed);
+        }
+    }
+
+    fn push_event(&self, e: FanEvent) {
+        {
+            let mut q = self.events.lock();
+            // Coalesce identical consecutive events on the same object.
+            if let Some(last) = q.back() {
+                if last.mask == e.mask && Arc::ptr_eq(&last.inode, &e.inode) {
+                    return;
+                }
+            }
+            q.push_back(e);
+        }
+        let waiters: Vec<i32> = core::mem::take(&mut self.read_waiters.lock());
+        for pid in waiters {
+            if let Some(t) = crate::task::task_by_pid(pid) {
+                let mut s = t.state.lock();
+                if *s == crate::task::TaskState::Waiting {
+                    *s = crate::task::TaskState::Ready;
+                }
+            }
+        }
+    }
+
+    pub fn add_read_waiter(&self, pid: i32) {
+        let mut w = self.read_waiters.lock();
+        if !w.contains(&pid) {
+            w.push(pid);
+        }
+    }
+    pub fn has_events(&self) -> bool {
+        !self.events.lock().is_empty()
+    }
+
+    /// Pack as many queued events as fit, allocating an fd to each object in
+    /// the calling process. Returns bytes written.
+    pub fn read_events(&self, buf: &mut [u8]) -> usize {
+        const META: usize = 24;
+        let task = crate::task::current_task();
+        let mut off = 0usize;
+        loop {
+            if off + META > buf.len() {
+                break;
+            }
+            let ev = {
+                let mut q = self.events.lock();
+                q.pop_front()
+            };
+            let Some(ev) = ev else { break };
+            // Open an fd to the affected object for the reader.
+            let file = Arc::new(crate::fs::File::from_inode(ev.inode.clone(), true, false, false));
+            let fd = match task.fd_table.lock().alloc(file, false) {
+                Ok(fd) => fd as i32,
+                Err(_) => -1,
+            };
+            buf[off..off + 4].copy_from_slice(&(META as u32).to_le_bytes());
+            buf[off + 4] = FANOTIFY_METADATA_VERSION;
+            buf[off + 5] = 0;
+            buf[off + 6..off + 8].copy_from_slice(&(META as u16).to_le_bytes());
+            buf[off + 8..off + 16].copy_from_slice(&ev.mask.to_le_bytes());
+            buf[off + 16..off + 20].copy_from_slice(&fd.to_le_bytes());
+            buf[off + 20..off + 24].copy_from_slice(&(task.pid).to_le_bytes());
+            off += META;
+        }
+        off
+    }
+}
+
+impl Drop for FanotifyGroup {
+    fn drop(&mut self) {
+        let n = self.marks.lock().len();
+        if n > 0 {
+            WATCH_COUNT.fetch_sub(n, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Fan a filesystem event to fanotify groups. Called from [`report`].
+fn report_fanotify(target: Option<&Arc<dyn Inode>>, mask: u64, is_dir: bool) {
+    let groups: Vec<Arc<FanotifyGroup>> = {
+        let g = FAN_GROUPS.lock();
+        g.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    if groups.is_empty() {
+        return;
+    }
+    let Some(t) = target else { return };
+    // A directory event only matches a mark that asked for FAN_ONDIR.
+    for g in groups {
+        let mut hit: Option<u64> = None;
+        {
+            let marks = g.marks.lock();
+            for mk in marks.iter() {
+                if mk.mask & mask == 0 {
+                    continue;
+                }
+                if is_dir && mk.mask & FAN_ONDIR == 0 {
+                    continue;
+                }
+                // A mount/fs mark matches any object; an inode mark matches
+                // only its own inode.
+                if mk.mount || Arc::ptr_eq(&mk.inode, t) {
+                    hit = Some(hit.unwrap_or(0) | (mk.mask & mask));
+                }
+            }
+        }
+        if let Some(m) = hit {
+            g.push_event(FanEvent { mask: m, inode: t.clone() });
+        }
+    }
+}
+
+/// The fd returned by fanotify_init.
+pub struct FanotifyFd {
+    pub group: Arc<FanotifyGroup>,
+}
+
+impl Inode for FanotifyFd {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn kind(&self) -> super::FileType {
+        super::FileType::Pipe
+    }
+    fn size(&self) -> u64 {
+        0
+    }
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize> {
         Ok(self.group.read_events(buf))
     }
 }

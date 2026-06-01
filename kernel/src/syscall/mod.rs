@@ -342,6 +342,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_INOTIFY_INIT1 => sys_inotify_init1(a0 as i32),
         nr::SYS_INOTIFY_ADD_WATCH => sys_inotify_add_watch(a0 as i32, a1, a2 as u32),
         nr::SYS_INOTIFY_RM_WATCH => sys_inotify_rm_watch(a0 as i32, a1 as i32),
+        nr::SYS_FANOTIFY_INIT => sys_fanotify_init(a0 as u32, a1 as u32),
+        nr::SYS_FANOTIFY_MARK => sys_fanotify_mark(a0 as i32, a1 as u32, a2 as u64, a3 as i32, a4),
         nr::SYS_SIGNALFD4 => sys_signalfd4(a0 as i32, a1, a2 as usize, a3 as i32),
         nr::SYS_SOCKET => { crate::net::poll(); socket::sys_socket(a0 as i32, a1 as i32, a2 as i32) }
         nr::SYS_SOCKETPAIR => socket::sys_socketpair(a0 as i32, a1 as i32, a2 as i32, a3),
@@ -617,6 +619,20 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     return -11; // EAGAIN
                 }
                 ino.group.add_read_waiter(task.pid);
+                *task.state.lock() = crate::task::TaskState::Waiting;
+                unsafe {
+                    let tf = task.tf_ptr();
+                    (*tf).rewind_syscall();
+                }
+                return 0;
+            }
+        }
+        if let Some(fano) = file.inode.as_any().downcast_ref::<crate::fs::notify::FanotifyFd>() {
+            if !fano.group.has_events() {
+                if fano.group.nonblock {
+                    return -11; // EAGAIN
+                }
+                fano.group.add_read_waiter(task.pid);
                 *task.state.lock() = crate::task::TaskState::Waiting;
                 unsafe {
                     let tf = task.tf_ptr();
@@ -1739,6 +1755,69 @@ fn sys_inotify_rm_watch(fd: i32, wd: i32) -> isize {
         return EINVAL;
     };
     if group.rm_watch(wd) {
+        0
+    } else {
+        EINVAL
+    }
+}
+
+/// fanotify_init(flags, event_f_flags): create a fanotify group fd.
+fn sys_fanotify_init(flags: u32, _event_f_flags: u32) -> isize {
+    const FAN_CLOEXEC: u32 = 0x0000_0001;
+    const FAN_NONBLOCK: u32 = 0x0000_0002;
+    let group = crate::fs::notify::FanotifyGroup::new(flags & FAN_NONBLOCK != 0);
+    let n: Arc<dyn Inode> = Arc::new(crate::fs::notify::FanotifyFd { group });
+    let file = Arc::new(crate::fs::File::from_inode(n, true, false, false));
+    match current_task().fd_table.lock().alloc(file, flags & FAN_CLOEXEC != 0) {
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+/// fanotify_mark(fd, flags, mask, dirfd, pathname): add/remove/flush a mark.
+fn sys_fanotify_mark(fd: i32, flags: u32, mask: u64, dirfd: i32, path: usize) -> isize {
+    use crate::fs::notify::{
+        FAN_MARK_ADD, FAN_MARK_FILESYSTEM, FAN_MARK_FLUSH, FAN_MARK_MOUNT, FAN_MARK_REMOVE,
+    };
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else {
+        return EBADF;
+    };
+    let Some(group) = file
+        .inode
+        .as_any()
+        .downcast_ref::<crate::fs::notify::FanotifyFd>()
+        .map(|f| f.group.clone())
+    else {
+        return EINVAL;
+    };
+    let mount = flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0;
+    if flags & FAN_MARK_FLUSH != 0 {
+        group.flush(mount);
+        return 0;
+    }
+    // Resolve the marked object (dirfd + path, AT-style).
+    let inode = if path == 0 {
+        if dirfd == AT_FDCWD {
+            cwd_inode()
+        } else {
+            match task.fd_table.lock().get(dirfd) {
+                Some(f) => f.inode.clone(),
+                None => return EBADF,
+            }
+        }
+    } else {
+        let Some(p) = copy_path(path) else { return EFAULT };
+        match resolve_at(dirfd, &p) {
+            Some(i) => i,
+            None => return ENOENT,
+        }
+    };
+    if flags & FAN_MARK_ADD != 0 {
+        group.add_mark(inode, mask, mount);
+        0
+    } else if flags & FAN_MARK_REMOVE != 0 {
+        group.remove_mark(&inode, mask, mount);
         0
     } else {
         EINVAL
