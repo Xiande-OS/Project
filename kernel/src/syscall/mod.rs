@@ -5951,14 +5951,43 @@ fn sys_statx(dfd: i32, path: usize, flags: i32, mask: u32, buf: usize) -> isize 
     let mut st = Statx::default();
     st.stx_mask = 0x7ff;
     st.stx_blksize = 4096;
-    st.stx_nlink = 1;
-    st.stx_mode = match inode.kind() {
-        FileType::Regular => 0o100644,
-        FileType::Directory => 0o040755,
-        FileType::CharDevice => 0o020666,
-        FileType::Pipe => 0o010600,
-        FileType::Symlink => 0o120777,
+    st.stx_nlink = inode.nlink();
+    // Mode/uid/gid must come from meta_perm (chmod/chown persisted state), NOT a
+    // hardcoded type default — otherwise chmod/chown are invisible through
+    // statx. glibc routes stat()/fstat() through statx on some arches (notably
+    // LoongArch), so without this the entire chmod/fchmod/chown/stat LTP family
+    // failed on LA while passing on RV (which used newfstatat -> fill_stat).
+    let type_bits: u16 = match inode.kind() {
+        FileType::Regular => 0o100000,
+        FileType::Directory => 0o040000,
+        FileType::CharDevice => 0o020000,
+        FileType::Pipe => 0o010000,
+        FileType::Symlink => 0o120000,
     };
+    let (mode_bits, uid, gid) = inode.meta_perm().unwrap_or_else(|| {
+        let d = match inode.kind() {
+            FileType::Regular => 0o644,
+            FileType::Directory => 0o755,
+            FileType::CharDevice => 0o666,
+            FileType::Pipe => 0o600,
+            FileType::Symlink => 0o777,
+        };
+        (d, 0, 0)
+    });
+    st.stx_mode = type_bits | ((mode_bits & 0o7777) as u16);
+    st.stx_uid = uid;
+    st.stx_gid = gid;
+    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+        let m = *f.meta.lock();
+        st.stx_atime = [m.atime_sec as u64, m.atime_nsec as u64];
+        st.stx_mtime = [m.mtime_sec as u64, m.mtime_nsec as u64];
+        st.stx_ctime = [m.ctime_sec as u64, m.ctime_nsec as u64];
+    } else if let Some(dd) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
+        let m = *dd.meta.lock();
+        st.stx_atime = [m.atime_sec as u64, m.atime_nsec as u64];
+        st.stx_mtime = [m.mtime_sec as u64, m.mtime_nsec as u64];
+        st.stx_ctime = [m.ctime_sec as u64, m.ctime_nsec as u64];
+    }
     if let Some(d) = inode.as_any().downcast_ref::<crate::fs::devfs::DevNode>() {
         let rdev = d.kind.rdev();
         st.stx_rdev_major = (rdev >> 8) as u32;
