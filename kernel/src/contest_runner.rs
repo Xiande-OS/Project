@@ -374,6 +374,17 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
              fi\n",
             ltp = ltp_dir,
         ));
+        // NB: deliberately do NOT symlink busybox's mkfs.* applets onto PATH.
+        // It's tempting (LTP's has_mkfs runs `mkfs.<fs>` and a 127 skips the
+        // fs), but making mkfs.ext2 resolve routes a device test into the real
+        // mkfs.ext2 → mount(ext2) path, and our mount overlays a fresh empty
+        // in-memory dir rather than parsing the ext2 image busybox wrote — so
+        // the test's data doesn't survive and it TBROKs. Without the applet,
+        // tst_get_supported_fs_types falls back to tmpfs (has_mkfs special-
+        // cases tmpfs as "no mkfs needed"), and the overlay mount gives a clean
+        // writable mountpoint that the no-real-fs cases (mkdir09,
+        // copy_file_range01, …) pass on. Real-ext2-content tests need a true
+        // ext2 reader, which is a separate, larger piece.
         // Derive `musl` / `glibc` from the dir path's last segment.
         let variant = dir.rsplit('/').next().unwrap_or("musl");
         let ordered = order_scripts(scripts);
