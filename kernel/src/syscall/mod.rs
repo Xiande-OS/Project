@@ -6317,11 +6317,28 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
     // pinning hundreds of frames while it waits to be wait4'd. Under a
     // fork-storm (unixbench SHELL16) the parent reaps slower than
     // children pile up; without eager teardown the frame pool drains
-    // and a later alloc_frame() panics. Only free when no live CLONE_VM
-    // thread shares this address space (strong_count == 1). The page
-    // table root stays (satp is still ours until the scheduler switches)
-    // — only the user data frames are released.
-    if alloc::sync::Arc::strong_count(&task.memory_set) == 1 {
+    // and a later alloc_frame() panics. The page table root stays (satp
+    // is still ours until the scheduler switches) — only the user data
+    // frames are released.
+    //
+    // We must NOT free while another *live* task still executes in this
+    // address space. The old gate (strong_count == 1) got this wrong for
+    // multi-threaded tests: a SIGKILLed thread group leaves *zombie*
+    // threads still holding the shared memory_set Arc, so strong_count
+    // stays > 1 and the free is skipped — leaking the entire address space
+    // (every thread's stack included) until each zombie is individually
+    // reaped. That backlog drains the frame pool and gradually OOMs
+    // pthread-heavy tests (glibc fcntl3x, nptl*). Zombies never run again,
+    // so they don't matter; scan instead for any *non-zombie* task sharing
+    // this exact memory_set (same Arc) — a live CLONE_THREAD sibling, or a
+    // CLONE_VM/vfork child still running in this space. If none, we're the
+    // last live user and it is safe to free right now.
+    let shared_with_live = crate::task::all_tasks().into_iter().any(|t| {
+        t.pid != task.pid
+            && *t.state.lock() != crate::task::TaskState::Zombie
+            && alloc::sync::Arc::ptr_eq(&t.memory_set, &task.memory_set)
+    });
+    if !shared_with_live {
         task.memory_set.lock().free_user_frames();
     }
 
