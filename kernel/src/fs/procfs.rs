@@ -615,7 +615,7 @@ fn gen_fd_target(pid: i32, fd: i32) -> Vec<u8> {
     let kind = file.inode.kind();
     let label = match kind {
         FileType::Pipe => format!("pipe:[{}]", fd),
-        FileType::CharDevice | FileType::BlockDevice => alloc::string::String::from("/dev/null"),
+        FileType::CharDevice => alloc::string::String::from("/dev/null"),
         FileType::Directory => alloc::string::String::from("anon_inode:dir"),
         FileType::Regular => alloc::string::String::from("anon_inode:file"),
         FileType::Symlink => alloc::string::String::from("anon_inode:symlink"),

@@ -9,7 +9,6 @@ use crate::sync::Mutex; use spin::Once;
 pub mod devfs;
 pub mod ext4;
 pub mod fat32;
-pub mod loopdev;
 pub mod pipe;
 pub mod procfs;
 pub mod socket;
@@ -187,7 +186,6 @@ pub enum FileType {
     Regular,
     Directory,
     CharDevice,
-    BlockDevice,
     Pipe,
     Symlink,
 }
@@ -525,18 +523,6 @@ pub fn init() {
     dev.create_special("console", devfs::DevKind::Tty).unwrap();
     dev.create_special("urandom", devfs::DevKind::Random).unwrap();
     dev.create_special("random", devfs::DevKind::Random).unwrap();
-    // Loop devices: /dev/loop-control + /dev/loop0..7. Enables LTP's
-    // tst_acquire_device (losetup/LOOP_CTL_GET_FREE/LOOP_SET_FD) so the ~90
-    // device-backed cases get a device instead of "Failed to acquire device".
-    dev.place_inode("loop-control", Arc::new(loopdev::LoopControl) as Arc<dyn Inode>)
-        .unwrap();
-    for i in 0..loopdev::NLOOP {
-        dev.place_inode(
-            &alloc::format!("loop{}", i),
-            Arc::new(loopdev::LoopDevice { idx: i }) as Arc<dyn Inode>,
-        )
-        .unwrap();
-    }
     root.place_inode("dev", dev as Arc<dyn Inode>).unwrap();
 
     let etc = tmpfs::TmpfsDir::new_root();
