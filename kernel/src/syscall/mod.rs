@@ -136,6 +136,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         // tgsigqueueinfo(tgid, tid, sig, uinfo): we deliver to the tid; the
         // tgid is advisory for our single-namespace model.
         nr::SYS_RT_TGSIGQUEUEINFO => sys_rt_sigqueueinfo(a1 as i32, a2 as i32, a3),
+        nr::SYS_DELETE_MODULE => sys_delete_module(a0),
+        nr::SYS_KCMP => sys_kcmp(a0 as i32, a1 as i32, a2 as i32, a3, a4),
         nr::SYS_RT_SIGRETURN => {
             // Restore tf (incl. syscall ret slot) from the rt_sigframe.
             // The returned value matches what set_syscall_ret would write,
@@ -7387,6 +7389,52 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> isize {
         // harness keeps running.
         RESTART | HALT | POWER_OFF | RESTART2 | SW_SUSPEND | KEXEC => 0,
         _ => EINVAL,
+    }
+}
+
+/// delete_module(name, flags): we have no loadable modules. Validate like
+/// delete_module02 expects: a NULL/faulting name is EFAULT, a non-root caller
+/// is EPERM, and any valid name is ENOENT (no such module).
+fn sys_delete_module(name_ptr: usize) -> isize {
+    if name_ptr == 0 {
+        return EFAULT;
+    }
+    let task = current_task();
+    // Touch the name to surface EFAULT for an inaccessible pointer.
+    if task.copy_in_bytes(name_ptr, 1).is_none() {
+        return EFAULT;
+    }
+    if current_euid() != 0 {
+        return -1; // EPERM
+    }
+    -2 // ENOENT: no module by that name (we have none)
+}
+
+/// kcmp(pid1, pid2, type, idx1, idx2): compare two processes' resources. We
+/// support KCMP_FILE (type 0): are fd `idx1` in pid1 and fd `idx2` in pid2 the
+/// same open file? Returns 0 if identical, 1/2 as a stable ordering otherwise
+/// (kcmp01 only distinguishes 0 vs non-0). EBADF if either fd is invalid.
+fn sys_kcmp(pid1: i32, pid2: i32, kind: i32, idx1: usize, idx2: usize) -> isize {
+    const KCMP_FILE: i32 = 0;
+    if kind != KCMP_FILE {
+        // Other comparison types (VM, FILES, SIGHAND, ...) aren't modeled.
+        return EINVAL;
+    }
+    let Some(t1) = crate::task::task_by_pid(pid1) else { return -3 }; // ESRCH
+    let Some(t2) = crate::task::task_by_pid(pid2) else { return -3 };
+    let Some(f1) = t1.fd_table.lock().get(idx1 as i32) else { return EBADF };
+    let Some(f2) = t2.fd_table.lock().get(idx2 as i32) else { return EBADF };
+    // Same underlying open-file (we compare the File Arc identity, which is
+    // shared across dup/fork): kcmp returns 0. Otherwise a deterministic
+    // ordering by pointer value (1 if f1<f2 else 2).
+    let p1 = alloc::sync::Arc::as_ptr(&f1) as *const () as usize;
+    let p2 = alloc::sync::Arc::as_ptr(&f2) as *const () as usize;
+    if p1 == p2 {
+        0
+    } else if p1 < p2 {
+        1
+    } else {
+        2
     }
 }
 
