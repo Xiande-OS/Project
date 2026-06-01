@@ -13,6 +13,7 @@ pub mod fat32;
 pub mod pipe;
 pub mod procfs;
 pub mod socket;
+pub mod notify;
 pub mod tmpfs;
 pub use tmpfs::TmpfsDir;
 

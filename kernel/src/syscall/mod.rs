@@ -340,8 +340,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(a0 as i32, a1 as i32, a2, a3 as u32),
         nr::SYS_PIDFD_GETFD => EBADF,
         nr::SYS_INOTIFY_INIT1 => sys_inotify_init1(a0 as i32),
-        nr::SYS_INOTIFY_ADD_WATCH => 1,
-        nr::SYS_INOTIFY_RM_WATCH => 0,
+        nr::SYS_INOTIFY_ADD_WATCH => sys_inotify_add_watch(a0 as i32, a1, a2 as u32),
+        nr::SYS_INOTIFY_RM_WATCH => sys_inotify_rm_watch(a0 as i32, a1 as i32),
         nr::SYS_SIGNALFD4 => sys_signalfd4(a0 as i32, a1, a2 as usize, a3 as i32),
         nr::SYS_SOCKET => { crate::net::poll(); socket::sys_socket(a0 as i32, a1 as i32, a2 as i32) }
         nr::SYS_SOCKETPAIR => socket::sys_socketpair(a0 as i32, a1 as i32, a2 as i32, a3),
@@ -472,7 +472,16 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         return EBADF;
     };
     match file.write(&bytes) {
-        Ok(n) => n as isize,
+        Ok(n) => {
+            if crate::fs::notify::active() && n > 0 {
+                crate::fs::notify::report(
+                    Some(&file.inode), None, "",
+                    crate::fs::notify::IN_MODIFY, 0,
+                    file.inode.kind() == FileType::Directory,
+                );
+            }
+            n as isize
+        }
         Err(e) => err_to_isize(e),
     }
 }
@@ -574,6 +583,13 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         Ok(n) => n,
         Err(e) => return err_to_isize(e),
     };
+    if crate::fs::notify::active() && n > 0 {
+        crate::fs::notify::report(
+            Some(&file.inode), None, "",
+            crate::fs::notify::IN_ACCESS, 0,
+            file.inode.kind() == FileType::Directory,
+        );
+    }
     // Pipe with live writer: 0 bytes means "writer hasn't written yet",
     // NOT EOF. Without this block-on-empty, `printf X | while read line`
     // sees the read-end return 0 immediately, treats it as EOF, and
@@ -582,6 +598,25 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         if let Some(pipe) = file.inode.as_any().downcast_ref::<crate::fs::pipe::PipeEnd>() {
             if !pipe.is_writer() && pipe.writer_alive() && pipe.buffered() == 0 {
                 pipe.add_read_waiter(task.pid);
+                *task.state.lock() = crate::task::TaskState::Waiting;
+                unsafe {
+                    let tf = task.tf_ptr();
+                    (*tf).rewind_syscall();
+                }
+                return 0;
+            }
+        }
+    }
+    // inotify fd with an empty queue: block until report() queues an event
+    // (the watched operation runs on another task, or is yet to happen).
+    // A nonblocking group gets EAGAIN instead.
+    if n == 0 && len != 0 {
+        if let Some(ino) = file.inode.as_any().downcast_ref::<crate::fs::notify::InotifyFd>() {
+            if !ino.group.has_events() {
+                if ino.group.nonblock {
+                    return -11; // EAGAIN
+                }
+                ino.group.add_read_waiter(task.pid);
                 *task.state.lock() = crate::task::TaskState::Waiting;
                 unsafe {
                     let tf = task.tf_ptr();
@@ -1055,6 +1090,10 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, mode: i32) -> isize {
                     // under every umask value and checks its mode — failed.
                     apply_mode(&i, mode as u32 & !current_umask() & 0o7777);
                     stamp_creator(&i, &parent);
+                    crate::fs::notify::report(
+                        Some(&i), Some(&parent), &name,
+                        crate::fs::notify::IN_CREATE, 0, false,
+                    );
                     i
                 }
                 Err(e) => return err_to_isize(e),
@@ -1080,8 +1119,19 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, mode: i32) -> isize {
             *file.dir_path.lock() = Some(abs);
         }
     }
-    match current_task().fd_table.lock().alloc(file, cloexec) {
-        Ok(fd) => fd as isize,
+    let opened_inode = file.inode.clone();
+    let res = current_task().fd_table.lock().alloc(file, cloexec);
+    match res {
+        Ok(fd) => {
+            if crate::fs::notify::active() {
+                let is_dir = opened_inode.kind() == FileType::Directory;
+                crate::fs::notify::report(
+                    Some(&opened_inode), None, "",
+                    crate::fs::notify::IN_OPEN, 0, is_dir,
+                );
+            }
+            fd as isize
+        }
         Err(e) => err_to_isize(e),
     }
 }
@@ -1101,10 +1151,9 @@ fn sys_close(fd: i32) -> isize {
     // remain open. fcntl15 closes a duplicated/independent fd and expects the
     // lock to be gone. Capture the inode before the close, drop the locks
     // after it succeeds.
-    let key = task
-        .fd_table
-        .lock()
-        .get(fd)
+    let closing = task.fd_table.lock().get(fd);
+    let key = closing
+        .as_ref()
         .map(|f| Arc::as_ptr(&f.inode) as *const () as usize);
     let r = task.fd_table.lock().close(fd);
     if r.is_ok() {
@@ -1116,6 +1165,21 @@ fn sys_close(fd: i32) -> isize {
                 if v.is_empty() {
                     table.remove(&k);
                 }
+            }
+        }
+        // inotify: closing an fd fires IN_CLOSE_WRITE (was writable) or
+        // IN_CLOSE_NOWRITE on the file's own watch.
+        if crate::fs::notify::active() {
+            if let Some(f) = &closing {
+                let mask = if f.writable {
+                    crate::fs::notify::IN_CLOSE_WRITE
+                } else {
+                    crate::fs::notify::IN_CLOSE_NOWRITE
+                };
+                crate::fs::notify::report(
+                    Some(&f.inode), None, "",
+                    mask, 0, f.inode.kind() == FileType::Directory,
+                );
             }
         }
     }
@@ -1196,6 +1260,10 @@ fn sys_mkdirat(dfd: i32, path: usize, mode: u32) -> isize {
             // After the mode is set, stamp ownership and let a set-gid parent
             // pass its group + set-gid bit down to the new directory.
             stamp_creator(&inode, &parent);
+            crate::fs::notify::report(
+                Some(&inode), Some(&parent), &name,
+                crate::fs::notify::IN_CREATE, 0, true,
+            );
             0
         }
         Err(e) => err_to_isize(e),
@@ -1609,20 +1677,71 @@ fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _siginfo: usize, _flags: u32) -> 
     0
 }
 
-struct InotifyFd;
-impl crate::fs::Inode for InotifyFd {
-    fn as_any(&self) -> &dyn core::any::Any { self }
-    fn kind(&self) -> crate::fs::FileType { crate::fs::FileType::Pipe }
-    fn size(&self) -> u64 { 0 }
-    fn read_at(&self, _o: u64, _b: &mut [u8]) -> crate::fs::Result<usize> { Ok(0) }
-}
-
 fn sys_inotify_init1(flags: i32) -> isize {
     const IN_CLOEXEC: i32 = 0o2000000;
-    let n: Arc<dyn Inode> = Arc::new(InotifyFd);
+    const IN_NONBLOCK: i32 = 0o4000;
+    let group = crate::fs::notify::InotifyGroup::new(flags & IN_NONBLOCK != 0);
+    let n: Arc<dyn Inode> = Arc::new(crate::fs::notify::InotifyFd { group });
     let file = Arc::new(crate::fs::File::from_inode(n, true, false, false));
     match current_task().fd_table.lock().alloc(file, flags & IN_CLOEXEC != 0) {
-        Ok(fd) => fd as isize, Err(e) => err_to_isize(e),
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+/// inotify_add_watch(fd, pathname, mask): resolve the path and register a
+/// watch on the group behind `fd`. Returns the watch descriptor.
+fn sys_inotify_add_watch(fd: i32, path: usize, mask: u32) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else {
+        return EBADF;
+    };
+    let Some(group) = file
+        .inode
+        .as_any()
+        .downcast_ref::<crate::fs::notify::InotifyFd>()
+        .map(|f| f.group.clone())
+    else {
+        return EINVAL;
+    };
+    let Some(path_str) = copy_path(path) else {
+        return EFAULT;
+    };
+    let start = if path_str.starts_with('/') { fs::root() } else { cwd_inode() };
+    // IN_DONT_FOLLOW: don't dereference a final symlink.
+    let inode = if mask & crate::fs::notify::IN_DONT_FOLLOW != 0 {
+        fs::lookup_path_nofollow(start, &path_str)
+    } else {
+        fs::lookup_path(start, &path_str)
+    };
+    let inode = match inode {
+        Ok(i) => i,
+        Err(e) => return err_to_isize(e),
+    };
+    if mask & crate::fs::notify::IN_ONLYDIR != 0 && inode.kind() != FileType::Directory {
+        return -20; // ENOTDIR
+    }
+    group.add_watch(inode, mask) as isize
+}
+
+/// inotify_rm_watch(fd, wd): drop a watch.
+fn sys_inotify_rm_watch(fd: i32, wd: i32) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else {
+        return EBADF;
+    };
+    let Some(group) = file
+        .inode
+        .as_any()
+        .downcast_ref::<crate::fs::notify::InotifyFd>()
+        .map(|f| f.group.clone())
+    else {
+        return EINVAL;
+    };
+    if group.rm_watch(wd) {
+        0
+    } else {
+        EINVAL
     }
 }
 
@@ -4722,6 +4841,17 @@ fn apply_times(inode: &Arc<dyn Inode>, atime: Option<(i64, i64)>, mtime: Option<
     }
 }
 
+/// inotify IN_ATTRIB on a metadata change (chmod/chown/utimes/link-count).
+fn notify_attrib(inode: &Arc<dyn Inode>) {
+    if crate::fs::notify::active() {
+        crate::fs::notify::report(
+            Some(inode), None, "",
+            crate::fs::notify::IN_ATTRIB, 0,
+            inode.kind() == FileType::Directory,
+        );
+    }
+}
+
 fn sys_fchmod(fd: i32, mode: u32) -> isize {
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
@@ -4730,6 +4860,7 @@ fn sys_fchmod(fd: i32, mode: u32) -> isize {
         return -1; // EPERM
     }
     apply_mode(&file.inode, mode);
+    notify_attrib(&file.inode);
     0
 }
 
@@ -4753,6 +4884,7 @@ fn sys_fchmodat(dfd: i32, path: usize, mode: u32) -> isize {
         return -1; // EPERM
     }
     apply_mode(&i, mode);
+    notify_attrib(&i);
     0
 }
 
@@ -4764,6 +4896,7 @@ fn sys_fchown(fd: i32, uid: u32, gid: u32) -> isize {
         return -1; // EPERM
     }
     apply_owner(&file.inode, uid, gid);
+    notify_attrib(&file.inode);
     0
 }
 
@@ -4780,6 +4913,7 @@ fn sys_fchownat(dfd: i32, path: usize, uid: u32, gid: u32, flags: i32) -> isize 
                 return -1; // EPERM
             }
             apply_owner(&f.inode, uid, gid);
+            notify_attrib(&f.inode);
             return 0;
         }
         return ENOENT;
@@ -4798,6 +4932,7 @@ fn sys_fchownat(dfd: i32, path: usize, uid: u32, gid: u32, flags: i32) -> isize 
         return -1; // EPERM
     }
     apply_owner(&i, uid, gid);
+    notify_attrib(&i);
     0
 }
 
@@ -5677,10 +5812,25 @@ fn sys_unlinkat(dfd: i32, path: usize, flag: i32) -> isize {
     let victim = parent.lookup(&name).ok();
     match parent.unlink(&name) {
         Ok(()) => {
-            if let Some(v) = victim {
-                if v.kind() != FileType::Directory {
+            let is_dir = victim.as_ref().map_or(false, |v| v.kind() == FileType::Directory);
+            if let Some(v) = &victim {
+                if !is_dir {
                     v.adjust_nlink(-1);
                 }
+            }
+            // inotify: IN_DELETE on the parent (with name) + IN_DELETE_SELF on
+            // the victim's own watch.
+            crate::fs::notify::report(
+                None, Some(&parent), &name,
+                crate::fs::notify::IN_DELETE, 0, is_dir,
+            );
+            if let Some(v) = &victim {
+                crate::fs::notify::report(
+                    Some(v), None, "",
+                    crate::fs::notify::IN_DELETE_SELF, 0, is_dir,
+                );
+                // The object is gone: drop its watches and fire IN_IGNORED.
+                crate::fs::notify::inode_gone(v);
             }
             0
         }
@@ -7435,15 +7585,37 @@ fn sys_renameat2(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _
     }
     // Re-place under new location. Works on TmpfsDir or Ext4Dir
     // (the two dir flavours that back our writable overlay).
-    if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
-        let _ = td.place_inode(&new_name, inode);
-        0
+    let is_dir = inode.kind() == FileType::Directory;
+    let placed = if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
+        let _ = td.place_inode(&new_name, inode.clone());
+        true
     } else if let Some(ed) = crate::fs::ext4::downcast_dir(&new_parent) {
-        let _ = ed.place_inode(&new_name, inode);
-        0
+        let _ = ed.place_inode(&new_name, inode.clone());
+        true
     } else {
-        ENOENT
+        false
+    };
+    if !placed {
+        return ENOENT;
     }
+    // inotify: paired IN_MOVED_FROM/IN_MOVED_TO (shared cookie) on the two
+    // directories, plus IN_MOVE_SELF on the moved object's own watch.
+    if crate::fs::notify::active() {
+        let cookie = crate::fs::notify::next_cookie();
+        crate::fs::notify::report(
+            None, Some(&old_parent), &old_name,
+            crate::fs::notify::IN_MOVED_FROM, cookie, is_dir,
+        );
+        crate::fs::notify::report(
+            None, Some(&new_parent), &new_name,
+            crate::fs::notify::IN_MOVED_TO, cookie, is_dir,
+        );
+        crate::fs::notify::report(
+            Some(&inode), None, "",
+            crate::fs::notify::IN_MOVE_SELF, 0, is_dir,
+        );
+    }
+    0
 }
 
 fn sys_linkat(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _flags: i32) -> isize {
