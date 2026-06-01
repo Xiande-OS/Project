@@ -154,13 +154,6 @@ pub struct Task {
     /// times-up flag after its blocking recv returns. Cleared at the
     /// start of every syscall.
     pub in_blocking_syscall: AtomicBool,
-    /// Set when this task's real parent died and it was adopted by init
-    /// (`reparent_children_to_init`). Distinguishes a runaway orphan — a child
-    /// the timeout-SIGKILLed memory/fork-bomb test left behind — from init's
-    /// *original* children (the driver shells), which are never reparented.
-    /// Under genuine memory pressure `emergency_reclaim` may kill a reparented
-    /// task to recover (an OOM-killer of last resort); the shells stay safe.
-    pub reparented: AtomicBool,
 }
 
 unsafe impl Send for Task {}
@@ -546,7 +539,6 @@ pub fn reparent_children_to_init(dead_pid: i32) {
     for kid in kids {
         if let Some(k) = task_by_pid(kid) {
             k.ppid.store(INIT_PID, Ordering::Relaxed);
-            k.reparented.store(true, Ordering::Relaxed);
             init_kids.push(kid);
         }
     }
@@ -681,7 +673,6 @@ pub fn emergency_reclaim() -> usize {
             }
             let parent_dead = !live.contains(&ppid);
             if let Some(task) = task_by_pid(pid) {
-                let orphan = parent_dead || task.reparented.load(Ordering::Relaxed);
                 let st = *task.state.lock();
                 match st {
                     // Nobody will wait4 it: parent gone, or reparented to init.
@@ -690,16 +681,8 @@ pub fn emergency_reclaim() -> usize {
                         reap(pid);
                         freed += 1;
                     }
-                    // A runaway orphan (real parent died / adopted by init) in
-                    // any *live* state — Waiting OR Ready/Running — is a child a
-                    // SIGKILLed memory/fork-bomb test left behind. Nobody will
-                    // wait4 it and it keeps pinning frames; under the memory
-                    // pressure that brought us here, kill+reap it so the shell
-                    // can fork the next case. This is the OOM-killer of last
-                    // resort. init's *original* children (the driver shells) are
-                    // never reparented and their parent (init) is alive, so they
-                    // are never `orphan` and stay safe.
-                    _ if orphan => {
+                    // Parked orphan that can never be woken (real parent gone).
+                    TaskState::Waiting if parent_dead => {
                         crate::signal::kill_now(&task);
                         drop(task);
                         reap(pid);
@@ -1116,7 +1099,6 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
         vfork_child: Mutex::new(None),
         thread_stack_top: AtomicUsize::new(0),
         in_blocking_syscall: AtomicBool::new(false),
-        reparented: AtomicBool::new(false),
     });
     unsafe {
         core::ptr::write(task.tf_ptr(), tf);
@@ -1432,7 +1414,6 @@ pub fn clone_current(
             },
         ),
         in_blocking_syscall: AtomicBool::new(false),
-        reparented: AtomicBool::new(false),
     });
     // Write the TF onto the new kstack.
     unsafe {
