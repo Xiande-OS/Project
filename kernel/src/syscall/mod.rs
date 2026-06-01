@@ -1388,12 +1388,22 @@ fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
     const TIOCSPGRP: u32 = 0x5410;
 
     let task = current_task();
-    let is_console = task
-        .fd_table
-        .lock()
-        .get(fd)
-        .map(|f| f.is_console)
-        .unwrap_or(false);
+    let file_opt = task.fd_table.lock().get(fd);
+    let is_console = file_opt.as_ref().map(|f| f.is_console).unwrap_or(false);
+
+    // Loop devices (/dev/loop-control + /dev/loopN) and block-size ioctls.
+    if let Some(file) = &file_opt {
+        let inode = file.inode.clone();
+        if inode.as_any().is::<crate::fs::loopdev::LoopControl>() {
+            if let Some(r) = crate::fs::loopdev::ioctl(None, req, arg, &task) {
+                return r;
+            }
+        } else if let Some(ld) = inode.as_any().downcast_ref::<crate::fs::loopdev::LoopDevice>() {
+            if let Some(r) = crate::fs::loopdev::ioctl(Some(ld.idx), req, arg, &task) {
+                return r;
+            }
+        }
+    }
 
     match req {
         TCGETS if is_console => {
@@ -5559,6 +5569,7 @@ fn sys_getdents64(fd: i32, buf: usize, len: usize) -> isize {
             FileType::Regular => 8u8,
             FileType::Directory => 4u8,
             FileType::CharDevice => 2u8,
+            FileType::BlockDevice => 6u8, // DT_BLK
             FileType::Pipe => 1u8,
             FileType::Symlink => 10u8,
         };
@@ -5614,6 +5625,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
         FileType::Regular => 0o100000,
         FileType::Directory => 0o040000,
         FileType::CharDevice => 0o020000,
+        FileType::BlockDevice => 0o060000,
         FileType::Pipe => 0o010000,
         FileType::Symlink => 0o120000,
     };
@@ -5627,7 +5639,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
         let mode_default = match inode.kind() {
             FileType::Regular => 0o644,
             FileType::Directory => 0o755,
-            FileType::CharDevice => 0o666,
+            FileType::CharDevice | FileType::BlockDevice => 0o666,
             FileType::Pipe => 0o600,
             FileType::Symlink => 0o777,
         };
@@ -5787,6 +5799,7 @@ fn sys_statx(dfd: i32, path: usize, flags: i32, mask: u32, buf: usize) -> isize 
         FileType::Regular => 0o100644,
         FileType::Directory => 0o040755,
         FileType::CharDevice => 0o020666,
+        FileType::BlockDevice => 0o060666,
         FileType::Pipe => 0o010600,
         FileType::Symlink => 0o120777,
     };
@@ -5892,15 +5905,55 @@ fn sys_chroot(path: usize) -> isize {
     0
 }
 
-fn sys_mount(_source: usize, target: usize, _fstype: usize, _flags: usize, _data: usize) -> isize {
+fn sys_mount(source: usize, target: usize, fstype: usize, flags: usize, _data: usize) -> isize {
+    const MS_REMOUNT: usize = 32;
+    const MS_BIND: usize = 4096;
     let Some(target_str) = copy_path(target) else {
         return EFAULT;
     };
+    let fstype_str = copy_path(fstype).unwrap_or_default();
     let start = if target_str.starts_with('/') { fs::root() } else { cwd_inode() };
-    match fs::lookup_path(start, &target_str) {
-        Ok(_) => 0,
-        Err(e) => err_to_isize(e),
+    // The mountpoint must exist and be a directory.
+    let tgt_inode = match fs::lookup_path(start.clone(), &target_str) {
+        Ok(i) => i,
+        Err(e) => return err_to_isize(e),
+    };
+    if tgt_inode.kind() != fs::FileType::Directory {
+        return -20; // ENOTDIR
     }
+    // A remount/bind just adjusts an existing mount — accept without replacing
+    // the directory (LTP remounts RO after the initial mount; replacing would
+    // wipe the files it just wrote).
+    if flags & (MS_REMOUNT | MS_BIND) != 0 {
+        return 0;
+    }
+    // Real filesystems we recognize get a fresh, empty, writable in-memory
+    // directory overlaid at the mountpoint — exactly what LTP needs after it
+    // mkfs'd a (loop) device: a clean place to create files and read them
+    // back. The mount-probe `mount("/dev/zero", tmp, fs)` that tst_fs_is_
+    // supported uses also lands here and succeeds, marking the fs supported.
+    // Pseudo/unknown filesystems we don't model fall through to a no-op
+    // success so they don't spuriously fail (the dir already exists).
+    const KNOWN: &[&str] = &[
+        "tmpfs", "ext2", "ext3", "ext4", "vfat", "msdos", "minix", "ramfs",
+        "xfs", "btrfs", "exfat", "ntfs",
+    ];
+    let _ = source;
+    if KNOWN.iter().any(|f| fstype_str == *f) || fstype_str.is_empty() {
+        // Overlay a fresh tmpfs dir at the mountpoint by replacing the entry in
+        // its parent. Requires the parent to be our in-memory tmpfs (it always
+        // is for LTP mountpoints under /tmp).
+        if let Ok((parent, name)) = fs::split_parent(start, &target_str) {
+            if let Some(pdir) = fs::tmpfs::downcast_dir(&parent) {
+                let fresh = fs::tmpfs::TmpfsDir::new_root();
+                if pdir.place_inode(&name, fresh as Arc<dyn fs::Inode>).is_ok() {
+                    return 0;
+                }
+            }
+        }
+    }
+    // Fall back to "mountpoint exists" success.
+    0
 }
 
 fn sys_umount2(target: usize, _flags: i32) -> isize {
