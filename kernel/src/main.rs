@@ -123,6 +123,16 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
         // down the kernel during contest init.
         let _ = fs::link_into("/bin", applet, bb.clone());
     }
+    // mkfs.<ext> wrappers for LTP's tst_mkfs on the writable scratch (x1).
+    // We don't ship e2fsprogs; instead a tiny script wipes the device's
+    // superblock region so the next mount(2) of it formats a fresh ext2
+    // in-kernel. The device is the /dev/* argument (usually last).
+    const MKFS_WRAPPER: &[u8] = b"#!/bin/sh\nd=\nfor a in \"$@\"; do case \"$a\" in /dev/*) d=\"$a\";; esac; done\n[ -n \"$d\" ] && dd if=/dev/zero of=\"$d\" bs=1024 count=64 2>/dev/null\nexit 0\n";
+    if let Ok(mkfs) = fs::install_file("/bin", "mkfs.ext2", MKFS_WRAPPER) {
+        for name in ["mkfs.ext3", "mkfs.ext4", "mke2fs", "mkfs"] {
+            let _ = fs::link_into("/bin", name, mkfs.clone());
+        }
+    }
     let git_inode = fs::install_file("/bin", "git", real_git_elf()).unwrap();
     // Real git is a multicall binary: when invoked as `git-<sub>` it
     // dispatches to that sub-builtin via argv[0]. fetch-pack forks off
@@ -254,6 +264,8 @@ nogroup:x:65533:\n",
     if let Some(_blk) = drivers::virtio_blk::init() {
         // Bring-up smoke test of the writable ext2 scratch (x1).
         fs::ext2::smoke_test();
+        // Expose the scratch as /dev/sdb so LTP's tst_device can mkfs+mount it.
+        fs::register_block_devices();
         // Contest mode mounts EXT4 inside contest_runner — skip FAT32
         // probe here. Dev builds still get a FAT32 attempt for the
         // local disk.img convenience.

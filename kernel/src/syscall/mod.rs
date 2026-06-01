@@ -5727,6 +5727,7 @@ fn sys_getdents64(fd: i32, buf: usize, len: usize) -> isize {
             FileType::Regular => 8u8,
             FileType::Directory => 4u8,
             FileType::CharDevice => 2u8,
+            FileType::BlockDevice => 6u8,
             FileType::Pipe => 1u8,
             FileType::Symlink => 10u8,
         };
@@ -5782,6 +5783,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
         FileType::Regular => 0o100000,
         FileType::Directory => 0o040000,
         FileType::CharDevice => 0o020000,
+        FileType::BlockDevice => 0o060000,
         FileType::Pipe => 0o010000,
         FileType::Symlink => 0o120000,
     };
@@ -5805,6 +5807,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
             FileType::Regular => 0o644,
             FileType::Directory => 0o755,
             FileType::CharDevice => 0o666,
+            FileType::BlockDevice => 0o660,
             FileType::Pipe => 0o600,
             FileType::Symlink => 0o777,
         };
@@ -5815,6 +5818,8 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
     // checks st_rdev == makedev(1,3) for /dev/null, so 0 makes it ENODEV.
     if let Some(d) = inode.as_any().downcast_ref::<crate::fs::devfs::DevNode>() {
         s.st_rdev = d.kind.rdev();
+    } else if let Some(b) = inode.as_any().downcast_ref::<crate::fs::devfs::BlockDevNode>() {
+        s.st_rdev = b.rdev;
     }
     s.st_uid = uid;
     s.st_gid = gid;
@@ -5969,6 +5974,7 @@ fn sys_statx(dfd: i32, path: usize, flags: i32, mask: u32, buf: usize) -> isize 
         FileType::Regular => 0o100000,
         FileType::Directory => 0o040000,
         FileType::CharDevice => 0o020000,
+        FileType::BlockDevice => 0o060000,
         FileType::Pipe => 0o010000,
         FileType::Symlink => 0o120000,
     };
@@ -5977,6 +5983,7 @@ fn sys_statx(dfd: i32, path: usize, flags: i32, mask: u32, buf: usize) -> isize 
             FileType::Regular => 0o644,
             FileType::Directory => 0o755,
             FileType::CharDevice => 0o666,
+            FileType::BlockDevice => 0o660,
             FileType::Pipe => 0o600,
             FileType::Symlink => 0o777,
         };
@@ -6000,6 +6007,9 @@ fn sys_statx(dfd: i32, path: usize, flags: i32, mask: u32, buf: usize) -> isize 
         let rdev = d.kind.rdev();
         st.stx_rdev_major = (rdev >> 8) as u32;
         st.stx_rdev_minor = (rdev & 0xff) as u32;
+    } else if let Some(b) = inode.as_any().downcast_ref::<crate::fs::devfs::BlockDevNode>() {
+        st.stx_rdev_major = (b.rdev >> 8) as u32;
+        st.stx_rdev_minor = (b.rdev & 0xff) as u32;
     }
     st.stx_size = inode.size();
     st.stx_blocks = (inode.size() + 511) / 512;
@@ -6098,14 +6108,59 @@ fn sys_chroot(path: usize) -> isize {
     0
 }
 
-fn sys_mount(_source: usize, target: usize, _fstype: usize, _flags: usize, _data: usize) -> isize {
+fn sys_mount(source: usize, target: usize, fstype: usize, _flags: usize, _data: usize) -> isize {
+    const ENODEV: isize = -19;
+    const EIO: isize = -5;
     let Some(target_str) = copy_path(target) else {
         return EFAULT;
     };
+    let source_str = copy_path(source).unwrap_or_default();
+    let fstype_str = copy_path(fstype).unwrap_or_default();
+    // Resolve the mountpoint's parent dir + final name (cwd-aware).
     let start = if target_str.starts_with('/') { fs::root() } else { cwd_inode() };
-    match fs::lookup_path(start, &target_str) {
-        Ok(_) => 0,
-        Err(e) => err_to_isize(e),
+    let (parent, name) = match fs::split_parent(start, &target_str) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
+    };
+    if matches!(fstype_str.as_str(), "ext2" | "ext3" | "ext4") {
+        // Resolve the source block-device node to its underlying device.
+        let s_start = if source_str.starts_with('/') { fs::root() } else { cwd_inode() };
+        let dev = match fs::lookup_path(s_start, &source_str) {
+            Ok(node) => node
+                .as_any()
+                .downcast_ref::<fs::devfs::BlockDevNode>()
+                .map(|b| b.dev.clone()),
+            Err(_) => None,
+        };
+        let Some(dev) = dev else { return ENODEV };
+        // Mount the on-disk ext2; if the device holds no valid ext2 yet
+        // (freshly mkfs'd-as-zero, or never formatted), format it first.
+        let efs = match fs::ext2::mount(dev.clone()) {
+            Ok(f) => f,
+            Err(_) => {
+                if fs::ext2::format(&dev).is_err() {
+                    return EIO;
+                }
+                match fs::ext2::mount(dev) {
+                    Ok(f) => f,
+                    Err(e) => return err_to_isize(e),
+                }
+            }
+        };
+        match fs::mount_at(parent, &name, efs.root_inode()) {
+            Ok(()) => 0,
+            Err(e) => err_to_isize(e),
+        }
+    } else if matches!(fstype_str.as_str(), "tmpfs" | "ramfs") {
+        let d = fs::tmpfs::TmpfsDir::new_root() as Arc<dyn Inode>;
+        match fs::mount_at(parent, &name, d) {
+            Ok(()) => 0,
+            Err(e) => err_to_isize(e),
+        }
+    } else {
+        // proc/sysfs/devpts/cgroup/... — virtual filesystems the kernel
+        // already provides or doesn't need; accept the mount as a no-op.
+        0
     }
 }
 
@@ -6114,10 +6169,14 @@ fn sys_umount2(target: usize, _flags: i32) -> isize {
         return EFAULT;
     };
     let start = if target_str.starts_with('/') { fs::root() } else { cwd_inode() };
-    match fs::lookup_path(start, &target_str) {
-        Ok(_) => 0,
-        Err(e) => err_to_isize(e),
-    }
+    let (parent, name) = match fs::split_parent(start, &target_str) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
+    };
+    // Restore the covered inode if this was a real mount; unmounting a
+    // virtual/no-op mount just succeeds quietly.
+    let _ = fs::umount_at(&parent, &name);
+    0
 }
 
 fn normalize_path(p: &str) -> String {

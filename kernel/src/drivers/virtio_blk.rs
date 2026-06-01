@@ -211,24 +211,15 @@ pub fn init() -> Option<Arc<BlockDevice>> {
     if devs.is_empty() {
         return None;
     }
-    // Pin the test-image vs scratch assignment NOW, before anything formats
-    // the scratch. The test image is the device that already holds a real
-    // ext filesystem (magic present); the scratch is the empty one.
-    for (i, d) in devs.iter().enumerate() {
-        if has_ext_magic(d) {
-            let _ = TEST_IMAGE_IDX.compare_exchange(
-                usize::MAX, i, Ordering::Relaxed, Ordering::Relaxed,
-            );
-        } else {
-            let _ = SCRATCH_IDX.compare_exchange(
-                usize::MAX, i, Ordering::Relaxed, Ordering::Relaxed,
-            );
-        }
-    }
-    // No device carried an ext magic (e.g. a FAT dev image) — fall back to
-    // treating the first as the image so the legacy mount path is unchanged.
-    if TEST_IMAGE_IDX.load(Ordering::Relaxed) == usize::MAX {
-        TEST_IMAGE_IDX.store(0, Ordering::Relaxed);
+    // The contest pins the read-only test image on x0 (bus.0 = the first slot
+    // scanned / first PCI function) and our writable scratch on x1 (bus.1 =
+    // the second). Identify by that fixed slot order, which is deterministic
+    // regardless of on-disk content — once the scratch is formatted it shares
+    // ext4's 0xEF53 magic, so content cannot distinguish the two. Device 0 is
+    // always the test image; a second device, if present, is the scratch.
+    TEST_IMAGE_IDX.store(0, Ordering::Relaxed);
+    if devs.len() >= 2 {
+        SCRATCH_IDX.store(1, Ordering::Relaxed);
     }
     BLKS.call_once(|| devs);
     crate::println!(
@@ -238,16 +229,6 @@ pub fn init() -> Option<Arc<BlockDevice>> {
         SCRATCH_IDX.load(Ordering::Relaxed) as isize,
     );
     get()
-}
-
-/// True if `dev` already holds an ext2/3/4 filesystem: the superblock sits
-/// at byte 1024 (sector 2) and s_magic (0xEF53) is at offset 56 within it.
-fn has_ext_magic(dev: &BlockDevice) -> bool {
-    let mut buf = [0u8; SECTOR_BYTES];
-    if dev.read_block(2, &mut buf).is_err() {
-        return false;
-    }
-    buf[56] == 0x53 && buf[57] == 0xEF
 }
 
 /// riscv64 virtio-mmio bank scan. QEMU virt's bank lives at

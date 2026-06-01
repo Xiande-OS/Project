@@ -379,6 +379,8 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                  export LTPROOT={ltp}; \
                  export LTP_TIMEOUT_MUL=2; \
                  export KCONFIG_SKIP_CHECK=1; \
+                 export LTP_DEV=/dev/sdb; \
+                 export LTP_DEV_FS_TYPE=ext2; \
              fi\n",
             ltp = ltp_dir,
         ));

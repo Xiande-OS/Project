@@ -187,6 +187,7 @@ pub enum FileType {
     Regular,
     Directory,
     CharDevice,
+    BlockDevice,
     Pipe,
     Symlink,
 }
@@ -601,6 +602,62 @@ pub fn link_into(parent: &str, name: &str, inode: Arc<dyn Inode>) -> Result<()> 
 
 pub fn root() -> Arc<dyn Inode> {
     ROOT_INODE.get().unwrap().clone()
+}
+
+/// One active mount: a filesystem root grafted over `name` in tmpfs dir
+/// `parent`, remembering the inode it covers so umount can restore it.
+struct MountEnt {
+    parent: Arc<dyn Inode>,
+    name: String,
+    covered: Arc<dyn Inode>,
+}
+static MOUNTS: Mutex<Vec<MountEnt>> = Mutex::new(Vec::new());
+
+/// Mount a real filesystem root over `name` in tmpfs directory `parent` by
+/// grafting it in (the same mechanism the ext4 test image uses), remembering
+/// what it covered. The mountpoint must exist and `parent` must be a tmpfs
+/// directory (LTP creates its mountpoints under the tmpfs tmpdir).
+pub fn mount_at(parent: Arc<dyn Inode>, name: &str, fs_root: Arc<dyn Inode>) -> Result<()> {
+    let td = tmpfs::downcast_dir(&parent).ok_or(EINVAL)?;
+    let covered = parent.lookup(name)?; // mountpoint must exist
+    td.place_inode(name, fs_root)?;
+    MOUNTS.lock().push(MountEnt {
+        parent,
+        name: String::from(name),
+        covered,
+    });
+    Ok(())
+}
+
+/// Undo the most recent mount over `name` in `parent`, restoring the covered
+/// inode. Matches by directory identity (Arc) + name.
+pub fn umount_at(parent: &Arc<dyn Inode>, name: &str) -> Result<()> {
+    let mut m = MOUNTS.lock();
+    let Some(pos) = m
+        .iter()
+        .rposition(|e| e.name == name && Arc::ptr_eq(&e.parent, parent))
+    else {
+        return Err(EINVAL);
+    };
+    let ent = m.remove(pos);
+    drop(m);
+    if let Some(td) = tmpfs::downcast_dir(&ent.parent) {
+        td.place_inode(&ent.name, ent.covered)?;
+    }
+    Ok(())
+}
+
+/// Expose the writable scratch disk (x1) as /dev/sdb so LTP's tst_device can
+/// claim a real S_ISBLK device and mkfs/mount it. Called after the block
+/// layer probes (the scratch isn't known at fs::init time).
+pub fn register_block_devices() {
+    if let Some(scratch) = crate::drivers::virtio_blk::get_scratch() {
+        let node = Arc::new(devfs::BlockDevNode {
+            dev: scratch,
+            rdev: (8 << 8) | 16, // 8:16 = sdb
+        }) as Arc<dyn Inode>;
+        let _ = link_into("/dev", "sdb", node);
+    }
 }
 
 /// Resolve an absolute or CWD-relative path. Returns the inode or an error.

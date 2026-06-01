@@ -1150,8 +1150,28 @@ pub fn smoke_test() {
     let after = root.list().unwrap_or_default();
     let gone = !after.iter().any(|(nm, _)| nm == "hello.txt");
 
+    // VFS mount test: graft this ext2 root at /tmp/m and round-trip a file
+    // through full-path resolution (proves mount_at + cross-mount lookup).
+    let mut vfs_ok = false;
+    if let Ok(tmp) = crate::fs::lookup_path(crate::fs::root(), "/tmp") {
+        let _ = tmp.create("m", FileType::Directory);
+        if crate::fs::mount_at(tmp.clone(), "m", fs.root_inode()).is_ok() {
+            if let Ok(md) = crate::fs::lookup_path(crate::fs::root(), "/tmp/m") {
+                if let Ok(file) = md.create("vfs.txt", FileType::Regular) {
+                    let _ = file.write_at(0, b"via-vfs");
+                }
+            }
+            if let Ok(f2) = crate::fs::lookup_path(crate::fs::root(), "/tmp/m/vfs.txt") {
+                let mut b = [0u8; 16];
+                let n = f2.read_at(0, &mut b).unwrap_or(0);
+                vfs_ok = &b[..n] == b"via-vfs";
+            }
+            let _ = crate::fs::umount_at(&tmp, "m");
+        }
+    }
+
     crate::println!(
-        "[ext2-smoke] rw={} mkdir={} big_indirect={} unlink={} entries_now={}",
-        ok_rw, has_sub, big_ok, gone, after.len()
+        "[ext2-smoke] rw={} mkdir={} big_indirect={} unlink={} vfs_mount={} entries_now={}",
+        ok_rw, has_sub, big_ok, gone, vfs_ok, after.len()
     );
 }
