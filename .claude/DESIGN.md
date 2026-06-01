@@ -6,12 +6,20 @@
 ## 现状（2026-06-01）：设计已全部落地，有几处原始决策被推翻
 本文件记录的是**立项时的架构意图**，大部分仍准确（Sv39、virtio-mmio、内存布局、锁层次、双架构…），但下面这些早期决策在实现中被推翻；正文相应处已就地更正，决策日志有对应条目：
 
-| 原始决策 | 实际落地 |
+| 原始决策 | 实际落地（已对照代码核实，2026-06-01） |
 |---|---|
-| 内核内部全 `async/await` + WaitQueue | **协作式调度 + trap 边界抢占 + per-syscall 看门狗**（内核里 0 个 `async fn`） |
-| 仅 musl，不支持 glibc | **musl + glibc 双支持**（绑 glibc ld-linux、libc.so.6、按变体设 LD_LIBRARY_PATH） |
-| sigreturn 用栈 trampoline，不做 vDSO | **改用 vDSO**（`vdso.rs` 的 `__vdso_rt_sigreturn` 带 CFI 供 glibc unwind） |
-| 持久 FS 起步 FAT32，ext4 后期可选 | **ext4 只读是评测主路径**，fat32 仅本地 dev 盘 |
+| 内核内部全 `async/await` + WaitQueue | **协作式调度 + trap 边界抢占 + per-syscall 看门狗**（0 个 `async fn`） |
+| 仅 musl，不支持 glibc | **musl + glibc 双支持**（绑 glibc ld-linux/libc.so.6、按变体设 LD_LIBRARY_PATH） |
+| sigreturn 用栈 trampoline | **改用 vDSO**（`__vdso_rt_sigreturn` 带 CFI 供 glibc unwind） |
+| 持久 FS = FAT32(`fatfs`)/ext4(`lwext4-rs`) | **ext4 + fat32 全自实现**，无第三方 crate；ext4 只读为评测主路径 |
+| buddy + slab(kmalloc) | 只有单个 buddy `LockedHeap`（256 MiB），**无 slab** |
+| MemorySet 支持 demand paging + CoW | **两者均未实现**（mmap/fork 即时分配+深拷贝，缺页→信号） |
+| 调度器 per-CPU FIFO runqueue + idle task | 全局 `BTreeMap` 任务表 + 扫表 round-robin，**无 per-CPU 队列/idle** |
+| 时钟 10 ms tick | **1 ms**（10 MHz mtimer，`TIMER_QUANTUM_TICKS=10_000`） |
+| PLIC + NS16550A IRQ | **均未用**：SBI legacy console + virtio 轮询 |
+| initramfs（cpio newc） | **无 cpio**；rootfs 由 `kmain` `include_bytes!` 直接铺 tmpfs |
+| crate 表含 hashbrown/cpio_reader/fatfs/lwext4-rs/crossbeam-queue | **均未使用**（见下方修正后的 crate 表） |
+| 用户栈 `0x3f_ffff_f000` / interp `0x2aaa_…` | 实际栈顶 `0x4000_0000`、mmap base `0x2000_0000`（全在 1 GiB 下） |
 
 文末「实施分期」表是 M0 时期的，**已作废**（全部已实现），仅留作历史。
 
@@ -27,7 +35,7 @@
 - **SBI 调用封装**：用 `sbi-rt` crate（HSM、IPI、timer、console、RFENCE 都齐全），不手写 ecall
 
 ## 内存
-- **物理分配器**：`buddy_system_allocator` crate 起步（页粒度 buddy），上面再叠一个 slab 分配小对象（kmalloc）
+- **物理分配器**：`buddy_system_allocator` crate（页粒度）。内核 heap = 单个 `LockedHeap`（256 MiB 静态 `.bss`，包成 `PreemptHeap` 防持锁时被抢占）。⚠️ **未叠 slab/kmalloc**——一个 buddy heap 覆盖所有内核分配（`mm/heap.rs`）
 - **虚拟内存**：**Sv39**（39 位 VA、3 级页表）。`PagingMode` trait 抽象层数与 VPN 位宽，未来切 Sv48 只改一处
 - **内核地址空间**（高半区，符号扩展位 = 1）：
   ```
@@ -36,25 +44,23 @@
   0xffff_ffe0_0000_0000 .. 0xffff_fff0_0000_0000  fixmap / per-cpu / IO 重映射
   0xffff_ffff_8000_0000 .. 0xffff_ffff_ffff_ffff  内核镜像 (-2GB，便于 mcmodel=medany)
   ```
-- **用户地址空间**（低半区）：
-  - `0x10000` 起放主程序 ELF；`mmap_min_addr = 0x10000` 阻止 NULL deref
-  - PT_INTERP 装到 `~0x2aaa_aaaa_0000`
-  - `mmap` 区从 `TASK_SIZE/3` 向上长；stack 从 `0x0000_003f_ffff_f000` 向下长
-- **页表 Rust 抽象**：`PhysAddr`/`VirtAddr` newtype；`PageTable` 拥有根帧并在 Drop 时递归释放；用户进程的 `MemorySet { page_table, areas: BTreeMap<VirtAddr, VmArea> }`（类似 Linux VMA），支持 demand paging、CoW（后期）
+- **用户地址空间**（⚠️ 实际布局，全在 1 GiB 以下，比原设计简单）：
+  - 主程序 ELF 放在 `MMAP_BASE`(`0x2000_0000`) 下方的大空隙（`loader/mod.rs`）
+  - `mmap` 区从 `MMAP_BASE = 0x2000_0000` 向上长
+  - 用户栈顶 `USER_STACK_TOP = 0x4000_0000`，8 MiB，向下长
+  - （原设计的 `0x2aaa_…` interp、`0x3f_ffff_f000` 栈未采用）
+- **页表 Rust 抽象**：`PhysAddr`/`VirtAddr` newtype；`PageTable` 拥有根帧并在 Drop 时递归释放；用户进程的 `MemorySet`（类似 Linux VMA）。⚠️ **未实现 demand paging 与 CoW**：mmap 即时分配、fork 即时深拷贝（`alloc_uninit`+`copy_from_slice`，见 `memory_set.rs::fork`），用户缺页一律转成信号（无缺页重试、无写时复制）
 - **CSR 操作**：用 `riscv` crate（v0.11+）的 register 模块
 
 ## 进程 / 线程 / 调度
 - **task 结构**：`Task { tid, pid, tgid, mm: Arc<MemorySet>, files: Arc<FdTable>, sighand: Arc<SigHand>, state, kstack, trap_frame, ... }`
 - **clone 语义**：精确解析 flags；fork = 复制 mm + fd 表 + sighand；pthread_create = 全共享 + 新 tid + 设 tp + 写 child_tid
-- **调度器**：起步用 per-CPU FIFO runqueue + idle task；公平性放到后期（CFS 太复杂，先用 round-robin）
-- **时钟**：SBI timer，10 ms tick 起步
+- **调度器**（⚠️ 实际）：单 hart，全局 `TaskTable { tasks: BTreeMap<i32, Arc<Task>> }`，`pick_ready` 扫表选下一个 Ready，trap 边界 round-robin。**无 per-CPU runqueue、无专门 idle task**（无可运行任务时自旋扫醒睡眠/futex/网络队列）
+- **时钟**（⚠️ 实际）：SBI `set_timer`，**1 ms** 抢占片（10 MHz mtimer，`TIMER_QUANTUM_TICKS=10_000`），非 10 ms
 
 ## SMP 与同步
 - **per-CPU 数据**：`tp` 寄存器持有当前 hart 的 `CpuLocal` 结构体指针。**手工 offset 访问**，不依赖 `#[thread_local]`
-- **锁层次**：
-  - `RawSpinLock`：atomic CAS，不动中断（极少用）
-  - `SpinLock<T>`：进入时保存并禁本地 sie，释放时恢复——内核大部分场景用这个
-  - `Mutex<T>`：可睡眠锁，给 async 上下文用，底层挂 WaitQueue
+- **锁**（⚠️ 实际只有一种）：`sync::Mutex<T>`（包 `spin::Mutex`）。它**不关中断**，只 bump 一个 per-hart `preempt_disable` 软件计数；调度器在计数非 0 时拒绝切换（单 hart 上抢占持锁者会让下一个任务在锁上空转）。**关键副作用**：持锁时 timer 照常打、`watchdog_overrun()` 全 lock-free，所以持锁的内核 wedge 仍能被 per-syscall 看门狗观测到。原计划的"禁 sie 的 `SpinLock` + 可睡眠 `Mutex` + `WaitQueue`"未实现
 - **锁顺序约定**：mm_lock → vma_lock → page_table_lock；vfs_lock → inode_lock → page_cache_lock；fd_table_lock 独立
 - **多 hart 启动**：boot hart 做完早期初始化后通过 SBI `HSM hart_start` 唤醒其他 hart；其他 hart 从 `_secondary_start` 进入；全局 `AtomicUsize cpus_online` 同步
 - **TLB shootdown**：用 SBI `remote_sfence_vma(hart_mask, start, size)`，**不自己手搓 IPI shootdown**
@@ -65,13 +71,13 @@
 ## 异常与中断
 - **trap.S 模式**：`stvec` Direct 模式单入口，scause 高位分流中断/异常；用 `sscratch` 实现用户/内核栈切换
 - **保存范围**：汇编保存全部 31 个通用寄存器到 `TrapFrame`；FP 与 V 寄存器 lazy save（第一次 FP/V 异常时再处理）
-- **PLIC**：MMIO 0x0c00_0000；S-mode hart 0 的 context 是 1；标准 claim → dispatch → complete 流程
+- **PLIC**：⚠️ **未实现**。riscv64 不走外部中断——控制台用 SBI console，virtio 用**轮询**（trap 出口 `net::poll`、块设备同步读写），trap 只处理 SupervisorTimer + 异常，其它中断打印后屏蔽
 
 ## 设备驱动
 - **virtio**：用 `virtio-drivers` crate（rcore-os 维护，成熟），自己只实现 `Hal` trait（dma_alloc / phys_to_virt）
 - **总线**：只走 **virtio-mmio**（扫 0x10001000 起），不走 PCI
-- **UART**：QEMU virt 是 **NS16550A** @ 0x1000_0000；早期 boot 用 SBI console，驱动起来后切到 16550 + IRQ
-- **virtio-blk**：modern 接口；包到 `BlockDevice` trait 给 fatfs/ext4 用
+- **UART**（⚠️ 实际）：riscv64 **全程用 SBI legacy console**（`console_putchar/getchar`，`arch/riscv64/console.rs`），未切到 NS16550A + IRQ。（loongarch64 端直接 MMIO 16550）
+- **virtio-blk**：modern 接口；包到 `BlockDevice` trait 给自实现的 ext4/fat32 用
 - **virtio-net**：给 `smoltcp` 实现 `phy::Device`；buffer 池 `[u8; 1536]`
 - **目录树解析**：用 `fdt` crate 解析 DTB
 
@@ -82,8 +88,8 @@
   - **tmpfs**（自实现）：Inode 持有 `RwLock<Vec<u8>>` 或页帧列表
   - **devfs**（自实现）：硬编码 `null/zero/full/random/urandom/tty/console`
   - **procfs**（自实现）：动态生成，**必须支持** `/proc/self/exe`（musl ld.so 用它做 origin 解析）、`/proc/self/maps`、`/proc/self/cmdline`、`/proc/mounts`、`/proc/cpuinfo`
-- **持久 FS**：起步 **FAT32**（`fatfs` crate 读写稳）；后期可加 ext4 只读（`lwext4-rs`）
-- **initramfs**：cpio newc，启动早期解压到 tmpfs。**最早期 rootfs 路径**，避开块设备依赖
+- **持久 FS**（⚠️ 实际全自实现，无第三方 crate）：**ext4 只读**（`fs/ext4.rs`，评测盘主路径）+ **fat32**（`fs/fat32.rs`，本地 dev 盘）。**没用 `fatfs`/`lwext4-rs`**
+- **rootfs 构建**（⚠️ 实际，非 cpio）：`kmain` 把 `include_bytes!` 进内核的 busybox/git/loader 等直接装进 tmpfs，并铺 `/bin` `/lib` `/etc` `/dev` `/sys`。**没有 cpio/initramfs**
 
 ## Linux ABI（riscv64）
 - **syscall 编号**：直接采用 Linux `include/uapi/asm-generic/unistd.h` 的 generic riscv64 表
@@ -99,27 +105,25 @@
 ## 网络
 - **栈**：`smoltcp` 0.11+，作为单例 `NetStack { iface, sockets }`，spin Mutex 保护
 - **socket 层**：自实现 `KSocket: File` 把 Linux socket syscall 翻译到 smoltcp，使其纳入 fd 表
-- **驱动循环**：单独内核任务 `iface.poll(now, &mut device, &mut sockets)` + 网卡 IRQ 触发的 poll
-- **DNS**：用户态做，不在内核解析；`/etc/resolv.conf` 指向 10.0.2.3（QEMU user-net 内置）
+- **驱动循环**（⚠️ 实际）：在 trap 出口轮询 `iface.poll`（`schedule_next_after_trap` 调 `net::poll_with_progress`），**无独立 poll 任务、无网卡 IRQ**
+- **DNS**（⚠️ 实际）：`/etc/resolv.conf` 写 `nameserver 127.0.0.1`；smoltcp 启用 `socket-dns` feature + 内核内 127.0.0.1 loopback。非原设计的"用户态解析、指向 10.0.2.3"
 - **QEMU 网络**：`-netdev user,id=net0 -device virtio-net-device,netdev=net0` 即可出网
 
-## 关键 crate 依赖（确定）
+## 关键 crate 依赖（⚠️ 实际，以 `kernel/Cargo.toml` 为准）
 | 用途 | crate |
 |---|---|
-| SBI 调用 | `sbi-rt` |
-| CSR 操作 | `riscv` (0.11+) |
-| 物理分配器 | `buddy_system_allocator` |
-| 自旋锁/RwLock 起步 | `spin` |
-| 无 std HashMap | `hashbrown` |
-| bitflags | `bitflags` |
-| DTB 解析 | `fdt` |
-| ELF 解析 | `xmas-elf` |
-| cpio (initramfs) | `cpio_reader` |
-| virtio 驱动 | `virtio-drivers` |
-| FAT32 | `fatfs` |
-| ext4 (后期可选) | `lwext4-rs` |
-| 网络栈 | `smoltcp` |
-| 无锁队列 | `crossbeam-queue` |
+| SBI 调用（riscv64） | `sbi-rt`（legacy） |
+| CSR 操作（riscv64） | `riscv` 0.11 |
+| 帧分配 + 内核 heap | `buddy_system_allocator` 0.10（`LockedFrameAllocator` + `LockedHeap`） |
+| 自旋锁/RwLock | `spin` 0.9 |
+| bitflags | `bitflags` 2.6 |
+| DTB 解析 | `fdt` 0.1 |
+| ELF 解析 | `xmas-elf` 0.9 |
+| virtio 驱动 | `virtio-drivers` 0.7 |
+| 网络栈 | `smoltcp` 0.11 |
+| 日志 | `log` 0.4 |
+
+**自实现 / 未用 crate**：HashMap 改用 `alloc::collections::BTreeMap`、**ext4**（`fs/ext4.rs`）、**fat32**（`fs/fat32.rs`）、tmpfs/devfs/procfs、pipe/socket、信号、futex 均自实现。原设计列的 `hashbrown` / `cpio_reader` / `fatfs` / `lwext4-rs` / `crossbeam-queue` **均未使用**。（帧分配仍用 `buddy_system_allocator::LockedFrameAllocator`，非自实现。）
 
 ## 已有项目参考（不复制，只学）
 | 项目 | 借鉴 | 不借鉴 |
@@ -131,7 +135,7 @@
 | Starry / Starry-Next (ArceOS 家族) | clone/execve 干净实现、组件化 | 单地址空间宏架构选择 |
 | Maestro | Linux ABI 兼容广度 | — |
 
-## 仓库目录骨架（M0 时建立）
+## 仓库目录骨架（⚠️ M0 时的规划，已演进——实际目录见 HANDOFF「代码地图」；下树仅存历史，含未采用的 `rust-toolchain.toml`/`sched/`/`uart_16550.rs`/`plic.rs` 等）
 ```
 xiande-os/
 ├── Cargo.toml            # workspace
@@ -189,3 +193,4 @@ xiande-os/
   - **栈 trampoline → vDSO**：glibc/libgcc unwinder 需要 `.cfi_signal_frame`，故映射带 CFI 的 vDSO（`vdso.rs`）。
   - **FAT32 起步 → ext4 只读为评测主路径**（fat32 仅本地 dev 盘）。
   - 工具链：**不钉 nightly、不放 `rust-toolchain.toml`**（rustup 升级在评测机跨挂载点 rename 报 EXDEV）；内核零 unstable feature，stable 即可构建。
+- 2026-06-01（二次核对，对照代码逐条）：补记其余设计↔实现差异（正文已就地更正，索引见顶部「现状」表）——heap 无 slab；无 demand paging / CoW；调度用全局 `BTreeMap` 任务表而非 per-CPU runqueue，无 idle task；抢占片 1 ms 非 10 ms；PLIC / NS16550A 均未用（SBI console + virtio 轮询）；无 cpio initramfs（`kmain` 直接铺 tmpfs）；ext4 / fat32 自实现（未用 `fatfs` / `lwext4-rs`）；crate 表删去 `hashbrown` / `cpio_reader` / `crossbeam-queue` 等未用项；用户地址布局实际全在 1 GiB 以下；锁只有一种 preempt-safe `Mutex`（不关中断、无 sie 操作、无 WaitQueue），其"timer 照常打"是看门狗能兜住持锁 wedge 的前提。
