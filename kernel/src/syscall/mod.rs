@@ -4363,7 +4363,7 @@ fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: usize) -> isize {
 /// the interest set. Blocking-for-`timeout` precision isn't modelled (we report
 /// current readiness and return), which is enough for the functional/error
 /// cases; a no-event return is the same 0 the previous stub gave.
-fn sys_epoll_pwait(epfd: i32, events: usize, maxevents: i32, _timeout: i32) -> isize {
+fn sys_epoll_pwait(epfd: i32, events: usize, maxevents: i32, timeout: i32) -> isize {
     if maxevents <= 0 {
         return EINVAL;
     }
@@ -4402,10 +4402,42 @@ fn sys_epoll_pwait(epfd: i32, events: usize, maxevents: i32, _timeout: i32) -> i
             out.extend_from_slice(&data.to_le_bytes());
         }
     }
-    if !out.is_empty() && task.copy_out_bytes(events, &out).is_none() {
-        return EFAULT;
+    if !out.is_empty() {
+        if task.copy_out_bytes(events, &out).is_none() {
+            return EFAULT;
+        }
+        return (out.len() / 16) as isize;
     }
-    (out.len() / 16) as isize
+
+    // No fd is ready. epoll_wait(timeout) must block up to `timeout`
+    // milliseconds before returning 0 — returning immediately made the
+    // tst_timer_test precision check report "woken up early". timeout==0 is a
+    // non-blocking poll (return 0 now); timeout<0 blocks indefinitely.
+    if timeout == 0 {
+        return 0;
+    }
+    if timeout > 0 {
+        let now = crate::arch::now_ticks();
+        let deadline = crate::task::sleeper_deadline(task.pid).unwrap_or_else(|| {
+            // epoll timeout is in milliseconds → ticks (10 MHz: 1 ms = 10_000).
+            let d = now.saturating_add((timeout as u64).saturating_mul(crate::arch::TICKS_PER_SEC / 1000));
+            crate::task::sleep_until(task.pid, d);
+            d
+        });
+        if now >= deadline {
+            crate::task::forget_sleeper(task.pid);
+            return 0; // timed out, no events
+        }
+    }
+    // Park until an fd becomes ready or (for timeout>0) the deadline fires via
+    // wake_expired_sleepers. Rewind so the syscall re-runs and re-scans.
+    crate::task::wake_socket_waiters();
+    crate::task::mark_socket_waiter(task.pid);
+    *task.state.lock() = crate::task::TaskState::Waiting;
+    unsafe {
+        (*task.tf_ptr()).rewind_syscall();
+    }
+    0
 }
 
 // ---------- mmap / munmap / mprotect ----------
