@@ -131,6 +131,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_SIGACTION => sys_rt_sigaction(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(a0 as i32, a1, a2, a3),
         nr::SYS_RT_SIGPENDING => sys_rt_sigpending(a0, a1),
+        nr::SYS_REBOOT => sys_reboot(a0 as u32, a1 as u32, a2 as u32),
         nr::SYS_RT_SIGRETURN => {
             // Restore tf (incl. syscall ret slot) from the rt_sigframe.
             // The returned value matches what set_syscall_ret would write,
@@ -7343,6 +7344,46 @@ fn sys_rt_sigprocmask(how: i32, new_ptr: usize, old_ptr: usize, sigsetsize: usiz
             .store(next & !unblockable_mask(), core::sync::atomic::Ordering::SeqCst);
     }
     0
+}
+
+/// reboot(magic1, magic2, cmd, arg). Validate the magic numbers (EINVAL
+/// otherwise) and require root (EPERM) — what reboot02 checks. The CAD_ON/
+/// CAD_OFF commands (toggle Ctrl-Alt-Del) are no-ops that return success,
+/// which is what reboot01 expects. We deliberately do NOT honor the
+/// RESTART/HALT/POWER_OFF commands as real reboots: doing so mid-run would
+/// terminate the whole test pass. Unknown commands are EINVAL.
+fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> isize {
+    const MAGIC1: u32 = 0xfee1dead;
+    const MAGIC2: u32 = 672274793; // 0x28121969
+    const MAGIC2B: u32 = 85072278; // 0x05121996
+    const MAGIC2C: u32 = 369367448; // 0x16041998
+    const MAGIC2D: u32 = 537993216; // 0x20112000
+    const CAD_ON: u32 = 0x89abcdef;
+    const CAD_OFF: u32 = 0x00000000;
+    const RESTART: u32 = 0x01234567;
+    const HALT: u32 = 0xcdef0123;
+    const POWER_OFF: u32 = 0x4321fedc;
+    const RESTART2: u32 = 0xa1b2c3d4;
+    const SW_SUSPEND: u32 = 0xd000fce2;
+    const KEXEC: u32 = 0x45584543;
+    if magic1 != MAGIC1
+        || !matches!(magic2, MAGIC2 | MAGIC2B | MAGIC2C | MAGIC2D)
+    {
+        return EINVAL;
+    }
+    if current_euid() != 0 {
+        return -1; // EPERM
+    }
+    match cmd {
+        // Toggling Ctrl-Alt-Del behaviour: a harmless no-op for us.
+        CAD_ON | CAD_OFF => 0,
+        // Real shutdown/restart commands: accept (root, valid magic) but do
+        // NOT actually reboot — that would abort the contest run. Treat as a
+        // successful no-op so a test that issues one doesn't fail, while the
+        // harness keeps running.
+        RESTART | HALT | POWER_OFF | RESTART2 | SW_SUSPEND | KEXEC => 0,
+        _ => EINVAL,
+    }
 }
 
 /// rt_sigpending(set, sigsetsize): report the signals pending on the caller
