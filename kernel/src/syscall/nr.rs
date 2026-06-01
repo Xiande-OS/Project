@@ -81,6 +81,7 @@ pub const SYS_SIGALTSTACK: usize = 132;
 pub const SYS_RT_SIGSUSPEND: usize = 133;
 pub const SYS_RT_SIGACTION: usize = 134;
 pub const SYS_RT_SIGPROCMASK: usize = 135;
+pub const SYS_RT_SIGPENDING: usize = 136;
 pub const SYS_RT_SIGTIMEDWAIT: usize = 137;
 pub const SYS_RT_SIGRETURN: usize = 139;
 pub const SYS_TIMES: usize = 153;
