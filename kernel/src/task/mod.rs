@@ -492,6 +492,7 @@ pub fn reap(pid: i32) {
     crate::syscall::forget_timers(pid);
     crate::syscall::forget_personality(pid);
     crate::syscall::forget_umask(pid);
+    crate::syscall::forget_ioprio(pid);
 }
 
 /// Reap orphan zombies — Zombie tasks whose parent is no longer in the table

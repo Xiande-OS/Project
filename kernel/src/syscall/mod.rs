@@ -138,6 +138,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_TGSIGQUEUEINFO => sys_rt_sigqueueinfo(a1 as i32, a2 as i32, a3),
         nr::SYS_DELETE_MODULE => sys_delete_module(a0),
         nr::SYS_KCMP => sys_kcmp(a0 as i32, a1 as i32, a2 as i32, a3, a4),
+        nr::SYS_IOPRIO_SET => sys_ioprio_set(a0 as i32, a1 as i32, a2 as i32),
+        nr::SYS_IOPRIO_GET => sys_ioprio_get(a0 as i32, a1 as i32),
         nr::SYS_RT_SIGRETURN => {
             // Restore tf (incl. syscall ret slot) from the rt_sigframe.
             // The returned value matches what set_syscall_ret would write,
@@ -7436,6 +7438,53 @@ fn sys_kcmp(pid1: i32, pid2: i32, kind: i32, idx1: usize, idx2: usize) -> isize 
     } else {
         2
     }
+}
+
+/// Per-process I/O priority (ioprio_set/get). Encoded as (class<<13)|level,
+/// class in 0..=3 (NONE/RT/BE/IDLE), level in 0..8. Default best-effort/4.
+static IOPRIO: crate::sync::Mutex<alloc::collections::BTreeMap<i32, i32>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
+
+pub fn forget_ioprio(tgid: i32) {
+    IOPRIO.lock().remove(&tgid);
+}
+
+fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> isize {
+    const IOPRIO_WHO_PROCESS: i32 = 1;
+    if which != IOPRIO_WHO_PROCESS || who != 0 {
+        // We only model the calling process (who==0). Other targets: EINVAL.
+        if which < 1 || which > 3 {
+            return EINVAL;
+        }
+    }
+    let class = (ioprio >> 13) & 0x7;
+    let level = ioprio & 0x1fff;
+    // Valid classes: NONE(0), RT(1), BE(2), IDLE(3); level 0..8.
+    if class > 3 || level >= 8 {
+        return EINVAL;
+    }
+    // CLASS_NONE is only valid with priority 0 (it means "use the default");
+    // any nonzero level with NONE is EINVAL (ioprio_set03).
+    if class == 0 && level != 0 {
+        return EINVAL;
+    }
+    // RT class requires privilege (ioprio_set03 checks EPERM for non-root RT).
+    if class == 1 && current_euid() != 0 {
+        return -1; // EPERM
+    }
+    IOPRIO.lock().insert(cur_tgid(), ioprio);
+    0
+}
+
+fn sys_ioprio_get(which: i32, who: i32) -> isize {
+    const IOPRIO_WHO_PROCESS: i32 = 1;
+    if which != IOPRIO_WHO_PROCESS && (which < 1 || which > 3) {
+        return EINVAL;
+    }
+    let _ = who;
+    // Default to best-effort (class 2), level 4 — what a fresh process reports.
+    let default = (2 << 13) | 4;
+    IOPRIO.lock().get(&cur_tgid()).copied().unwrap_or(default) as isize
 }
 
 /// rt_sigpending(set, sigsetsize): report the signals pending on the caller
