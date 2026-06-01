@@ -2336,9 +2336,29 @@ fn sys_preadv(fd: i32, iov: usize, count: usize, off: u64) -> isize {
 }
 
 fn sys_pwritev(fd: i32, iov: usize, count: usize, off: u64) -> isize {
+    // Mirror preadv's argument validation (pwritev02): negative iovcnt/offset →
+    // EINVAL, a non-writable fd → EBADF, an iov total overflowing SSIZE_MAX →
+    // EINVAL. (pwritev2's -1 "current offset" routes to writev, not here.)
+    if (count as isize) < 0 || (off as i64) < 0 {
+        return EINVAL;
+    }
     if count == 0 { return 0; }
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    if !file.writable {
+        return EBADF; // fd not open for writing
+    }
+    {
+        let Some(b) = task.copy_in_bytes(iov, count * core::mem::size_of::<IoVec>()) else { return EFAULT };
+        let v = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const IoVec, count) };
+        let mut total: isize = 0;
+        for e in v {
+            total = match total.checked_add(e.len as isize) {
+                Some(t) if t >= 0 => t,
+                _ => return EINVAL,
+            };
+        }
+    }
     let Some(iovs_bytes) = task.copy_in_bytes(iov, count * core::mem::size_of::<IoVec>()) else { return EFAULT };
     let iovs = unsafe { core::slice::from_raw_parts(iovs_bytes.as_ptr() as *const IoVec, count) };
     let mut total = 0isize;
