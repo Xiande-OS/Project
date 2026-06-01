@@ -65,6 +65,13 @@ fn tmpfs_uncharge(bytes: usize) {
 
 pub struct TmpfsFile {
     data: Mutex<Vec<u8>>,
+    /// Logical file length. May exceed `data.len()` for a sparse file: a
+    /// `truncate`/`fallocate` that grows the file only bumps this (no heap is
+    /// charged) and the unbacked tail reads as zeros. LTP's tst_device
+    /// preallocates a 300 MiB backing image this way, then writes only a small
+    /// filesystem into it — without sparseness that 300 MiB blew past the
+    /// tmpfs cap (ENOSPC → "Failed to acquire device" → ~93 cases TBROK).
+    logical_len: core::sync::atomic::AtomicU64,
     pub meta: Mutex<Meta>,
     xattrs: XattrStore,
     /// F_SEAL_* bits set via fcntl(F_ADD_SEALS) — used by memfd_create. Stored
@@ -132,6 +139,7 @@ impl TmpfsFile {
     pub fn new() -> Self {
         Self {
             data: Mutex::new(Vec::new()),
+            logical_len: core::sync::atomic::AtomicU64::new(0),
             meta: Mutex::new(Meta::default()),
             xattrs: Mutex::new(BTreeMap::new()),
             seals: core::sync::atomic::AtomicU32::new(0),
@@ -147,16 +155,27 @@ impl Inode for TmpfsFile {
         FileType::Regular
     }
     fn size(&self) -> u64 {
-        self.data.lock().len() as u64
+        // Logical length wins for a sparse file (grown by truncate/fallocate
+        // past the materialised bytes).
+        let backed = self.data.lock().len() as u64;
+        core::cmp::max(backed, self.logical_len.load(Ordering::Relaxed))
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let data = self.data.lock();
+        let logical = core::cmp::max(
+            data.len() as u64,
+            self.logical_len.load(Ordering::Relaxed),
+        ) as usize;
         let off = offset as usize;
-        if off >= data.len() {
+        if off >= logical {
             return Ok(0);
         }
-        let n = core::cmp::min(buf.len(), data.len() - off);
-        buf[..n].copy_from_slice(&data[off..off + n]);
+        // Read may span materialised bytes then the sparse (zero) tail.
+        let n = core::cmp::min(buf.len(), logical - off);
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            let p = off + i;
+            *b = if p < data.len() { data[p] } else { 0 };
+        }
         Ok(n)
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
@@ -199,38 +218,36 @@ impl Inode for TmpfsFile {
             data.resize(end, 0);
         }
         data[off..end].copy_from_slice(buf);
+        // Keep the logical length at least as large as the written extent (a
+        // write into the middle of a sparse file mustn't shrink it).
+        let cur = self.logical_len.load(Ordering::Relaxed);
+        if (end as u64) > cur {
+            self.logical_len.store(end as u64, Ordering::Relaxed);
+        }
         Ok(buf.len())
     }
     fn truncate(&self, len: u64) -> Result<()> {
         let mut data = self.data.lock();
         let new_len = len as usize;
         if new_len > data.len() {
-            if data.capacity() < new_len {
-                let need = new_len - data.len();
-                if !tmpfs_charge(need) {
-                    return Err(ENOSPC);
-                }
-                let before = data.capacity();
-                if let Err(_e) = data.try_reserve(need) {
-                    tmpfs_uncharge(need);
-                    return Err(ENOSPC);
-                }
-                let grew = data.capacity() - before;
-                if grew >= need {
-                    tmpfs_charge(grew - need);
-                } else {
-                    tmpfs_uncharge(need - grew);
-                }
-            }
-            data.resize(new_len, 0);
-        } else if new_len < data.len() {
-            // Shrinking: hand the freed heap back to the global budget. resize()
+            // Grow SPARSELY: record the logical length but allocate nothing.
+            // The unbacked tail reads as zeros (see read_at) and is materialised
+            // only where a later write lands. This is what lets LTP preallocate
+            // a 300 MiB device image (fallocate/ftruncate) without consuming
+            // 300 MiB of the kernel heap — it then writes only a small fs into
+            // it. Charging the full size here was the "Failed to acquire
+            // device" ENOSPC that broke ~93 fs/mount cases.
+            self.logical_len.store(new_len as u64, Ordering::Relaxed);
+        } else {
+            // Shrinking (new_len <= data.len()): drop the materialised bytes
+            // past new_len and hand the freed heap back to the budget. resize()
             // alone keeps the old capacity, so a test that truncates a huge temp
             // file to 0 (a common teardown) would otherwise keep pinning it.
             let before = data.capacity();
             data.truncate(new_len);
             data.shrink_to_fit();
             tmpfs_uncharge(before.saturating_sub(data.capacity()));
+            self.logical_len.store(new_len as u64, Ordering::Relaxed);
         }
         Ok(())
     }
