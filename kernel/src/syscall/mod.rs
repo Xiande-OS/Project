@@ -4411,7 +4411,7 @@ fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: usize) -> isize {
 /// the interest set. Blocking-for-`timeout` precision isn't modelled (we report
 /// current readiness and return), which is enough for the functional/error
 /// cases; a no-event return is the same 0 the previous stub gave.
-fn sys_epoll_pwait(epfd: i32, events: usize, maxevents: i32, _timeout: i32) -> isize {
+fn sys_epoll_pwait(epfd: i32, events: usize, maxevents: i32, timeout: i32) -> isize {
     if maxevents <= 0 {
         return EINVAL;
     }
@@ -4450,10 +4450,60 @@ fn sys_epoll_pwait(epfd: i32, events: usize, maxevents: i32, _timeout: i32) -> i
             out.extend_from_slice(&data.to_le_bytes());
         }
     }
-    if !out.is_empty() && task.copy_out_bytes(events, &out).is_none() {
-        return EFAULT;
+    if !out.is_empty() {
+        if task.copy_out_bytes(events, &out).is_none() {
+            return EFAULT;
+        }
+        // An fd is ready: clear any pending epoll deadline and return.
+        crate::task::forget_sleeper(task.pid);
+        return (out.len() / 16) as isize;
     }
-    (out.len() / 16) as isize
+
+    // No fd is ready. epoll_wait must block up to `timeout` ms before returning
+    // 0 — the old stub returned immediately, which the tst_timer_test precision
+    // harness flagged as "woken up early". We park as Waiting with a SLEEPING_
+    // UNTIL deadline (the same mechanism nanosleep/rt_sigtimedwait use, woken by
+    // wake_expired_sleepers). On every re-entry we re-scan the fds above, so a
+    // descriptor that becomes ready before the deadline is reported then.
+    //
+    // Crucially we do NOT mark a socket-waiter here: epoll commonly watches
+    // pipes/eventfds, and a stale socket-waiter entry from a watchdog-killed
+    // epoll task corrupted the global wait set and wedged unrelated processes
+    // (which zeroed the whole glibc suite). Deadline-only wakeups can't leak:
+    // wake_expired_sleepers ignores dead pids and exit clears the entry.
+    if timeout == 0 {
+        return 0; // non-blocking poll
+    }
+    let now = crate::arch::now_ticks();
+    // timeout > 0: real millisecond deadline. timeout < 0 (block "forever"):
+    // bound it so a never-ready fd can't wedge the task past the watchdog —
+    // re-entry keeps re-arming, so functionally it still blocks indefinitely
+    // while staying interruptible/observable.
+    let want_ticks = if timeout > 0 {
+        (timeout as u64).saturating_mul(crate::arch::TICKS_PER_SEC / 1000)
+    } else {
+        crate::arch::TICKS_PER_SEC // 1s re-scan cadence for "infinite" waits
+    };
+    let deadline = crate::task::sleeper_deadline(task.pid).unwrap_or_else(|| {
+        let d = now.saturating_add(want_ticks);
+        crate::task::sleep_until(task.pid, d);
+        d
+    });
+    if timeout > 0 && now >= deadline {
+        crate::task::forget_sleeper(task.pid);
+        return 0; // timed out with no events
+    }
+    if timeout < 0 && now >= deadline {
+        // "Infinite" wait re-scan tick elapsed with still nothing ready: re-arm
+        // a fresh interval and keep waiting (the syscall re-runs).
+        crate::task::forget_sleeper(task.pid);
+    }
+    // Park: mark Waiting + rewind so the ecall re-runs (and re-scans) on wake.
+    *task.state.lock() = crate::task::TaskState::Waiting;
+    unsafe {
+        (*task.tf_ptr()).rewind_syscall();
+    }
+    0
 }
 
 // ---------- mmap / munmap / mprotect ----------
