@@ -448,9 +448,9 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 ));
                 s.push_str(&alloc::format!(
                     "./busybox timeout -s KILL {b} ./busybox sh -c 'cd {d}/ltp/testcases/bin 2>/dev/null || exit 0; \
-                     WL=\" {wl} \"; SKIP=\" {skip} \"; \
+                     WL=\" {wl} \"; SKIP=\" {skip} \"; ELFM=\"$({d}/busybox printf '\\177ELF')\"; \
                      for t in $WL; do [ -f \"$t\" ] || continue; {d}/busybox echo \"RUN LTP CASE $t\"; {d}/busybox setsid {d}/busybox timeout -s KILL 5 \"./$t\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $t : $?\"; {d}/busybox rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; done; \
-                     for f in *; do [ -f \"$f\" ] || continue; case \"$f\" in *.sh|cgroup_*|cpuctl_*|cpuacct_*|cpuset_*|cpuhotplug_*|genload|ebizzy|crash0?|hackbench|messaging|pidns*|pid_namespace*|mmap1|mmap2|mmap3|mmap-corruption*|mmapstress*|growfiles|growstack*) continue ;; esac; case \"$WL\" in *\" $f \"*) continue ;; esac; case \"$SKIP\" in *\" $f \"*) continue ;; esac; {d}/busybox echo \"RUN LTP CASE $f\"; {d}/busybox setsid {d}/busybox timeout -s KILL 3 \"./$f\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $f : $?\"; {d}/busybox rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; done'\n",
+                     for f in *; do [ -f \"$f\" ] || continue; case \"$f\" in *.sh|*datafile*|*_data|*.dat|cgroup_*|cpuctl_*|cpuacct_*|cpuset_*|cpuhotplug_*|genload|ebizzy|crash0?|hackbench|messaging|pidns*|pid_namespace*|mmap1|mmap2|mmap3|mmap-corruption*|mmapstress*|growfiles|growstack*) continue ;; esac; case \"$WL\" in *\" $f \"*) continue ;; esac; case \"$SKIP\" in *\" $f \"*) continue ;; esac; case \"$({d}/busybox head -c4 \"./$f\" 2>/dev/null)\" in $ELFM) : ;; *) continue ;; esac; {d}/busybox echo \"RUN LTP CASE $f\"; {d}/busybox setsid {d}/busybox timeout -s KILL 3 \"./$f\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $f : $?\"; {d}/busybox rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; done'\n",
                     b = budget,
                     d = dir,
                     wl = LTP_WHITELIST,

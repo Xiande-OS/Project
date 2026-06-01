@@ -4537,11 +4537,13 @@ fn meta_of_inode(inode: &Arc<dyn Inode>) -> Option<&Arc<dyn Inode>> {
 }
 
 fn apply_mode(inode: &Arc<dyn Inode>, mode: u32) {
-    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
-        f.meta.lock().mode = mode & 0o7777;
-    } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
-        d.meta.lock().mode = mode & 0o7777;
-    }
+    // Use the inode's own set_mode (tmpfs persists in Meta; the ext4 overlay
+    // stores a per-inode override). Falls through harmlessly for inode types
+    // that don't carry mode. Previously this only handled tmpfs by downcast, so
+    // chmod on an ext4-backed file (where the LTP chmod/stat/fcntl tests create
+    // their files) was a silent no-op — failing on LoongArch while passing on
+    // RISC-V purely because of where the temp files landed.
+    inode.set_mode(mode);
 }
 
 /// POSIX rule for the setuid/setgid bits after a successful chown: the
@@ -4559,17 +4561,12 @@ fn chown_clear_mode(mode: u32) -> u32 {
 }
 
 fn apply_owner(inode: &Arc<dyn Inode>, uid: u32, gid: u32) {
-    // chown(-1) (== u32::MAX) leaves that field unchanged.
-    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
-        let mut m = f.meta.lock();
-        if uid != u32::MAX { m.uid = uid; }
-        if gid != u32::MAX { m.gid = gid; }
-        m.mode = chown_clear_mode(m.mode);
-    } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
-        let mut m = d.meta.lock();
-        if uid != u32::MAX { m.uid = uid; }
-        if gid != u32::MAX { m.gid = gid; }
-        m.mode = chown_clear_mode(m.mode);
+    // chown(-1) (== u32::MAX) leaves that field unchanged. Uses the inode's own
+    // set_owner (tmpfs Meta or ext4 overlay override) so chown works on
+    // ext4-backed files too, then clears setuid/setgid as POSIX requires.
+    inode.set_owner(uid, gid);
+    if let Some((mode, _, _)) = inode.meta_perm() {
+        inode.set_mode(chown_clear_mode(mode));
     }
 }
 
@@ -5243,19 +5240,14 @@ fn sys_getitimer(which: usize, cur_val: usize) -> isize {
 /// Meta (the rootfs is tmpfs, so LTP's tmpdir files carry their real chmod);
 /// everything else falls back to conventional defaults.
 fn inode_perm(inode: &Arc<dyn Inode>) -> (u32, u32, u32) {
-    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
-        let m = *f.meta.lock();
-        (m.mode & 0o7777, m.uid, m.gid)
-    } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
-        let m = *d.meta.lock();
-        (m.mode & 0o7777, m.uid, m.gid)
-    } else {
-        let def = match inode.kind() {
-            FileType::Directory => 0o755,
-            _ => 0o644,
-        };
-        (def, 0, 0)
+    if let Some((mode, uid, gid)) = inode.meta_perm() {
+        return (mode & 0o7777, uid, gid);
     }
+    let def = match inode.kind() {
+        FileType::Directory => 0o755,
+        _ => 0o644,
+    };
+    (def, 0, 0)
 }
 
 /// Permission check for the *effective* uid/gid (used by open/creat/mkdir,
@@ -5715,22 +5707,31 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
         FileType::Pipe => 0o010000,
         FileType::Symlink => 0o120000,
     };
-    let (mode_bits, uid, gid, atime, mtime, ctime) = if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+    // Timestamps come from a tmpfs Meta when present (ext4 overlay doesn't
+    // track them — zero is fine). Mode/uid/gid come from meta_perm(), which
+    // every inode type implements: tmpfs reads its Meta, the ext4 overlay reads
+    // its chmod/chown override or the on-disk mode. This is what makes chmod/
+    // chown/stat consistent on ext4-backed test files (the LA chmod/stat/fcntl
+    // fix); previously stat fell through to a hardcoded default for ext4.
+    let (atime, mtime, ctime) = if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
         let m = *f.meta.lock();
-        (m.mode, m.uid, m.gid, (m.atime_sec, m.atime_nsec), (m.mtime_sec, m.mtime_nsec), (m.ctime_sec, m.ctime_nsec))
+        ((m.atime_sec, m.atime_nsec), (m.mtime_sec, m.mtime_nsec), (m.ctime_sec, m.ctime_nsec))
     } else if let Some(d) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
         let m = *d.meta.lock();
-        (m.mode, m.uid, m.gid, (m.atime_sec, m.atime_nsec), (m.mtime_sec, m.mtime_nsec), (m.ctime_sec, m.ctime_nsec))
+        ((m.atime_sec, m.atime_nsec), (m.mtime_sec, m.mtime_nsec), (m.ctime_sec, m.ctime_nsec))
     } else {
-        let mode_default = match inode.kind() {
+        ((0, 0), (0, 0), (0, 0))
+    };
+    let (mode_bits, uid, gid) = inode.meta_perm().unwrap_or_else(|| {
+        let d = match inode.kind() {
             FileType::Regular => 0o644,
             FileType::Directory => 0o755,
             FileType::CharDevice => 0o666,
             FileType::Pipe => 0o600,
             FileType::Symlink => 0o777,
         };
-        (mode_default, 0, 0, (0, 0), (0, 0), (0, 0))
-    };
+        (d, 0, 0)
+    });
     s.st_mode = (type_bits | (mode_bits & 0o7777)) as u32;
     // Report a real device number for /dev/* char devices. glibc's daemon()
     // checks st_rdev == makedev(1,3) for /dev/null, so 0 makes it ENODEV.

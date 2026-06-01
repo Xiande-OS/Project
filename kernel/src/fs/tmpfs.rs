@@ -151,6 +151,20 @@ impl Inode for TmpfsFile {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn meta_perm(&self) -> Option<(u32, u32, u32)> {
+        let m = self.meta.lock();
+        Some((m.mode & 0o7777, m.uid, m.gid))
+    }
+    fn set_mode(&self, mode: u32) -> bool {
+        self.meta.lock().mode = mode & 0o7777;
+        true
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> bool {
+        let mut m = self.meta.lock();
+        if uid != u32::MAX { m.uid = uid; }
+        if gid != u32::MAX { m.gid = gid; }
+        true
+    }
     fn kind(&self) -> FileType {
         FileType::Regular
     }
@@ -318,6 +332,20 @@ pub fn downcast_dir(inode: &Arc<dyn Inode>) -> Option<Arc<TmpfsDir>> {
 impl Inode for TmpfsDir {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn meta_perm(&self) -> Option<(u32, u32, u32)> {
+        let m = self.meta.lock();
+        Some((m.mode & 0o7777, m.uid, m.gid))
+    }
+    fn set_mode(&self, mode: u32) -> bool {
+        self.meta.lock().mode = mode & 0o7777;
+        true
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> bool {
+        let mut m = self.meta.lock();
+        if uid != u32::MAX { m.uid = uid; }
+        if gid != u32::MAX { m.gid = gid; }
+        true
     }
     fn kind(&self) -> FileType {
         FileType::Directory

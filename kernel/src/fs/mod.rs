@@ -243,6 +243,28 @@ pub trait Inode: Send + Sync + core::any::Any {
     fn xattr_remove(&self, _name: &str) -> Result<()> {
         Err(ENODATA)
     }
+
+    /// POSIX metadata accessors used by stat/chmod/chown. The default returns
+    /// `None`, meaning "no stored metadata — the caller uses a type-based
+    /// default". tmpfs inodes carry a real Meta (so chmod/chown/utimes persist
+    /// and stat reads them back); the ext4 overlay stores per-inode overrides
+    /// so chmod/chown work on disk-backed files too (the LTP chmod/stat/fcntl
+    /// family creates its test files on the mounted ext4, where without this
+    /// chmod was a no-op and stat always read the 0644 default — failing on LA
+    /// while passing on RV, where the same files happened to be tmpfs-backed).
+    /// Returns (mode_perm_bits, uid, gid).
+    fn meta_perm(&self) -> Option<(u32, u32, u32)> {
+        None
+    }
+    /// Set the permission bits (chmod). Returns false if unsupported.
+    fn set_mode(&self, _mode: u32) -> bool {
+        false
+    }
+    /// Set owner uid/gid (chown); a value of u32::MAX leaves that field. Returns
+    /// false if unsupported.
+    fn set_owner(&self, _uid: u32, _gid: u32) -> bool {
+        false
+    }
 }
 
 /// In-memory symlink: stores the target path plus its own xattr table (the

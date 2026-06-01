@@ -366,6 +366,8 @@ pub struct Ext4Dir {
     children: Mutex<Option<BTreeMap<String, Arc<dyn Inode>>>>,
     overlay_added: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
     overlay_deleted: Mutex<BTreeSet<String>>,
+    /// chmod/chown override (mode_perm_bits, uid, gid). None = read from disk.
+    perm: Mutex<Option<(u32, u32, u32)>>,
 }
 
 pub struct Ext4File {
@@ -373,6 +375,8 @@ pub struct Ext4File {
     ino: u32,
     cached: Mutex<Option<Arc<[u8]>>>,
     mutated: Mutex<Option<Vec<u8>>>,
+    /// chmod/chown override (mode_perm_bits, uid, gid). None = read from disk.
+    perm: Mutex<Option<(u32, u32, u32)>>,
 }
 
 impl Ext4Dir {
@@ -406,6 +410,7 @@ impl Ext4Dir {
                     children: Mutex::new(None),
                     overlay_added: Mutex::new(BTreeMap::new()),
                     overlay_deleted: Mutex::new(BTreeSet::new()),
+                    perm: Mutex::new(None),
                 }),
                 7 => {
                     // Symlink — present as a regular file holding the target.
@@ -414,6 +419,7 @@ impl Ext4Dir {
                         ino: child_ino,
                         cached: Mutex::new(None),
                         mutated: Mutex::new(None),
+                    perm: Mutex::new(None),
                     })
                 }
                 _ => Arc::new(Ext4File {
@@ -421,6 +427,7 @@ impl Ext4Dir {
                     ino: child_ino,
                     cached: Mutex::new(None),
                     mutated: Mutex::new(None),
+                    perm: Mutex::new(None),
                 }),
             };
             map.insert(name, child);
@@ -432,6 +439,27 @@ impl Ext4Dir {
 
 impl Inode for Ext4Dir {
     fn as_any(&self) -> &dyn Any { self }
+    fn meta_perm(&self) -> Option<(u32, u32, u32)> {
+        if let Some(p) = *self.perm.lock() {
+            return Some(p);
+        }
+        let mode = self.fs.read_inode(self.ino).map(|i| (i.mode & 0o7777) as u32).unwrap_or(0o755);
+        Some((mode, 0, 0))
+    }
+    fn set_mode(&self, mode: u32) -> bool {
+        let mut p = self.perm.lock();
+        let cur = p.unwrap_or((0o755, 0, 0));
+        *p = Some((mode & 0o7777, cur.1, cur.2));
+        true
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> bool {
+        let mut p = self.perm.lock();
+        let cur = p.unwrap_or((0o755, 0, 0));
+        let nu = if uid != u32::MAX { uid } else { cur.1 };
+        let ng = if gid != u32::MAX { gid } else { cur.2 };
+        *p = Some((cur.0, nu, ng));
+        true
+    }
     fn kind(&self) -> FileType { FileType::Directory }
     fn size(&self) -> u64 { 0 }
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
@@ -529,6 +557,30 @@ impl Ext4File {
 
 impl Inode for Ext4File {
     fn as_any(&self) -> &dyn Any { self }
+    fn meta_perm(&self) -> Option<(u32, u32, u32)> {
+        if let Some(p) = *self.perm.lock() {
+            return Some(p);
+        }
+        let mode = self.fs.read_inode(self.ino).map(|i| (i.mode & 0o7777) as u32).unwrap_or(0o644);
+        Some((mode, 0, 0))
+    }
+    fn set_mode(&self, mode: u32) -> bool {
+        let mut p = self.perm.lock();
+        let cur = p.unwrap_or((0o644, 0, 0));
+        *p = Some((mode & 0o7777, cur.1, cur.2));
+        true
+    }
+    fn set_owner(&self, uid: u32, gid: u32) -> bool {
+        let mut p = self.perm.lock();
+        let cur = p.unwrap_or_else(|| {
+            let m = self.fs.read_inode(self.ino).map(|i| (i.mode & 0o7777) as u32).unwrap_or(0o644);
+            (m, 0, 0)
+        });
+        let nu = if uid != u32::MAX { uid } else { cur.1 };
+        let ng = if gid != u32::MAX { gid } else { cur.2 };
+        *p = Some((cur.0, nu, ng));
+        true
+    }
     fn kind(&self) -> FileType {
         let raw = match self.fs.read_inode(self.ino) {
             Ok(r) => r,
@@ -629,6 +681,7 @@ pub fn mount() -> core::result::Result<Arc<dyn Inode>, &'static str> {
         children: Mutex::new(None),
         overlay_added: Mutex::new(BTreeMap::new()),
         overlay_deleted: Mutex::new(BTreeSet::new()),
+                    perm: Mutex::new(None),
     });
     Ok(root)
 }
