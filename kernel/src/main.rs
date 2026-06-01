@@ -252,6 +252,8 @@ nogroup:x:65533:\n",
     println!("[ok] heap + frame allocator + trap vector + vfs + /bin + /lib + /dev/shm");
 
     if let Some(_blk) = drivers::virtio_blk::init() {
+        // Bring-up smoke test of the writable ext2 scratch (x1).
+        fs::ext2::smoke_test();
         // Contest mode mounts EXT4 inside contest_runner — skip FAT32
         // probe here. Dev builds still get a FAT32 attempt for the
         // local disk.img convenience.

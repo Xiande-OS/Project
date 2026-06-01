@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use crate::sync::Mutex; use spin::Once;
 
 pub mod devfs;
+pub mod ext2;
 pub mod ext4;
 pub mod fat32;
 pub mod pipe;
