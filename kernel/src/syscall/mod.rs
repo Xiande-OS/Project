@@ -2283,9 +2283,37 @@ fn sys_fstatfs(fd: i32, buf: usize) -> isize {
 }
 
 fn sys_preadv(fd: i32, iov: usize, count: usize, off: u64) -> isize {
+    // Argument validation preadv02 checks: negative iovcnt (arrives as a huge
+    // usize) → EINVAL; negative offset (arrives as a huge u64, top bit set) →
+    // EINVAL; bad/non-readable fd → EBADF; a directory fd → EISDIR; an invalid
+    // iov_len (overflowing the signed total) → EINVAL.
+    if (count as isize) < 0 {
+        return EINVAL;
+    }
+    if (off as i64) < 0 {
+        return EINVAL;
+    }
     if count == 0 { return 0; }
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
+    if !file.readable {
+        return EBADF; // fd not open for reading
+    }
+    if file.inode.kind() == FileType::Directory {
+        return -21; // EISDIR
+    }
+    // Validate the iov array's total length is non-negative (EINVAL otherwise).
+    {
+        let Some(b) = task.copy_in_bytes(iov, count * core::mem::size_of::<IoVec>()) else { return EFAULT };
+        let v = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const IoVec, count) };
+        let mut total: isize = 0;
+        for e in v {
+            total = match total.checked_add(e.len as isize) {
+                Some(t) if t >= 0 => t,
+                _ => return EINVAL, // iov_len invalid / overflows SSIZE_MAX
+            };
+        }
+    }
     let Some(iovs_bytes) = task.copy_in_bytes(iov, count * core::mem::size_of::<IoVec>()) else { return EFAULT };
     let iovs = unsafe { core::slice::from_raw_parts(iovs_bytes.as_ptr() as *const IoVec, count) };
     let mut total = 0isize;
