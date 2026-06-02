@@ -29,7 +29,7 @@ jobs:
   ltp:
     name: ltp-${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -94,8 +94,9 @@ jobs:
       - name: Run full LTP under QEMU
         run: |
           chmod +x ci/*.sh
-          # Generous wall cap; the in-kernel ltp group budget (~2000s) governs.
-          bash ci/run-qemu.sh "${{ matrix.arch }}" "ci/img/${{ matrix.name }}.img" "${{ matrix.name }}" 2700 \
+          # Generous wall cap so the slow TCG guest reaches its in-kernel ltp
+          # budget (~2000 guest-s) and emits END before the host wall fires.
+          bash ci/run-qemu.sh "${{ matrix.arch }}" "ci/img/${{ matrix.name }}.img" "${{ matrix.name }}" 3600 \
             | tee "ci/${{ matrix.name }}.log"
 
       - name: Parse results + gate
