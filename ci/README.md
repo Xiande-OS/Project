@@ -1,39 +1,51 @@
 # CI — LTP quality control
 
-`.github/workflows/ci.yml` (`ltp-ci`) builds the kernel and runs a curated LTP
-sweep under QEMU across **4 cells**: `rv-musl`, `rv-glibc`, `la-musl`,
+`.github/workflows/ci.yml` (`ltp-ci`) builds the kernel and runs the **full LTP
+suite** under QEMU across **4 cells**: `rv-musl`, `rv-glibc`, `la-musl`,
 `la-glibc`. Triggered on push / PR / manual dispatch.
 
-## How it fits in ~14 GB
+## Test images (you provide these)
 
-Each matrix cell is an independent runner and handles **one** variant only:
+CI does **not** build test images (building LTP in the runner hung on flaky
+third-party mirrors). Instead each cell **downloads a prebuilt full-suite image**
+from the `test-images` release on the mirror:
 
-- kernel build (cargo, cached in `cargo-<arch>-…`),
-- **one** small test image — a curated LTP subset (`ci/ltp-cases.txt`), not the
-  full ~2800-case suite — cached in `img-<cell>-…`,
-- a 512 MiB sparse scratch disk (`/dev/sdb`) created at run time.
+    https://github.com/Xiande-OS/Project/releases/tag/test-images
 
-The job frees the runner's pre-installed bulk (dotnet, Android SDK, …) first.
-Image caches stay small (subset → tens–hundreds of MB each), well under the
-10 GB per-repo cache budget across all 4 cells.
+Expected assets — one single-variant image per cell:
 
-## Image acquisition (in order)
+    sdcard-rv-musl.img   sdcard-rv-glibc.img
+    sdcard-la-musl.img   sdcard-la-glibc.img
 
-1. **cache hit** → reuse (fast path; the common case).
-2. **`TEST_IMAGE_BASE_URL` set** (repo secret or variable) → download
-   `sdcard-<arch>-<libc>.img` — byte-for-byte what the grader runs
-   (recommended; **required for `la-musl`**, see caveat).
-3. **build from source** → clone upstream LTP `20240524`, cross-compile the
-   subset, build a static busybox, assemble an ext2 image.
+Each holds that variant's `busybox` + `lib/` + `ltp/` tree under `/<libc>/` (the
+in-kernel runner generates its own ltp driver, so a `ltp_testcode.sh` trigger is
+enough).
 
-Toolchains for path 3: `rv-glibc`/`la-glibc` use the distro cross-gcc;
-`rv-musl` pulls a musl cross from musl.cc.
+### Producing them from the official sdcards
 
-### Caveat: `la-musl`
+The official contest images are per-arch and combined (both `/musl` and
+`/glibc`). Split each into the two per-cell uploads with `ci/split-sdcard.sh`:
 
-There is no packaged musl/LoongArch cross-toolchain, so `la-musl` **cannot
-build from source** — it needs path 2 (`TEST_IMAGE_BASE_URL` with
-`sdcard-la-musl.img`). The other three cells build from source out of the box.
+    sudo ci/split-sdcard.sh rv  /path/sdcard-rv.img  ./out
+    sudo ci/split-sdcard.sh la  /path/sdcard-la.img  ./out
+    # → out/sdcard-{rv,la}-{musl,glibc}.img  →  upload all 4 to the release
+
+After re-uploading images, bump `IMG_VERSION` in `ci.yml` to refresh the cache.
+
+## How it works per cell
+
+1. build the kernel (cargo `--offline` with the vendored crates; cached in
+   `cargo-<arch>-…`),
+2. download the cell's image (cached in `img-<cell>-<IMG_VERSION>`; the download
+   runs only on a cache miss),
+3. boot it under QEMU exactly as the grader does (RV virtio-mmio, LA virtio-pci)
+   with a 512 MiB scratch `/dev/sdb` for `.needs_device` cases, full-suite wall
+   cap 2700 s (the in-kernel ltp budget ~2000 s governs),
+4. parse + gate (`ci/parse-ltp.sh`).
+
+Runner disk (~14 GB) is fine: one single-variant image per cell, the runner's
+pre-installed bulk freed first. Image caches (one per cell) stay under the 10 GB
+per-repo cache budget.
 
 ## Pass/fail gate (`ci/parse-ltp.sh`)
 
@@ -43,6 +55,6 @@ ltp group that started but never ended, or the rc==0 case count dropping below
 
 **Baselines** are not committed yet. After the first green run, read each cell's
 "cases rc==0" from its log and commit it as `ci/baseline/<cell>.txt` (e.g.
-`echo 57 > ci/baseline/rv-glibc.txt`). The gate then catches regressions; bump a
-baseline deliberately when a cell legitimately improves (CI prints a notice when
-it does).
+`echo 1771 > ci/baseline/rv-glibc.txt`). The gate then catches regressions; bump
+a baseline deliberately when a cell legitimately improves (CI prints a notice
+when it does).

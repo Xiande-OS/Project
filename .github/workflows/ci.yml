@@ -1,17 +1,16 @@
 name: ltp-ci
 
-# Quality-control CI: build the kernel for each platform and run a curated
-# LTP sweep under QEMU, across the 4 cells RV/LA x musl/glibc. Designed for a
-# GitHub-hosted runner's ~14 GB of free disk: each cell handles ONE variant
-# image (curated subset, small), aggressively frees space, and caches the
-# expensive build outputs (cargo target dir + the assembled test image).
+# Quality-control CI: build the kernel for each platform and run the FULL LTP
+# suite under QEMU, across the 4 cells RV/LA x musl/glibc. Test images are
+# prebuilt full-suite sdcards downloaded from the 'test-images' release (CI does
+# not build them — that hung on flaky mirrors). Downloaded images are cached so
+# the download happens only when a cell's image (or IMG_VERSION) changes.
 
 on:
   push:
   pull_request:
   workflow_dispatch:
 
-# One in-flight run per ref; a newer push cancels the older run.
 concurrency:
   group: ltp-ci-${{ github.ref }}
   cancel-in-progress: true
@@ -19,10 +18,18 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Public Releases CDN on the mirror. Override with a repo variable of the same
+  # name to point elsewhere.
+  TEST_IMG_BASE: https://github.com/Xiande-OS/Project/releases/download/test-images
+  # Bump when you re-upload images, to invalidate the per-cell image cache.
+  IMG_VERSION: v1
+
 jobs:
   ltp:
     name: ltp-${{ matrix.name }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -31,35 +38,28 @@ jobs:
           - { name: rv-glibc, arch: rv, libc: glibc }
           - { name: la-musl,  arch: la, libc: musl }
           - { name: la-glibc, arch: la, libc: glibc }
-    env:
-      # Bump to force a rebuild of every cached test image.
-      IMG_VERSION: v1
-      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space (target ~14 GB)
+      - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          sudo docker image prune -af || true
           df -h /
 
-      - name: Install build + run deps
+      - name: Install QEMU + cross linker
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-misc qemu-system-riscv64 \
-            gcc-riscv64-linux-gnu gcc-14-loongarch64-linux-gnu \
-            e2fsprogs file bzip2 curl
+            gcc-riscv64-linux-gnu gcc-14-loongarch64-linux-gnu curl
           qemu-system-riscv64 --version | head -1
           qemu-system-loongarch64 --version | head -1
 
       - name: Install Rust target
-        run: |
-          rustup target add ${{ matrix.arch == 'rv' && 'riscv64gc-unknown-none-elf' || 'loongarch64-unknown-none' }}
+        run: rustup target add ${{ matrix.arch == 'rv' && 'riscv64gc-unknown-none-elf' || 'loongarch64-unknown-none' }}
 
-      - name: Cache cargo build (per arch)
+      - name: Cache cargo build
         uses: actions/cache@v4
         with:
           path: |
@@ -83,21 +83,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ci/img/${{ matrix.name }}.img
-          key: img-${{ matrix.name }}-${{ env.IMG_VERSION }}-${{ hashFiles('ci/make-testimg.sh','ci/ltp-cases.txt') }}
+          key: img-${{ matrix.name }}-${{ env.IMG_VERSION }}
 
-      - name: Build test image (on cache miss)
+      - name: Download test image (on cache miss)
         if: steps.imgcache.outputs.cache-hit != 'true'
-        env:
-          # Optional: host faithful prebuilt images at <base>/sdcard-<arch>-<libc>.img
-          TEST_IMAGE_URL: ${{ secrets.TEST_IMAGE_BASE_URL }}
         run: |
           chmod +x ci/*.sh
           bash ci/make-testimg.sh "${{ matrix.arch }}" "${{ matrix.libc }}" "ci/img/${{ matrix.name }}.img"
 
-      - name: Run LTP under QEMU
+      - name: Run full LTP under QEMU
         run: |
           chmod +x ci/*.sh
-          bash ci/run-qemu.sh "${{ matrix.arch }}" "ci/img/${{ matrix.name }}.img" "${{ matrix.name }}" 600 \
+          # Generous wall cap; the in-kernel ltp group budget (~2000s) governs.
+          bash ci/run-qemu.sh "${{ matrix.arch }}" "ci/img/${{ matrix.name }}.img" "${{ matrix.name }}" 2700 \
             | tee "ci/${{ matrix.name }}.log"
 
       - name: Parse results + gate
