@@ -487,12 +487,6 @@ impl MemorySet {
         self.areas.clear();
     }
 
-    /// Resident user frames (RSS), summed across all areas. Used by the OOM
-    /// killer to pick the largest memory hog as its victim.
-    pub fn resident_frames(&self) -> usize {
-        self.areas.iter().map(|a| a.frames.len()).sum()
-    }
-
     /// Unmap and free the single VmArea at index `idx`, clearing its PTEs,
     /// flushing the local TLB, and dropping the backing frames. Returns the
     /// freed area so the caller can inspect its bounds.
