@@ -12,8 +12,9 @@
 //! dir entries. No journal (that's ext3/4), no extents, no htree — a plain
 //! ext2, which Linux mounts as ext2/ext3/ext4.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use crate::drivers::virtio_blk::BlockDevice;
@@ -85,6 +86,14 @@ struct SuperBlock {
 pub struct Ext2Fs {
     dev: Arc<BlockDevice>,
     sb: Mutex<SuperBlock>,
+    /// Inode cache: returns a STABLE Arc per on-disk inode number so the same
+    /// file reached via different paths (e.g. a bind mount) is the same Arc.
+    /// fanotify marks are keyed by Arc identity (ptr_eq); without this, a mark
+    /// added via one path never matches an event whose target was looked up via
+    /// another, so ignore masks fail to suppress (fanotify10/16). Holds Weak so
+    /// it never keeps an inode alive — no Ext2Fs<->Ext2Inode Arc cycle — and a
+    /// dropped inode's slot simply fails to upgrade and is replaced.
+    inode_cache: Mutex<BTreeMap<u32, Weak<Ext2Inode>>>,
 }
 
 /// Read fs-block `blk` (BLOCK_SIZE bytes) into `buf`.
@@ -489,7 +498,11 @@ pub fn mount(dev: Arc<BlockDevice>) -> Result<Arc<Ext2Fs>> {
         inode_bitmap: rd32(&gd, 4),
         inode_table: rd32(&gd, 8),
     };
-    Ok(Arc::new(Ext2Fs { dev, sb: Mutex::new(sb) }))
+    Ok(Arc::new(Ext2Fs {
+        dev,
+        sb: Mutex::new(sb),
+        inode_cache: Mutex::new(BTreeMap::new()),
+    }))
 }
 
 /// Lay down a fresh single-group ext2 filesystem on `dev`, sized to the
@@ -840,7 +853,13 @@ impl Ext2Fs {
     }
 
     pub fn get_inode(self: &Arc<Self>, ino: u32) -> Arc<Ext2Inode> {
-        Arc::new(Ext2Inode { fs: self.clone(), ino })
+        let mut cache = self.inode_cache.lock();
+        if let Some(existing) = cache.get(&ino).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let inode = Arc::new(Ext2Inode { fs: self.clone(), ino });
+        cache.insert(ino, Arc::downgrade(&inode));
+        inode
     }
     /// The filesystem root inode, for grafting into the VFS at a mount point.
     pub fn root_inode(self: &Arc<Self>) -> Arc<dyn Inode> {
