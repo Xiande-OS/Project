@@ -716,33 +716,48 @@ pub fn emergency_reclaim() -> usize {
     let cur = current_pid();
     let mut total = 0usize;
     loop {
-        let (pairs, live): (Vec<(i32, i32)>, alloc::collections::BTreeSet<i32>) = {
+        let (rows, live): (Vec<(i32, i32, i32)>, alloc::collections::BTreeSet<i32>) = {
             let t = TABLE.lock();
             let live = t.tasks.keys().copied().collect();
-            let pairs = t
+            let rows = t
                 .tasks
                 .values()
-                .map(|task| (task.pid, task.ppid.load(Ordering::Relaxed)))
+                .map(|task| {
+                    (
+                        task.pid,
+                        task.ppid.load(Ordering::Relaxed),
+                        task.sid.load(Ordering::Relaxed),
+                    )
+                })
                 .collect();
-            (pairs, live)
+            (rows, live)
         };
         let mut freed = 0usize;
-        for (pid, ppid) in pairs {
+        for (pid, ppid, sid) in rows {
             if pid == INIT_PID || pid == cur {
                 continue;
             }
             let parent_dead = !live.contains(&ppid);
+            // A finished per-case session: the `setsid timeout ./case` leader is
+            // gone (sid not in the table, sid > 1) so nothing legitimately runs
+            // here. Hung LTP cases leak members that get reparented to init
+            // (ppid==1, so parent_dead is false) and park forever on a fd/futex,
+            // pinning their whole address space — the cumulative drain that
+            // OOM-poweroffs the run mid-catch-all. Treat such a dead session as
+            // grounds to reclaim the member regardless of parent.
+            let session_dead = sid > 1 && !live.contains(&sid);
             if let Some(task) = task_by_pid(pid) {
                 let st = *task.state.lock();
                 match st {
                     // Nobody will wait4 it: parent gone, or reparented to init.
-                    TaskState::Zombie if parent_dead || ppid == INIT_PID => {
+                    TaskState::Zombie if parent_dead || ppid == INIT_PID || session_dead => {
                         drop(task);
                         reap(pid);
                         freed += 1;
                     }
-                    // Parked orphan that can never be woken (real parent gone).
-                    TaskState::Waiting if parent_dead => {
+                    // Parked orphan that can never be woken (real parent gone),
+                    // or any live member of a finished session.
+                    TaskState::Waiting if parent_dead || session_dead => {
                         crate::signal::kill_now(&task);
                         drop(task);
                         reap(pid);
