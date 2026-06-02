@@ -1,0 +1,112 @@
+name: ltp-ci
+
+# Quality-control CI: build the kernel for each platform and run a curated
+# LTP sweep under QEMU, across the 4 cells RV/LA x musl/glibc. Designed for a
+# GitHub-hosted runner's ~14 GB of free disk: each cell handles ONE variant
+# image (curated subset, small), aggressively frees space, and caches the
+# expensive build outputs (cargo target dir + the assembled test image).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# One in-flight run per ref; a newer push cancels the older run.
+concurrency:
+  group: ltp-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ltp:
+    name: ltp-${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: rv-musl,  arch: rv, libc: musl }
+          - { name: rv-glibc, arch: rv, libc: glibc }
+          - { name: la-musl,  arch: la, libc: musl }
+          - { name: la-glibc, arch: la, libc: glibc }
+    env:
+      # Bump to force a rebuild of every cached test image.
+      IMG_VERSION: v1
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space (target ~14 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Install build + run deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-misc qemu-system-riscv64 \
+            gcc-riscv64-linux-gnu gcc-14-loongarch64-linux-gnu \
+            e2fsprogs file bzip2 curl
+          qemu-system-riscv64 --version | head -1
+          qemu-system-loongarch64 --version | head -1
+
+      - name: Install Rust target
+        run: |
+          rustup target add ${{ matrix.arch == 'rv' && 'riscv64gc-unknown-none-elf' || 'loongarch64-unknown-none' }}
+
+      - name: Cache cargo build (per arch)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('kernel/src/**') }}
+          restore-keys: |
+            cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-${{ matrix.arch }}-
+
+      - name: Build kernel (${{ matrix.arch }})
+        run: |
+          make prepare
+          TGT=${{ matrix.arch == 'rv' && 'riscv64gc-unknown-none-elf' || 'loongarch64-unknown-none' }}
+          cargo build --release -p kernel --target "$TGT" --offline
+          cp "target/$TGT/release/kernel" "kernel-${{ matrix.arch }}"
+          ls -l "kernel-${{ matrix.arch }}"
+
+      - name: Cache test image
+        id: imgcache
+        uses: actions/cache@v4
+        with:
+          path: ci/img/${{ matrix.name }}.img
+          key: img-${{ matrix.name }}-${{ env.IMG_VERSION }}-${{ hashFiles('ci/make-testimg.sh','ci/ltp-cases.txt') }}
+
+      - name: Build test image (on cache miss)
+        if: steps.imgcache.outputs.cache-hit != 'true'
+        env:
+          # Optional: host faithful prebuilt images at <base>/sdcard-<arch>-<libc>.img
+          TEST_IMAGE_URL: ${{ secrets.TEST_IMAGE_BASE_URL }}
+        run: |
+          chmod +x ci/*.sh
+          bash ci/make-testimg.sh "${{ matrix.arch }}" "${{ matrix.libc }}" "ci/img/${{ matrix.name }}.img"
+
+      - name: Run LTP under QEMU
+        run: |
+          chmod +x ci/*.sh
+          bash ci/run-qemu.sh "${{ matrix.arch }}" "ci/img/${{ matrix.name }}.img" "${{ matrix.name }}" 600 \
+            | tee "ci/${{ matrix.name }}.log"
+
+      - name: Parse results + gate
+        run: bash ci/parse-ltp.sh "${{ matrix.name }}" "ci/${{ matrix.name }}.log"
+
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ltp-log-${{ matrix.name }}
+          path: ci/${{ matrix.name }}.log
+          retention-days: 14

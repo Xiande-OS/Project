@@ -1,0 +1,42 @@
+name: mirror
+
+# On every push, mirror the pushed ref to Xiande-OS/Project (the public copy
+# used to view CI results). The token lives ONLY in the MIRROR_TOKEN secret —
+# never in this file. Guarded to skip inside the mirror itself, so it neither
+# loops nor requires the secret to be set there.
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    if: github.repository != 'Xiande-OS/Project'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push ref to mirror
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
+          if [ -z "$MIRROR_TOKEN" ]; then
+            echo "::error title=mirror::MIRROR_TOKEN secret is not set — see ci/README.md"
+            exit 1
+          fi
+          # The token is interpolated from the env (masked in logs); the URL is
+          # never echoed. --force keeps the mirror an exact copy of this ref.
+          git push --force \
+            "https://x-access-token:${MIRROR_TOKEN}@github.com/Xiande-OS/Project.git" \
+            "HEAD:${GITHUB_REF}"
+          echo "mirrored ${GITHUB_REF} -> Xiande-OS/Project"
