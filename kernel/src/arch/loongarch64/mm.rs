@@ -21,23 +21,14 @@ pub fn activate(pgd_pa: usize) {
     }
 }
 
-/// Invalidate the local TLB entry covering `va`.
-///
-/// Was flushing the WHOLE TLB (`invtlb 0x0`) on every single-page invalidation
-/// — so each munmap/mprotect/exit-time page teardown nuked the entire TLB and
-/// forced the next process to refill its whole working set. On a fork-heavy
-/// LTP case (access01/getpid01/waitpid01 fork 100–199× → as many address-space
-/// teardowns) that refill storm made the case overrun the contest's 5s/3s
-/// per-case `timeout` on loongarch64 and score 0, even though it ran correctly.
-///
-/// We run user space at ASID 0 (no ASID recycling) and the kernel lives in DMW
-/// windows (never in the TLB), so `invtlb 0x6, $zero, va` — invalidate entries
-/// matching VA `va` that are global OR carry ASID 0 — flushes exactly the one
-/// page instead of the whole TLB.
+/// Invalidate the local TLB entry covering `va`. We flush the whole TLB
+/// (op 0) rather than a single ASID/VA pair to stay correct regardless of
+/// the ASID currently programmed.
 #[inline]
 pub fn flush_va(va: usize) {
+    let _ = va;
     unsafe {
-        core::arch::asm!("invtlb 0x6, $zero, {0}", in(reg) va);
+        core::arch::asm!("invtlb 0x0, $zero, $zero");
     }
 }
 
