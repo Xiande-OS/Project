@@ -417,17 +417,21 @@ pub struct FanotifyGroup {
     events: Mutex<VecDeque<FanEvent>>,
     read_waiters: Mutex<Vec<i32>>,
     pub nonblock: bool,
+    /// FAN_REPORT_FID: events carry a file handle (fanotify_event_info_fid)
+    /// and FAN_NOFD instead of an open fd.
+    pub report_fid: bool,
 }
 
 static FAN_GROUPS: Mutex<Vec<Weak<FanotifyGroup>>> = Mutex::new(Vec::new());
 
 impl FanotifyGroup {
-    pub fn new(nonblock: bool) -> Arc<Self> {
+    pub fn new(nonblock: bool, report_fid: bool) -> Arc<Self> {
         let g = Arc::new(Self {
             marks: Mutex::new(Vec::new()),
             events: Mutex::new(VecDeque::new()),
             read_waiters: Mutex::new(Vec::new()),
             nonblock,
+            report_fid,
         });
         let mut reg = FAN_GROUPS.lock();
         reg.retain(|w| w.strong_count() > 0);
@@ -478,9 +482,13 @@ impl FanotifyGroup {
     fn push_event(&self, e: FanEvent) {
         {
             let mut q = self.events.lock();
-            // Coalesce identical consecutive events on the same object.
-            if let Some(last) = q.back() {
-                if last.mask == e.mask && Weak::ptr_eq(&last.inode, &e.inode) {
+            // Coalesce with the most-recent unread event on the SAME object by
+            // OR-ing the masks — fanotify merges e.g. FAN_OPEN then
+            // FAN_CLOSE_NOWRITE on one object into a single mask=0x30 event
+            // (fanotify13 checks this). Distinct objects stay separate.
+            if let Some(last) = q.back_mut() {
+                if Weak::ptr_eq(&last.inode, &e.inode) {
+                    last.mask |= e.mask;
                     return;
                 }
             }
@@ -528,9 +536,48 @@ impl FanotifyGroup {
             };
             let Some(ev) = ev else { break };
             // Upgrade the weak target; a stale event (object already freed)
-            // is dropped — an fd to a deleted file would be useless anyway.
+            // is dropped — an fd/handle to a deleted file is useless anyway.
             let Some(inode) = ev.inode.upgrade() else { continue };
-            // Open an fd to the affected object for the reader.
+            if self.report_fid {
+                // FAN_REPORT_FID: metadata (fd = FAN_NOFD) followed by a
+                // fanotify_event_info_fid record carrying a file handle whose
+                // bytes equal name_to_handle_at(2)'s (both = the inode's
+                // st_ino == Arc pointer). Layout:
+                //   info hdr: info_type(u8)=1(FID), pad(u8), len(u16)
+                //   fsid: __kernel_fsid_t (two i32, =0 to match statfs)
+                //   file_handle: handle_bytes(u32)=8, handle_type(i32)=1,
+                //                f_handle[8] = st_ino
+                const INFO_LEN: usize = 4 + 8 + 16; // 28
+                const TOTAL: usize = META + INFO_LEN; // 52
+                if off + TOTAL > buf.len() {
+                    // Re-queue and stop; the caller will read it next time.
+                    self.events.lock().push_front(ev);
+                    break;
+                }
+                let st_ino = Arc::as_ptr(&inode) as *const () as u64;
+                const FAN_NOFD: i32 = -1;
+                buf[off..off + 4].copy_from_slice(&(TOTAL as u32).to_le_bytes());
+                buf[off + 4] = FANOTIFY_METADATA_VERSION;
+                buf[off + 5] = 0;
+                buf[off + 6..off + 8].copy_from_slice(&(META as u16).to_le_bytes());
+                buf[off + 8..off + 16].copy_from_slice(&ev.mask.to_le_bytes());
+                buf[off + 16..off + 20].copy_from_slice(&FAN_NOFD.to_le_bytes());
+                buf[off + 20..off + 24].copy_from_slice(&(task.pid).to_le_bytes());
+                let i = off + META;
+                buf[i] = 1; // FAN_EVENT_INFO_TYPE_FID
+                buf[i + 1] = 0;
+                buf[i + 2..i + 4].copy_from_slice(&(INFO_LEN as u16).to_le_bytes());
+                // fsid (8 bytes) = 0
+                for b in &mut buf[i + 4..i + 12] {
+                    *b = 0;
+                }
+                buf[i + 12..i + 16].copy_from_slice(&8u32.to_le_bytes()); // handle_bytes
+                buf[i + 16..i + 20].copy_from_slice(&1i32.to_le_bytes()); // handle_type
+                buf[i + 20..i + 28].copy_from_slice(&st_ino.to_le_bytes());
+                off += TOTAL;
+                continue;
+            }
+            // Default (notification) mode: open an fd to the object.
             let file = Arc::new(crate::fs::File::from_inode(inode, true, false, false));
             let fd = match task.fd_table.lock().alloc(file, false) {
                 Ok(fd) => fd as i32,

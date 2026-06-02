@@ -1765,7 +1765,12 @@ fn sys_inotify_rm_watch(fd: i32, wd: i32) -> isize {
 fn sys_fanotify_init(flags: u32, _event_f_flags: u32) -> isize {
     const FAN_CLOEXEC: u32 = 0x0000_0001;
     const FAN_NONBLOCK: u32 = 0x0000_0002;
-    let group = crate::fs::notify::FanotifyGroup::new(flags & FAN_NONBLOCK != 0);
+    const FAN_REPORT_DIR_FID: u32 = 0x0000_0400;
+    const FAN_REPORT_FID: u32 = 0x0000_0200;
+    // FAN_REPORT_FID or FAN_REPORT_DFID_NAME (which includes DIR_FID) → the
+    // group reports file handles instead of fds.
+    let report_fid = flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID) != 0;
+    let group = crate::fs::notify::FanotifyGroup::new(flags & FAN_NONBLOCK != 0, report_fid);
     let n: Arc<dyn Inode> = Arc::new(crate::fs::notify::FanotifyFd { group });
     let file = Arc::new(crate::fs::File::from_inode(n, true, false, false));
     match current_task().fd_table.lock().alloc(file, flags & FAN_CLOEXEC != 0) {
@@ -3114,7 +3119,12 @@ fn sys_name_to_handle_at(dfd: i32, path: usize, handle: usize, mount_id: usize, 
             Err(e) => return e as isize,
         }
     };
-    let id = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Use the inode's stable identity (its st_ino == Arc pointer) as the
+    // handle, so the SAME inode always yields the SAME handle bytes — this is
+    // what lets a fanotify FAN_REPORT_FID event's file handle match the one
+    // name_to_handle_at(2) returns. Keyed into HANDLES so open_by_handle_at
+    // still round-trips.
+    let id = Arc::as_ptr(&inode) as *const () as u64;
     HANDLES.lock().insert(id, inode);
     // struct file_handle: handle_bytes(4) + handle_type(4) + f_handle[8].
     let mut out = [0u8; 16];
