@@ -578,19 +578,49 @@ pub fn reap_orphan_zombies(except: i32) {
     // Snapshot (pid, ppid) and the live-pid set under the table lock, then
     // release it before touching per-task state locks (TABLE-then-state would
     // invert the scheduler's state-then-TABLE order).
-    let (pairs, live): (Vec<(i32, i32)>, alloc::collections::BTreeSet<i32>) = {
+    let (rows, live): (Vec<(i32, i32, i32)>, alloc::collections::BTreeSet<i32>) = {
         let t = TABLE.lock();
         let live = t.tasks.keys().copied().collect();
-        let pairs = t
+        let rows = t
             .tasks
             .values()
-            .map(|task| (task.pid, task.ppid.load(Ordering::Relaxed)))
+            .map(|task| {
+                (
+                    task.pid,
+                    task.ppid.load(Ordering::Relaxed),
+                    task.sid.load(Ordering::Relaxed),
+                )
+            })
             .collect();
-        (pairs, live)
+        (rows, live)
     };
     const INIT_PID: i32 = 1;
+    // Pass A: SIGKILL *live* session leftovers. The contest runs each case as
+    // `setsid timeout -KILL N ./case`, so the per-case session leader is the
+    // `timeout` wrapper. When it exits (case done/killed) kill_session tears the
+    // session down — but a member parked on a fanotify-fd read, a futex, etc.,
+    // or created in the race, can survive, get reparented to init, and then
+    // block/run forever pinning its whole address space. Dozens of hung LTP
+    // cases (fanotify perm tests, signal-wait, net helpers) leak such leftovers;
+    // they accumulate until the frame/heap pool drains and the run OOM-powers
+    // off mid-catch-all, losing the tail + libctest + benchmarks. A task whose
+    // session leader is no longer in the table (sid not live, sid > 1) belongs
+    // to a finished session — nothing legitimately runs there — so SIGKILL it;
+    // it then dies via the normal trap path and is reaped as a zombie below. A
+    // currently-running case is untouched (its leader is alive). The init
+    // session (sid <= 1: init + the never-setsid'd driver shells) is never hit.
+    for &(pid, _ppid, sid) in &rows {
+        if pid == except || pid == INIT_PID || sid <= 1 || live.contains(&sid) {
+            continue;
+        }
+        if let Some(task) = task_by_pid(pid) {
+            if *task.state.lock() != TaskState::Zombie {
+                crate::signal::raise_signal(&task, crate::signal::SIGKILL);
+            }
+        }
+    }
     let mut n = 0;
-    for (pid, ppid) in pairs {
+    for (pid, ppid, _sid) in rows {
         if pid == except {
             continue; // never reap the caller
         }
