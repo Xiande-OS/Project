@@ -83,3 +83,68 @@ impl Inode for DevNode {
         }
     }
 }
+
+/// A raw block-device node (e.g. /dev/sdb) over a virtio-blk device. Byte
+/// reads/writes are translated to 512-byte sector I/O, so `dd`, `mkfs`, and
+/// LTP's tst_device (which requires an S_ISBLK device) all work against it.
+pub struct BlockDevNode {
+    pub dev: alloc::sync::Arc<crate::drivers::virtio_blk::BlockDevice>,
+    pub rdev: u64,
+}
+
+const SEC: usize = 512;
+
+impl Inode for BlockDevNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn kind(&self) -> FileType {
+        FileType::BlockDevice
+    }
+    fn size(&self) -> u64 {
+        self.dev.capacity() * SEC as u64
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let total = self.dev.capacity() * SEC as u64;
+        if offset >= total {
+            return Ok(0);
+        }
+        let end = core::cmp::min(offset + buf.len() as u64, total);
+        let mut done = 0usize;
+        let mut pos = offset;
+        let mut sec = [0u8; SEC];
+        while pos < end {
+            let s = (pos / SEC as u64) as usize;
+            let within = (pos % SEC as u64) as usize;
+            let n = core::cmp::min(SEC - within, (end - pos) as usize);
+            self.dev.read_block(s, &mut sec).map_err(|_| super::EINVAL)?;
+            buf[done..done + n].copy_from_slice(&sec[within..within + n]);
+            done += n;
+            pos += n as u64;
+        }
+        Ok(done)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        let total = self.dev.capacity() * SEC as u64;
+        if offset >= total {
+            return Err(super::ENOSPC);
+        }
+        let end = core::cmp::min(offset + buf.len() as u64, total);
+        let mut done = 0usize;
+        let mut pos = offset;
+        let mut sec = [0u8; SEC];
+        while pos < end {
+            let s = (pos / SEC as u64) as usize;
+            let within = (pos % SEC as u64) as usize;
+            let n = core::cmp::min(SEC - within, (end - pos) as usize);
+            if within != 0 || n != SEC {
+                self.dev.read_block(s, &mut sec).map_err(|_| super::EINVAL)?;
+            }
+            sec[within..within + n].copy_from_slice(&buf[done..done + n]);
+            self.dev.write_block(s, &sec).map_err(|_| super::EINVAL)?;
+            done += n;
+            pos += n as u64;
+        }
+        Ok(done)
+    }
+}

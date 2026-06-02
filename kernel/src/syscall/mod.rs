@@ -106,7 +106,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_FCHOWN => sys_fchown(a0 as i32, a1 as u32, a2 as u32),
         nr::SYS_FCHOWNAT => sys_fchownat(a0 as i32, a1, a2 as u32, a3 as u32, a4 as i32),
         nr::SYS_UMASK => sys_umask(a0 as u32),
-        nr::SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2 as i32),
+        nr::SYS_FCNTL => sys_fcntl(a0 as i32, a1 as i32, a2 as i32, a2),
         nr::SYS_FLOCK => sys_flock(a0 as i32, a1 as i32),
         nr::SYS_FSYNC => 0,
         nr::SYS_UTIMENSAT => sys_utimensat(a0 as i32, a1, a2, a3 as i32),
@@ -340,8 +340,10 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(a0 as i32, a1 as i32, a2, a3 as u32),
         nr::SYS_PIDFD_GETFD => EBADF,
         nr::SYS_INOTIFY_INIT1 => sys_inotify_init1(a0 as i32),
-        nr::SYS_INOTIFY_ADD_WATCH => 1,
-        nr::SYS_INOTIFY_RM_WATCH => 0,
+        nr::SYS_INOTIFY_ADD_WATCH => sys_inotify_add_watch(a0 as i32, a1, a2 as u32),
+        nr::SYS_INOTIFY_RM_WATCH => sys_inotify_rm_watch(a0 as i32, a1 as i32),
+        nr::SYS_FANOTIFY_INIT => sys_fanotify_init(a0 as u32, a1 as u32),
+        nr::SYS_FANOTIFY_MARK => sys_fanotify_mark(a0 as i32, a1 as u32, a2 as u64, a3 as i32, a4),
         nr::SYS_SIGNALFD4 => sys_signalfd4(a0 as i32, a1, a2 as usize, a3 as i32),
         nr::SYS_SOCKET => { crate::net::poll(); socket::sys_socket(a0 as i32, a1 as i32, a2 as i32) }
         nr::SYS_SOCKETPAIR => socket::sys_socketpair(a0 as i32, a1 as i32, a2 as i32, a3),
@@ -472,7 +474,16 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         return EBADF;
     };
     match file.write(&bytes) {
-        Ok(n) => n as isize,
+        Ok(n) => {
+            if crate::fs::notify::active() && n > 0 {
+                crate::fs::notify::report(
+                    Some(&file.inode), None, "",
+                    crate::fs::notify::IN_MODIFY, 0,
+                    file.inode.kind() == FileType::Directory,
+                );
+            }
+            n as isize
+        }
         Err(e) => err_to_isize(e),
     }
 }
@@ -574,6 +585,13 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         Ok(n) => n,
         Err(e) => return err_to_isize(e),
     };
+    if crate::fs::notify::active() && n > 0 {
+        crate::fs::notify::report(
+            Some(&file.inode), None, "",
+            crate::fs::notify::IN_ACCESS, 0,
+            file.inode.kind() == FileType::Directory,
+        );
+    }
     // Pipe with live writer: 0 bytes means "writer hasn't written yet",
     // NOT EOF. Without this block-on-empty, `printf X | while read line`
     // sees the read-end return 0 immediately, treats it as EOF, and
@@ -582,6 +600,39 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         if let Some(pipe) = file.inode.as_any().downcast_ref::<crate::fs::pipe::PipeEnd>() {
             if !pipe.is_writer() && pipe.writer_alive() && pipe.buffered() == 0 {
                 pipe.add_read_waiter(task.pid);
+                *task.state.lock() = crate::task::TaskState::Waiting;
+                unsafe {
+                    let tf = task.tf_ptr();
+                    (*tf).rewind_syscall();
+                }
+                return 0;
+            }
+        }
+    }
+    // inotify fd with an empty queue: block until report() queues an event
+    // (the watched operation runs on another task, or is yet to happen).
+    // A nonblocking group gets EAGAIN instead.
+    if n == 0 && len != 0 {
+        if let Some(ino) = file.inode.as_any().downcast_ref::<crate::fs::notify::InotifyFd>() {
+            if !ino.group.has_events() {
+                if ino.group.nonblock {
+                    return -11; // EAGAIN
+                }
+                ino.group.add_read_waiter(task.pid);
+                *task.state.lock() = crate::task::TaskState::Waiting;
+                unsafe {
+                    let tf = task.tf_ptr();
+                    (*tf).rewind_syscall();
+                }
+                return 0;
+            }
+        }
+        if let Some(fano) = file.inode.as_any().downcast_ref::<crate::fs::notify::FanotifyFd>() {
+            if !fano.group.has_events() {
+                if fano.group.nonblock {
+                    return -11; // EAGAIN
+                }
+                fano.group.add_read_waiter(task.pid);
                 *task.state.lock() = crate::task::TaskState::Waiting;
                 unsafe {
                     let tf = task.tf_ptr();
@@ -1055,6 +1106,10 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, mode: i32) -> isize {
                     // under every umask value and checks its mode — failed.
                     apply_mode(&i, mode as u32 & !current_umask() & 0o7777);
                     stamp_creator(&i, &parent);
+                    crate::fs::notify::report(
+                        Some(&i), Some(&parent), &name,
+                        crate::fs::notify::IN_CREATE, 0, false,
+                    );
                     i
                 }
                 Err(e) => return err_to_isize(e),
@@ -1080,8 +1135,19 @@ fn sys_openat(dfd: i32, path: usize, flags: i32, mode: i32) -> isize {
             *file.dir_path.lock() = Some(abs);
         }
     }
-    match current_task().fd_table.lock().alloc(file, cloexec) {
-        Ok(fd) => fd as isize,
+    let opened_inode = file.inode.clone();
+    let res = current_task().fd_table.lock().alloc(file, cloexec);
+    match res {
+        Ok(fd) => {
+            if crate::fs::notify::active() {
+                let is_dir = opened_inode.kind() == FileType::Directory;
+                crate::fs::notify::report(
+                    Some(&opened_inode), None, "",
+                    crate::fs::notify::IN_OPEN, 0, is_dir,
+                );
+            }
+            fd as isize
+        }
         Err(e) => err_to_isize(e),
     }
 }
@@ -1101,10 +1167,9 @@ fn sys_close(fd: i32) -> isize {
     // remain open. fcntl15 closes a duplicated/independent fd and expects the
     // lock to be gone. Capture the inode before the close, drop the locks
     // after it succeeds.
-    let key = task
-        .fd_table
-        .lock()
-        .get(fd)
+    let closing = task.fd_table.lock().get(fd);
+    let key = closing
+        .as_ref()
         .map(|f| Arc::as_ptr(&f.inode) as *const () as usize);
     let r = task.fd_table.lock().close(fd);
     if r.is_ok() {
@@ -1116,6 +1181,21 @@ fn sys_close(fd: i32) -> isize {
                 if v.is_empty() {
                     table.remove(&k);
                 }
+            }
+        }
+        // inotify: closing an fd fires IN_CLOSE_WRITE (was writable) or
+        // IN_CLOSE_NOWRITE on the file's own watch.
+        if crate::fs::notify::active() {
+            if let Some(f) = &closing {
+                let mask = if f.writable {
+                    crate::fs::notify::IN_CLOSE_WRITE
+                } else {
+                    crate::fs::notify::IN_CLOSE_NOWRITE
+                };
+                crate::fs::notify::report(
+                    Some(&f.inode), None, "",
+                    mask, 0, f.inode.kind() == FileType::Directory,
+                );
             }
         }
     }
@@ -1196,6 +1276,10 @@ fn sys_mkdirat(dfd: i32, path: usize, mode: u32) -> isize {
             // After the mode is set, stamp ownership and let a set-gid parent
             // pass its group + set-gid bit down to the new directory.
             stamp_creator(&inode, &parent);
+            crate::fs::notify::report(
+                Some(&inode), Some(&parent), &name,
+                crate::fs::notify::IN_CREATE, 0, true,
+            );
             0
         }
         Err(e) => err_to_isize(e),
@@ -1487,6 +1571,31 @@ fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
             TTY_FG_PGID.store(pg, core::sync::atomic::Ordering::Relaxed);
             0
         }
+        // Block-device geometry. LTP's tst_device reads the device size and
+        // skips a device smaller than the test wants ("Skipping size 0MB");
+        // without these it saw 0 and every .needs_device case TBROK'd.
+        0x8008_1272 | 0x1260 | 0x1268 | 0x8008_1270 => {
+            const BLKGETSIZE64: u32 = 0x8008_1272; // u64 bytes
+            const BLKGETSIZE: u32 = 0x1260; // unsigned long, 512-byte sectors
+            const BLKSSZGET: u32 = 0x1268; // int, logical sector size
+            const BLKBSZGET: u32 = 0x8008_1270; // size_t, block size
+            let dev = task.fd_table.lock().get(fd).and_then(|f| {
+                f.inode
+                    .as_any()
+                    .downcast_ref::<crate::fs::devfs::BlockDevNode>()
+                    .map(|b| b.dev.clone())
+            });
+            let Some(dev) = dev else { return 0 };
+            let bytes: u64 = dev.capacity() * 512;
+            let _ = (BLKGETSIZE64, BLKGETSIZE, BLKSSZGET, BLKBSZGET);
+            let ok = match req {
+                BLKGETSIZE64 => task.copy_out_bytes(arg, &bytes.to_le_bytes()).is_some(),
+                BLKBSZGET => task.copy_out_bytes(arg, &4096u64.to_le_bytes()).is_some(),
+                BLKGETSIZE => task.copy_out_bytes(arg, &(bytes / 512).to_le_bytes()).is_some(),
+                _ => task.copy_out_bytes(arg, &512i32.to_le_bytes()).is_some(), // BLKSSZGET
+            };
+            if ok { 0 } else { EFAULT }
+        }
         _ => 0,
     }
 }
@@ -1609,20 +1718,150 @@ fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _siginfo: usize, _flags: u32) -> 
     0
 }
 
-struct InotifyFd;
-impl crate::fs::Inode for InotifyFd {
-    fn as_any(&self) -> &dyn core::any::Any { self }
-    fn kind(&self) -> crate::fs::FileType { crate::fs::FileType::Pipe }
-    fn size(&self) -> u64 { 0 }
-    fn read_at(&self, _o: u64, _b: &mut [u8]) -> crate::fs::Result<usize> { Ok(0) }
-}
-
 fn sys_inotify_init1(flags: i32) -> isize {
     const IN_CLOEXEC: i32 = 0o2000000;
-    let n: Arc<dyn Inode> = Arc::new(InotifyFd);
+    const IN_NONBLOCK: i32 = 0o4000;
+    let group = crate::fs::notify::InotifyGroup::new(flags & IN_NONBLOCK != 0);
+    let n: Arc<dyn Inode> = Arc::new(crate::fs::notify::InotifyFd { group });
     let file = Arc::new(crate::fs::File::from_inode(n, true, false, false));
     match current_task().fd_table.lock().alloc(file, flags & IN_CLOEXEC != 0) {
-        Ok(fd) => fd as isize, Err(e) => err_to_isize(e),
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+/// inotify_add_watch(fd, pathname, mask): resolve the path and register a
+/// watch on the group behind `fd`. Returns the watch descriptor.
+fn sys_inotify_add_watch(fd: i32, path: usize, mask: u32) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else {
+        return EBADF;
+    };
+    let Some(group) = file
+        .inode
+        .as_any()
+        .downcast_ref::<crate::fs::notify::InotifyFd>()
+        .map(|f| f.group.clone())
+    else {
+        return EINVAL;
+    };
+    let Some(path_str) = copy_path(path) else {
+        return EFAULT;
+    };
+    let start = if path_str.starts_with('/') { fs::root() } else { cwd_inode() };
+    // IN_DONT_FOLLOW: don't dereference a final symlink.
+    let inode = if mask & crate::fs::notify::IN_DONT_FOLLOW != 0 {
+        fs::lookup_path_nofollow(start, &path_str)
+    } else {
+        fs::lookup_path(start, &path_str)
+    };
+    let inode = match inode {
+        Ok(i) => i,
+        Err(e) => return err_to_isize(e),
+    };
+    if mask & crate::fs::notify::IN_ONLYDIR != 0 && inode.kind() != FileType::Directory {
+        return -20; // ENOTDIR
+    }
+    group.add_watch(inode, mask) as isize
+}
+
+/// inotify_rm_watch(fd, wd): drop a watch.
+fn sys_inotify_rm_watch(fd: i32, wd: i32) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else {
+        return EBADF;
+    };
+    let Some(group) = file
+        .inode
+        .as_any()
+        .downcast_ref::<crate::fs::notify::InotifyFd>()
+        .map(|f| f.group.clone())
+    else {
+        return EINVAL;
+    };
+    if group.rm_watch(wd) {
+        0
+    } else {
+        EINVAL
+    }
+}
+
+/// fanotify_init(flags, event_f_flags): create a fanotify group fd.
+fn sys_fanotify_init(flags: u32, _event_f_flags: u32) -> isize {
+    const FAN_CLOEXEC: u32 = 0x0000_0001;
+    const FAN_NONBLOCK: u32 = 0x0000_0002;
+    const FAN_REPORT_FID: u32 = 0x0000_0200;
+    const FAN_REPORT_DIR_FID: u32 = 0x0000_0400;
+    const FAN_REPORT_NAME: u32 = 0x0000_0800;
+    // FID reports the affected object's handle; DIR_FID reports the parent
+    // directory's; NAME (with DIR_FID = DFID_NAME) also reports the entry name.
+    let report_fid = flags & FAN_REPORT_FID != 0;
+    let report_dir_fid = flags & FAN_REPORT_DIR_FID != 0;
+    let report_name = flags & FAN_REPORT_NAME != 0;
+    let group = crate::fs::notify::FanotifyGroup::new(
+        flags & FAN_NONBLOCK != 0,
+        report_fid,
+        report_dir_fid,
+        report_name,
+    );
+    let n: Arc<dyn Inode> = Arc::new(crate::fs::notify::FanotifyFd { group });
+    let file = Arc::new(crate::fs::File::from_inode(n, true, false, false));
+    match current_task().fd_table.lock().alloc(file, flags & FAN_CLOEXEC != 0) {
+        Ok(fd) => fd as isize,
+        Err(e) => err_to_isize(e),
+    }
+}
+
+/// fanotify_mark(fd, flags, mask, dirfd, pathname): add/remove/flush a mark.
+fn sys_fanotify_mark(fd: i32, flags: u32, mask: u64, dirfd: i32, path: usize) -> isize {
+    use crate::fs::notify::{
+        FAN_MARK_ADD, FAN_MARK_FILESYSTEM, FAN_MARK_FLUSH, FAN_MARK_MOUNT, FAN_MARK_REMOVE,
+    };
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(fd) else {
+        return EBADF;
+    };
+    let Some(group) = file
+        .inode
+        .as_any()
+        .downcast_ref::<crate::fs::notify::FanotifyFd>()
+        .map(|f| f.group.clone())
+    else {
+        return EINVAL;
+    };
+    const FAN_MARK_IGNORED_MASK: u32 = 0x0000_0020;
+    const FAN_MARK_IGNORE: u32 = 0x0000_0400;
+    let mount = flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0;
+    let ignore = flags & (FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORE) != 0;
+    if flags & FAN_MARK_FLUSH != 0 {
+        group.flush(mount);
+        return 0;
+    }
+    // Resolve the marked object (dirfd + path, AT-style).
+    let inode = if path == 0 {
+        if dirfd == AT_FDCWD {
+            cwd_inode()
+        } else {
+            match task.fd_table.lock().get(dirfd) {
+                Some(f) => f.inode.clone(),
+                None => return EBADF,
+            }
+        }
+    } else {
+        let Some(p) = copy_path(path) else { return EFAULT };
+        match resolve_at(dirfd, &p) {
+            Some(i) => i,
+            None => return ENOENT,
+        }
+    };
+    if flags & FAN_MARK_ADD != 0 {
+        group.add_mark(inode, mask, mount, ignore);
+        0
+    } else if flags & FAN_MARK_REMOVE != 0 {
+        group.remove_mark(&inode, mask, mount);
+        0
+    } else {
+        EINVAL
     }
 }
 
@@ -1960,7 +2199,15 @@ fn sys_flock(fd: i32, op: i32) -> isize {
     }
 }
 
-fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
+// `arg` is the fcntl argument truncated to 32 bits — correct for the
+// integer commands (F_DUPFD min-fd, F_SETFL flags, F_SETOWN pid, F_SETSIG,
+// F_SETLEASE, pipe size, ...). `arg_ptr` is the SAME register kept at full
+// 64-bit width, used only by the commands whose argument is a userspace
+// POINTER (F_GETOWN_EX/F_SETOWN_EX's struct f_owner_ex, F_GETLK/F_SETLK's
+// struct flock). Truncating those to i32 mangled the address — harmless on
+// riscv where user stacks sit in the low 2 GiB, but EFAULT on loongarch
+// whose user pointers have high bits set (fcntl15/22/31 failed LA-only).
+fn sys_fcntl(fd: i32, cmd: i32, arg: i32, arg_ptr: usize) -> isize {
     const F_DUPFD: i32 = 0;
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
@@ -2134,14 +2381,14 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
             let mut buf = [0u8; 8];
             buf[0..4].copy_from_slice(&otype.to_le_bytes());
             buf[4..8].copy_from_slice(&opid.to_le_bytes());
-            if task.copy_out_bytes(arg as usize, &buf).is_none() {
+            if task.copy_out_bytes(arg_ptr, &buf).is_none() {
                 return EFAULT;
             }
             0
         }
         F_SETOWN_EX => {
             let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
-            let Some(b) = task.copy_in_bytes(arg as usize, 8) else { return EFAULT };
+            let Some(b) = task.copy_in_bytes(arg_ptr, 8) else { return EFAULT };
             let otype = i32::from_le_bytes(b[0..4].try_into().unwrap_or([0; 4]));
             let opid = i32::from_le_bytes(b[4..8].try_into().unwrap_or([0; 4]));
             // F_OWNER_PGRP(2) -> negated pgid; F_OWNER_TID(0)/F_OWNER_PID(1) -> pid.
@@ -2239,14 +2486,14 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32) -> isize {
         5 | 6 | 7 => {
             let task = current_task();
             let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
-            let Some(buf) = task.copy_in_bytes(arg as usize, core::mem::size_of::<Flock>()) else { return EFAULT };
+            let Some(buf) = task.copy_in_bytes(arg_ptr, core::mem::size_of::<Flock>()) else { return EFAULT };
             let mut flock = Flock::default();
             unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), &mut flock as *mut _ as *mut u8, core::mem::size_of::<Flock>()); }
             match cmd {
                 5 => {
                     let out = fcntl_getlk(&file, &flock);
                     let bytes = unsafe { core::slice::from_raw_parts(&out as *const _ as *const u8, core::mem::size_of::<Flock>()) };
-                    let _ = task.copy_out_bytes(arg as usize, bytes);
+                    let _ = task.copy_out_bytes(arg_ptr, bytes);
                     0
                 }
                 6 => fcntl_setlk(&file, &flock, false),
@@ -2908,7 +3155,12 @@ fn sys_name_to_handle_at(dfd: i32, path: usize, handle: usize, mount_id: usize, 
             Err(e) => return e as isize,
         }
     };
-    let id = NEXT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Use the inode's stable identity (its st_ino == Arc pointer) as the
+    // handle, so the SAME inode always yields the SAME handle bytes — this is
+    // what lets a fanotify FAN_REPORT_FID event's file handle match the one
+    // name_to_handle_at(2) returns. Keyed into HANDLES so open_by_handle_at
+    // still round-trips.
+    let id = Arc::as_ptr(&inode) as *const () as u64;
     HANDLES.lock().insert(id, inode);
     // struct file_handle: handle_bytes(4) + handle_type(4) + f_handle[8].
     let mut out = [0u8; 16];
@@ -4714,6 +4966,17 @@ fn apply_times(inode: &Arc<dyn Inode>, atime: Option<(i64, i64)>, mtime: Option<
     }
 }
 
+/// inotify IN_ATTRIB on a metadata change (chmod/chown/utimes/link-count).
+fn notify_attrib(inode: &Arc<dyn Inode>) {
+    if crate::fs::notify::active() {
+        crate::fs::notify::report(
+            Some(inode), None, "",
+            crate::fs::notify::IN_ATTRIB, 0,
+            inode.kind() == FileType::Directory,
+        );
+    }
+}
+
 fn sys_fchmod(fd: i32, mode: u32) -> isize {
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else { return EBADF; };
@@ -4722,6 +4985,7 @@ fn sys_fchmod(fd: i32, mode: u32) -> isize {
         return -1; // EPERM
     }
     apply_mode(&file.inode, mode);
+    notify_attrib(&file.inode);
     0
 }
 
@@ -4745,6 +5009,7 @@ fn sys_fchmodat(dfd: i32, path: usize, mode: u32) -> isize {
         return -1; // EPERM
     }
     apply_mode(&i, mode);
+    notify_attrib(&i);
     0
 }
 
@@ -4756,6 +5021,7 @@ fn sys_fchown(fd: i32, uid: u32, gid: u32) -> isize {
         return -1; // EPERM
     }
     apply_owner(&file.inode, uid, gid);
+    notify_attrib(&file.inode);
     0
 }
 
@@ -4772,6 +5038,7 @@ fn sys_fchownat(dfd: i32, path: usize, uid: u32, gid: u32, flags: i32) -> isize 
                 return -1; // EPERM
             }
             apply_owner(&f.inode, uid, gid);
+            notify_attrib(&f.inode);
             return 0;
         }
         return ENOENT;
@@ -4790,6 +5057,7 @@ fn sys_fchownat(dfd: i32, path: usize, uid: u32, gid: u32, flags: i32) -> isize 
         return -1; // EPERM
     }
     apply_owner(&i, uid, gid);
+    notify_attrib(&i);
     0
 }
 
@@ -5669,10 +5937,25 @@ fn sys_unlinkat(dfd: i32, path: usize, flag: i32) -> isize {
     let victim = parent.lookup(&name).ok();
     match parent.unlink(&name) {
         Ok(()) => {
-            if let Some(v) = victim {
-                if v.kind() != FileType::Directory {
+            let is_dir = victim.as_ref().map_or(false, |v| v.kind() == FileType::Directory);
+            if let Some(v) = &victim {
+                if !is_dir {
                     v.adjust_nlink(-1);
                 }
+            }
+            // inotify: IN_DELETE on the parent (with name) + IN_DELETE_SELF on
+            // the victim's own watch.
+            crate::fs::notify::report(
+                None, Some(&parent), &name,
+                crate::fs::notify::IN_DELETE, 0, is_dir,
+            );
+            if let Some(v) = &victim {
+                crate::fs::notify::report(
+                    Some(v), None, "",
+                    crate::fs::notify::IN_DELETE_SELF, 0, is_dir,
+                );
+                // The object is gone: drop its watches and fire IN_IGNORED.
+                crate::fs::notify::inode_gone(v);
             }
             0
         }
@@ -5719,6 +6002,7 @@ fn sys_getdents64(fd: i32, buf: usize, len: usize) -> isize {
             FileType::Regular => 8u8,
             FileType::Directory => 4u8,
             FileType::CharDevice => 2u8,
+            FileType::BlockDevice => 6u8,
             FileType::Pipe => 1u8,
             FileType::Symlink => 10u8,
         };
@@ -5774,6 +6058,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
         FileType::Regular => 0o100000,
         FileType::Directory => 0o040000,
         FileType::CharDevice => 0o020000,
+        FileType::BlockDevice => 0o060000,
         FileType::Pipe => 0o010000,
         FileType::Symlink => 0o120000,
     };
@@ -5797,6 +6082,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
             FileType::Regular => 0o644,
             FileType::Directory => 0o755,
             FileType::CharDevice => 0o666,
+            FileType::BlockDevice => 0o660,
             FileType::Pipe => 0o600,
             FileType::Symlink => 0o777,
         };
@@ -5807,6 +6093,8 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
     // checks st_rdev == makedev(1,3) for /dev/null, so 0 makes it ENODEV.
     if let Some(d) = inode.as_any().downcast_ref::<crate::fs::devfs::DevNode>() {
         s.st_rdev = d.kind.rdev();
+    } else if let Some(b) = inode.as_any().downcast_ref::<crate::fs::devfs::BlockDevNode>() {
+        s.st_rdev = b.rdev;
     }
     s.st_uid = uid;
     s.st_gid = gid;
@@ -5951,18 +6239,52 @@ fn sys_statx(dfd: i32, path: usize, flags: i32, mask: u32, buf: usize) -> isize 
     let mut st = Statx::default();
     st.stx_mask = 0x7ff;
     st.stx_blksize = 4096;
-    st.stx_nlink = 1;
-    st.stx_mode = match inode.kind() {
-        FileType::Regular => 0o100644,
-        FileType::Directory => 0o040755,
-        FileType::CharDevice => 0o020666,
-        FileType::Pipe => 0o010600,
-        FileType::Symlink => 0o120777,
+    st.stx_nlink = inode.nlink();
+    // Mode/uid/gid must come from meta_perm (chmod/chown persisted state), NOT a
+    // hardcoded type default — otherwise chmod/chown are invisible through
+    // statx. glibc routes stat()/fstat() through statx on some arches (notably
+    // LoongArch), so without this the entire chmod/fchmod/chown/stat LTP family
+    // failed on LA while passing on RV (which used newfstatat -> fill_stat).
+    let type_bits: u16 = match inode.kind() {
+        FileType::Regular => 0o100000,
+        FileType::Directory => 0o040000,
+        FileType::CharDevice => 0o020000,
+        FileType::BlockDevice => 0o060000,
+        FileType::Pipe => 0o010000,
+        FileType::Symlink => 0o120000,
     };
+    let (mode_bits, uid, gid) = inode.meta_perm().unwrap_or_else(|| {
+        let d = match inode.kind() {
+            FileType::Regular => 0o644,
+            FileType::Directory => 0o755,
+            FileType::CharDevice => 0o666,
+            FileType::BlockDevice => 0o660,
+            FileType::Pipe => 0o600,
+            FileType::Symlink => 0o777,
+        };
+        (d, 0, 0)
+    });
+    st.stx_mode = type_bits | ((mode_bits & 0o7777) as u16);
+    st.stx_uid = uid;
+    st.stx_gid = gid;
+    if let Some(f) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsFile>() {
+        let m = *f.meta.lock();
+        st.stx_atime = [m.atime_sec as u64, m.atime_nsec as u64];
+        st.stx_mtime = [m.mtime_sec as u64, m.mtime_nsec as u64];
+        st.stx_ctime = [m.ctime_sec as u64, m.ctime_nsec as u64];
+    } else if let Some(dd) = inode.as_any().downcast_ref::<crate::fs::tmpfs::TmpfsDir>() {
+        let m = *dd.meta.lock();
+        st.stx_atime = [m.atime_sec as u64, m.atime_nsec as u64];
+        st.stx_mtime = [m.mtime_sec as u64, m.mtime_nsec as u64];
+        st.stx_ctime = [m.ctime_sec as u64, m.ctime_nsec as u64];
+    }
     if let Some(d) = inode.as_any().downcast_ref::<crate::fs::devfs::DevNode>() {
         let rdev = d.kind.rdev();
         st.stx_rdev_major = (rdev >> 8) as u32;
         st.stx_rdev_minor = (rdev & 0xff) as u32;
+    } else if let Some(b) = inode.as_any().downcast_ref::<crate::fs::devfs::BlockDevNode>() {
+        st.stx_rdev_major = (b.rdev >> 8) as u32;
+        st.stx_rdev_minor = (b.rdev & 0xff) as u32;
     }
     st.stx_size = inode.size();
     st.stx_blocks = (inode.size() + 511) / 512;
@@ -6061,14 +6383,59 @@ fn sys_chroot(path: usize) -> isize {
     0
 }
 
-fn sys_mount(_source: usize, target: usize, _fstype: usize, _flags: usize, _data: usize) -> isize {
+fn sys_mount(source: usize, target: usize, fstype: usize, _flags: usize, _data: usize) -> isize {
+    const ENODEV: isize = -19;
+    const EIO: isize = -5;
     let Some(target_str) = copy_path(target) else {
         return EFAULT;
     };
+    let source_str = copy_path(source).unwrap_or_default();
+    let fstype_str = copy_path(fstype).unwrap_or_default();
+    // Resolve the mountpoint's parent dir + final name (cwd-aware).
     let start = if target_str.starts_with('/') { fs::root() } else { cwd_inode() };
-    match fs::lookup_path(start, &target_str) {
-        Ok(_) => 0,
-        Err(e) => err_to_isize(e),
+    let (parent, name) = match fs::split_parent(start, &target_str) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
+    };
+    if matches!(fstype_str.as_str(), "ext2" | "ext3" | "ext4") {
+        // Resolve the source block-device node to its underlying device.
+        let s_start = if source_str.starts_with('/') { fs::root() } else { cwd_inode() };
+        let dev = match fs::lookup_path(s_start, &source_str) {
+            Ok(node) => node
+                .as_any()
+                .downcast_ref::<fs::devfs::BlockDevNode>()
+                .map(|b| b.dev.clone()),
+            Err(_) => None,
+        };
+        let Some(dev) = dev else { return ENODEV };
+        // Mount the on-disk ext2; if the device holds no valid ext2 yet
+        // (freshly mkfs'd-as-zero, or never formatted), format it first.
+        let efs = match fs::ext2::mount(dev.clone()) {
+            Ok(f) => f,
+            Err(_) => {
+                if fs::ext2::format(&dev).is_err() {
+                    return EIO;
+                }
+                match fs::ext2::mount(dev) {
+                    Ok(f) => f,
+                    Err(e) => return err_to_isize(e),
+                }
+            }
+        };
+        match fs::mount_at(parent, &name, efs.root_inode()) {
+            Ok(()) => 0,
+            Err(e) => err_to_isize(e),
+        }
+    } else if matches!(fstype_str.as_str(), "tmpfs" | "ramfs") {
+        let d = fs::tmpfs::TmpfsDir::new_root() as Arc<dyn Inode>;
+        match fs::mount_at(parent, &name, d) {
+            Ok(()) => 0,
+            Err(e) => err_to_isize(e),
+        }
+    } else {
+        // proc/sysfs/devpts/cgroup/... — virtual filesystems the kernel
+        // already provides or doesn't need; accept the mount as a no-op.
+        0
     }
 }
 
@@ -6077,10 +6444,14 @@ fn sys_umount2(target: usize, _flags: i32) -> isize {
         return EFAULT;
     };
     let start = if target_str.starts_with('/') { fs::root() } else { cwd_inode() };
-    match fs::lookup_path(start, &target_str) {
-        Ok(_) => 0,
-        Err(e) => err_to_isize(e),
-    }
+    let (parent, name) = match fs::split_parent(start, &target_str) {
+        Ok(v) => v,
+        Err(e) => return err_to_isize(e),
+    };
+    // Restore the covered inode if this was a real mount; unmounting a
+    // virtual/no-op mount just succeeds quietly.
+    let _ = fs::umount_at(&parent, &name);
+    0
 }
 
 fn normalize_path(p: &str) -> String {
@@ -6288,11 +6659,28 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
     // pinning hundreds of frames while it waits to be wait4'd. Under a
     // fork-storm (unixbench SHELL16) the parent reaps slower than
     // children pile up; without eager teardown the frame pool drains
-    // and a later alloc_frame() panics. Only free when no live CLONE_VM
-    // thread shares this address space (strong_count == 1). The page
-    // table root stays (satp is still ours until the scheduler switches)
-    // — only the user data frames are released.
-    if alloc::sync::Arc::strong_count(&task.memory_set) == 1 {
+    // and a later alloc_frame() panics. The page table root stays (satp
+    // is still ours until the scheduler switches) — only the user data
+    // frames are released.
+    //
+    // We must NOT free while another *live* task still executes in this
+    // address space. The old gate (strong_count == 1) got this wrong for
+    // multi-threaded tests: a SIGKILLed thread group leaves *zombie*
+    // threads still holding the shared memory_set Arc, so strong_count
+    // stays > 1 and the free is skipped — leaking the entire address space
+    // (every thread's stack included) until each zombie is individually
+    // reaped. That backlog drains the frame pool and gradually OOMs
+    // pthread-heavy tests (glibc fcntl3x, nptl*). Zombies never run again,
+    // so they don't matter; scan instead for any *non-zombie* task sharing
+    // this exact memory_set (same Arc) — a live CLONE_THREAD sibling, or a
+    // CLONE_VM/vfork child still running in this space. If none, we're the
+    // last live user and it is safe to free right now.
+    let shared_with_live = crate::task::all_tasks().into_iter().any(|t| {
+        t.pid != task.pid
+            && *t.state.lock() != crate::task::TaskState::Zombie
+            && alloc::sync::Arc::ptr_eq(&t.memory_set, &task.memory_set)
+    });
+    if !shared_with_live {
         task.memory_set.lock().free_user_frames();
     }
 
@@ -6318,6 +6706,15 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
         // collects them — otherwise a SIGKILLed test's orphaned grandchildren
         // pin frames forever and eventually wedge the run (fork07 ENOMEM).
         crate::task::reparent_children_to_init(task.pid);
+        // If this leader is itself a session leader (the per-case `setsid
+        // timeout ./foo` wrapper), tear down the rest of its session — the
+        // case's leftover forked children. Otherwise a fork/memory-bomb case
+        // leaks them (reparented to init, still allocating) until the run OOMs.
+        // The init session (sid 1: init + driver shells) is left alone.
+        let my_sid = task.sid.load(core::sync::atomic::Ordering::Relaxed);
+        if my_sid == task.pid {
+            crate::task::kill_session(my_sid, task.pid);
+        }
         let ppid = task.ppid.load(core::sync::atomic::Ordering::Relaxed);
         if let Some(parent) = crate::task::task_by_pid(ppid) {
             {
@@ -7313,15 +7710,37 @@ fn sys_renameat2(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _
     }
     // Re-place under new location. Works on TmpfsDir or Ext4Dir
     // (the two dir flavours that back our writable overlay).
-    if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
-        let _ = td.place_inode(&new_name, inode);
-        0
+    let is_dir = inode.kind() == FileType::Directory;
+    let placed = if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
+        let _ = td.place_inode(&new_name, inode.clone());
+        true
     } else if let Some(ed) = crate::fs::ext4::downcast_dir(&new_parent) {
-        let _ = ed.place_inode(&new_name, inode);
-        0
+        let _ = ed.place_inode(&new_name, inode.clone());
+        true
     } else {
-        ENOENT
+        false
+    };
+    if !placed {
+        return ENOENT;
     }
+    // inotify: paired IN_MOVED_FROM/IN_MOVED_TO (shared cookie) on the two
+    // directories, plus IN_MOVE_SELF on the moved object's own watch.
+    if crate::fs::notify::active() {
+        let cookie = crate::fs::notify::next_cookie();
+        crate::fs::notify::report(
+            None, Some(&old_parent), &old_name,
+            crate::fs::notify::IN_MOVED_FROM, cookie, is_dir,
+        );
+        crate::fs::notify::report(
+            None, Some(&new_parent), &new_name,
+            crate::fs::notify::IN_MOVED_TO, cookie, is_dir,
+        );
+        crate::fs::notify::report(
+            Some(&inode), None, "",
+            crate::fs::notify::IN_MOVE_SELF, 0, is_dir,
+        );
+    }
+    0
 }
 
 fn sys_linkat(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _flags: i32) -> isize {
@@ -7362,6 +7781,21 @@ fn sys_linkat(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _fla
     // The new name must not already exist (link04 expects EEXIST).
     if new_parent.lookup(&new_name).is_ok() {
         return -17; // EEXIST
+    }
+    // Cap the hard-link count and report EMLINK once it is reached. Every real
+    // filesystem has a link limit (glibc's LINK_MAX is just 127, ext4 is
+    // 65000); ours is small but legitimate. Without a cap, linkat02's
+    // tst_fs_fill_hardlinks() keeps calling link() up to MAX_SANE_HARD_LINKS
+    // (65535) probing for the limit — 65k link()s plus the matching unlinks and
+    // a getdents sweep over a 65k-entry directory, which blows past the per-case
+    // timeout and then stalls the whole run inside the `rm -rf` cleanup (it cost
+    // the entire s-z tail of a full sweep: 1052 cases instead of 1291). Stopping
+    // at a bounded count makes the probe terminate immediately and linkat02's
+    // EMLINK subtest pass. The limit is the max value st_nlink reaches, so the
+    // probe returns exactly this and its `st_nlink == i` check holds.
+    const LINK_MAX: u32 = 1000;
+    if src_inode.nlink() >= LINK_MAX {
+        return -31; // EMLINK
     }
     if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
         match td.place_inode(&new_name, src_inode.clone()) {

@@ -615,7 +615,7 @@ fn gen_fd_target(pid: i32, fd: i32) -> Vec<u8> {
     let kind = file.inode.kind();
     let label = match kind {
         FileType::Pipe => format!("pipe:[{}]", fd),
-        FileType::CharDevice => alloc::string::String::from("/dev/null"),
+        FileType::CharDevice | FileType::BlockDevice => alloc::string::String::from("/dev/null"),
         FileType::Directory => alloc::string::String::from("anon_inode:dir"),
         FileType::Regular => alloc::string::String::from("anon_inode:file"),
         FileType::Symlink => alloc::string::String::from("anon_inode:symlink"),
@@ -878,6 +878,7 @@ impl Inode for ProcSysFsDir {
             "file-nr" => Ok(ProcGenFile::new(|| b"0\t0\t9223372036854775807\n".to_vec())),
             "nr_open" => Ok(ProcGenFile::new(|| b"1073741816\n".to_vec())),
             "pipe-max-size" => Ok(ProcGenFile::new(|| b"1048576\n".to_vec())),
+            "inotify" => Ok(Arc::new(ProcSysFsInotifyDir) as Arc<dyn Inode>),
             _ => Err(ENOENT),
         }
     }
@@ -887,6 +888,29 @@ impl Inode for ProcSysFsDir {
             ("file-nr".into(), FileType::Regular),
             ("nr_open".into(), FileType::Regular),
             ("pipe-max-size".into(), FileType::Regular),
+            ("inotify".into(), FileType::Directory),
+        ])
+    }
+}
+
+/// /proc/sys/fs/inotify/* — the tunables LTP's inotify cases read.
+pub struct ProcSysFsInotifyDir;
+impl Inode for ProcSysFsInotifyDir {
+    fn as_any(&self) -> &dyn Any { self }
+    fn kind(&self) -> FileType { FileType::Directory }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        match name {
+            "max_queued_events" => Ok(ProcGenFile::new(|| b"16384\n".to_vec())),
+            "max_user_instances" => Ok(ProcGenFile::new(|| b"128\n".to_vec())),
+            "max_user_watches" => Ok(ProcGenFile::new(|| b"65536\n".to_vec())),
+            _ => Err(ENOENT),
+        }
+    }
+    fn list(&self) -> Result<Vec<(String, FileType)>> {
+        Ok(alloc::vec![
+            ("max_queued_events".into(), FileType::Regular),
+            ("max_user_instances".into(), FileType::Regular),
+            ("max_user_watches".into(), FileType::Regular),
         ])
     }
 }

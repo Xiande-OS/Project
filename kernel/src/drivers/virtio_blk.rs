@@ -9,7 +9,9 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::Mutex; use spin::Once;
 use virtio_drivers::device::blk::VirtIOBlk;
 use virtio_drivers::transport::mmio::MmioTransport;
@@ -144,11 +146,12 @@ const CACHE_MAX_SECTORS: usize = 32768;
 /// let the hot set re-populate; with a 16 MiB ceiling that's infrequent.
 struct BlockCache {
     map: BTreeMap<usize, [u8; SECTOR_BYTES]>,
+    cap: usize,
 }
 
 impl BlockCache {
-    fn new() -> Self {
-        Self { map: BTreeMap::new() }
+    fn new(cap: usize) -> Self {
+        Self { map: BTreeMap::new(), cap }
     }
     fn get(&self, sector: usize, out: &mut [u8]) -> bool {
         if out.len() != SECTOR_BYTES {
@@ -165,7 +168,7 @@ impl BlockCache {
         if data.len() != SECTOR_BYTES {
             return;
         }
-        if self.map.len() >= CACHE_MAX_SECTORS && !self.map.contains_key(&sector) {
+        if self.map.len() >= self.cap && !self.map.contains_key(&sector) {
             self.map.clear();
         }
         let mut a = [0u8; SECTOR_BYTES];
@@ -182,25 +185,57 @@ pub struct BlockDevice {
     cache: Mutex<BlockCache>,
 }
 
-static BLK: Once<Arc<BlockDevice>> = Once::new();
+/// All block devices found at probe time, in scan order. The contest
+/// attaches the read-only on-disk test image on x0 and our writable
+/// scratch (disk.img / disk-la.img) on x1; we register BOTH and pin which
+/// is which at boot via TEST_IMAGE_IDX / SCRATCH_IDX.
+static BLKS: Once<Vec<Arc<BlockDevice>>> = Once::new();
+/// Index into BLKS of the read-only test image — the device whose
+/// superblock carries an ext magic (0xEF53) at probe time. `get()` returns
+/// it, so callers that mount the test image are robust to MMIO/PCI slot
+/// order regardless of how many disks are attached.
+static TEST_IMAGE_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Index into BLKS of our writable scratch — the device WITHOUT an ext
+/// magic at probe time (zeroed by the Makefile, formatted to ext2 at boot).
+/// Pinned BEFORE any format runs, so a freshly written magic can't make it
+/// indistinguishable from the ext4 test image (they share magic 0xEF53).
+static SCRATCH_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// Probe for a virtio-blk device and register it. On riscv64 this scans
-/// the virtio-mmio bank; on loongarch64 it enumerates PCI.
+/// Probe for virtio-blk devices and register them. On riscv64 this scans
+/// the virtio-mmio bank; on loongarch64 it enumerates PCI. Returns the
+/// test-image device (for the existing single-disk callers).
 pub fn init() -> Option<Arc<BlockDevice>> {
     #[cfg(target_arch = "loongarch64")]
-    {
-        return init_pci();
-    }
+    let devs = probe_pci();
     #[cfg(not(target_arch = "loongarch64"))]
-    {
-        init_mmio()
+    let devs = probe_mmio();
+    if devs.is_empty() {
+        return None;
     }
+    // The contest pins the read-only test image on x0 (bus.0 = the first slot
+    // scanned / first PCI function) and our writable scratch on x1 (bus.1 =
+    // the second). Identify by that fixed slot order, which is deterministic
+    // regardless of on-disk content — once the scratch is formatted it shares
+    // ext4's 0xEF53 magic, so content cannot distinguish the two. Device 0 is
+    // always the test image; a second device, if present, is the scratch.
+    TEST_IMAGE_IDX.store(0, Ordering::Relaxed);
+    if devs.len() >= 2 {
+        SCRATCH_IDX.store(1, Ordering::Relaxed);
+    }
+    BLKS.call_once(|| devs);
+    crate::println!(
+        "[virtio-blk] {} device(s): test-image=#{} scratch=#{}",
+        device_count(),
+        TEST_IMAGE_IDX.load(Ordering::Relaxed) as isize,
+        SCRATCH_IDX.load(Ordering::Relaxed) as isize,
+    );
+    get()
 }
 
 /// riscv64 virtio-mmio bank scan. QEMU virt's bank lives at
 /// 0x1000_1000 .. 0x1000_9000 with 0x1000-spaced slots.
 #[cfg(not(target_arch = "loongarch64"))]
-fn init_mmio() -> Option<Arc<BlockDevice>> {
+fn probe_mmio() -> Vec<Arc<BlockDevice>> {
     const BASES: &[usize] = &[
         0x1000_1000,
         0x1000_2000,
@@ -211,6 +246,7 @@ fn init_mmio() -> Option<Arc<BlockDevice>> {
         0x1000_7000,
         0x1000_8000,
     ];
+    let mut out = Vec::new();
     for &base in BASES {
         // Peek DeviceID before opening — MmioTransport::new resets the
         // device on drop, so probing a non-block device with it would
@@ -219,7 +255,9 @@ fn init_mmio() -> Option<Arc<BlockDevice>> {
             // 2 = Block.
             continue;
         }
-        let header = unsafe { NonNull::new(base as *mut VirtIOHeader)? };
+        let Some(header) = (unsafe { NonNull::new(base as *mut VirtIOHeader) }) else {
+            continue;
+        };
         let transport = match unsafe { MmioTransport::new(header) } {
             Ok(t) => t,
             Err(_) => continue,
@@ -234,24 +272,30 @@ fn init_mmio() -> Option<Arc<BlockDevice>> {
                 continue;
             }
         };
+        // Only the first block device (the read-heavy test image) gets the
+        // full 16 MiB read cache; later devices (our write-heavy scratch) get
+        // a small one so a second disk doesn't double the cache RAM.
+        let cap = if out.is_empty() { CACHE_MAX_SECTORS } else { 512 };
         let dev = Arc::new(BlockDevice {
             inner: Mutex::new(BlkInner::Mmio(blk)),
-            cache: Mutex::new(BlockCache::new()),
+            cache: Mutex::new(BlockCache::new(cap)),
         });
-        BLK.call_once(|| dev.clone());
         crate::println!("[virtio-blk] online at {:#x}, capacity={} sectors", base, dev.capacity());
-        return Some(dev);
+        out.push(dev);
     }
-    None
+    out
 }
 
 /// loongarch64 virtio-pci path: enumerate the ECAM, find the first block
 /// device, build a `PciTransport`, and wrap it.
 #[cfg(target_arch = "loongarch64")]
-fn init_pci() -> Option<Arc<BlockDevice>> {
+fn probe_pci() -> Vec<Arc<BlockDevice>> {
     use virtio_drivers::transport::pci::PciTransport;
 
-    let (mut root, devices) = crate::drivers::pci::enumerate()?;
+    let mut out = Vec::new();
+    let Some((mut root, devices)) = crate::drivers::pci::enumerate() else {
+        return out;
+    };
     for d in devices {
         if d.dev_type != DeviceType::Block {
             continue;
@@ -270,22 +314,43 @@ fn init_pci() -> Option<Arc<BlockDevice>> {
                 continue;
             }
         };
+        let cap = if out.is_empty() { CACHE_MAX_SECTORS } else { 512 };
         let dev = Arc::new(BlockDevice {
             inner: Mutex::new(BlkInner::Pci(blk)),
-            cache: Mutex::new(BlockCache::new()),
+            cache: Mutex::new(BlockCache::new(cap)),
         });
-        BLK.call_once(|| dev.clone());
         crate::println!(
             "[virtio-blk] online on PCI {}, capacity={} sectors",
             d.func, dev.capacity()
         );
-        return Some(dev);
+        out.push(dev);
     }
-    None
+    out
 }
 
+/// The read-only on-disk test image (x0). Robust to slot order: returns the
+/// device pinned as the ext-filesystem image at probe time.
 pub fn get() -> Option<Arc<BlockDevice>> {
-    BLK.get().cloned()
+    let devs = BLKS.get()?;
+    let idx = TEST_IMAGE_IDX.load(Ordering::Relaxed);
+    devs.get(idx).or_else(|| devs.first()).cloned()
+}
+
+/// Our writable scratch disk (x1 = disk.img / disk-la.img), if one was
+/// attached. This is the device the writable on-disk filesystems live on;
+/// the test image (`get()`) is never written.
+pub fn get_scratch() -> Option<Arc<BlockDevice>> {
+    let devs = BLKS.get()?;
+    let idx = SCRATCH_IDX.load(Ordering::Relaxed);
+    if idx == usize::MAX {
+        return None;
+    }
+    devs.get(idx).cloned()
+}
+
+/// Number of block devices registered at boot.
+pub fn device_count() -> usize {
+    BLKS.get().map_or(0, |v| v.len())
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
