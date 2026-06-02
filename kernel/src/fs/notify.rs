@@ -453,6 +453,20 @@ impl FanotifyGroup {
         self.report_fid || self.report_dir_fid
     }
 
+    /// Snapshot of marks for /proc/<pid>/fdinfo/<fd>: (mask, ignore_mask,
+    /// mount, ino). fanotify10's show_fanotify_ignore_marks() opens fdinfo and
+    /// counts the inode marks whose ignored_mask is non-zero.
+    pub fn fdinfo_marks(&self) -> Vec<(u64, u64, bool, u64)> {
+        self.marks
+            .lock()
+            .iter()
+            .map(|m| {
+                let ino = Arc::as_ptr(&m.inode) as *const () as u64;
+                (m.mask, m.ignore_mask, m.mount, ino)
+            })
+            .collect()
+    }
+
     pub fn add_mark(&self, inode: Arc<dyn Inode>, mask: u64, mount: bool, ignore: bool) {
         let mut m = self.marks.lock();
         for mk in m.iter_mut() {

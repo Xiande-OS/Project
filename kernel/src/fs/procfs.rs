@@ -181,6 +181,7 @@ impl Inode for ProcPidDir {
             "cwd" => Ok(ProcGenFile::new(move || gen_cwd(pid))),
             "comm" => Ok(ProcGenFile::new(move || gen_comm(pid))),
             "fd" => Ok(Arc::new(ProcFdDir { pid }) as Arc<dyn Inode>),
+            "fdinfo" => Ok(Arc::new(ProcFdInfoDir { pid }) as Arc<dyn Inode>),
             // LTP's cgroup/taint/kconfig probes open /proc/self/mounts,
             // /proc/self/cmdline, etc. The "self" path resolves to here, so
             // mirror the global proc files that some cases happen to read
@@ -218,6 +219,7 @@ impl Inode for ProcPidDir {
             ("cwd".into(), FileType::Regular),
             ("comm".into(), FileType::Regular),
             ("fd".into(), FileType::Directory),
+            ("fdinfo".into(), FileType::Directory),
             ("mounts".into(), FileType::Regular),
             ("cgroup".into(), FileType::Regular),
             ("limits".into(), FileType::Regular),
@@ -275,6 +277,73 @@ impl Inode for ProcFdDir {
         }
         Ok(out)
     }
+}
+
+/// /proc/<pid>/fdinfo/<fd> — per-open-fd info. For fanotify fds we render the
+/// per-mark lines that fanotify10's show_fanotify_ignore_marks() parses
+/// ("fanotify ino:.. mflags: .. mask:.. ignored_mask:..") to count ignore
+/// marks. Other fd types get the generic pos/flags/mnt_id header only.
+pub struct ProcFdInfoDir {
+    pid: i32,
+}
+impl Inode for ProcFdInfoDir {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn kind(&self) -> FileType {
+        FileType::Directory
+    }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        let fd: i32 = name.parse().map_err(|_| ENOENT)?;
+        let task = crate::task::task_by_pid(self.pid).ok_or(ENOENT)?;
+        if task.fd_table.lock().get(fd).is_none() {
+            return Err(ENOENT);
+        }
+        let pid = self.pid;
+        Ok(ProcGenFile::new(move || gen_fdinfo(pid, fd)))
+    }
+    fn list(&self) -> Result<Vec<(String, FileType)>> {
+        let task = crate::task::task_by_pid(self.pid).ok_or(ENOENT)?;
+        let table = task.fd_table.lock();
+        let t = table.table.lock();
+        let mut out = Vec::new();
+        for (i, slot) in t.iter().enumerate() {
+            if slot.is_some() {
+                out.push((alloc::format!("{}", i), FileType::Regular));
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn gen_fdinfo(pid: i32, fd: i32) -> Vec<u8> {
+    let Some(task) = crate::task::task_by_pid(pid) else {
+        return Vec::new();
+    };
+    let Some(file) = task.fd_table.lock().get(fd) else {
+        return Vec::new();
+    };
+    let mut s = alloc::string::String::from("pos:\t0\nflags:\t0100002\nmnt_id:\t9\n");
+    if let Some(fan) = file
+        .inode
+        .as_any()
+        .downcast_ref::<crate::fs::notify::FanotifyFd>()
+    {
+        for (mask, ign, mount, ino) in fan.group.fdinfo_marks() {
+            if mount {
+                s.push_str(&alloc::format!(
+                    "fanotify mnt_id:9 mflags: 0 mask:{:x} ignored_mask:{:x}\n",
+                    mask, ign
+                ));
+            } else {
+                s.push_str(&alloc::format!(
+                    "fanotify ino:{:x} sdev:0 mflags: 0 mask:{:x} ignored_mask:{:x}\n",
+                    ino, mask, ign
+                ));
+            }
+        }
+    }
+    s.into_bytes()
 }
 
 /// Resolves at lookup time to the current task's pid directory.
