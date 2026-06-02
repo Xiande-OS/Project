@@ -6383,9 +6383,11 @@ fn sys_chroot(path: usize) -> isize {
     0
 }
 
-fn sys_mount(source: usize, target: usize, fstype: usize, _flags: usize, _data: usize) -> isize {
+fn sys_mount(source: usize, target: usize, fstype: usize, flags: usize, _data: usize) -> isize {
     const ENODEV: isize = -19;
     const EIO: isize = -5;
+    const MS_BIND: usize = 0x1000;
+    const MS_REMOUNT: usize = 0x0020;
     let Some(target_str) = copy_path(target) else {
         return EFAULT;
     };
@@ -6397,6 +6399,27 @@ fn sys_mount(source: usize, target: usize, fstype: usize, _flags: usize, _data: 
         Ok(v) => v,
         Err(e) => return err_to_isize(e),
     };
+    // Bind mount (MS_BIND): make the target resolve to the *source* directory's
+    // existing inode, so both paths reach the same objects. fanotify10/fanotify16
+    // bind-mount the test dir to a second mountpoint and then mark/generate
+    // events through both paths to check that marks on the same inode merge.
+    // We graft the source inode at the target the same way a real mount does.
+    // MS_REMOUNT on a bind mount only changes flags (e.g. add MS_RDONLY) — the
+    // graft already exists, so accept it as a no-op.
+    if flags & MS_BIND != 0 {
+        if flags & MS_REMOUNT != 0 {
+            return 0;
+        }
+        let s_start = if source_str.starts_with('/') { fs::root() } else { cwd_inode() };
+        let src_inode = match fs::lookup_path(s_start, &source_str) {
+            Ok(i) => i,
+            Err(e) => return err_to_isize(e),
+        };
+        return match fs::mount_at(parent, &name, src_inode) {
+            Ok(()) => 0,
+            Err(e) => err_to_isize(e),
+        };
+    }
     if matches!(fstype_str.as_str(), "ext2" | "ext3" | "ext4") {
         // Resolve the source block-device node to its underlying device.
         let s_start = if source_str.starts_with('/') { fs::root() } else { cwd_inode() };
