@@ -7782,6 +7782,21 @@ fn sys_linkat(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _fla
     if new_parent.lookup(&new_name).is_ok() {
         return -17; // EEXIST
     }
+    // Cap the hard-link count and report EMLINK once it is reached. Every real
+    // filesystem has a link limit (glibc's LINK_MAX is just 127, ext4 is
+    // 65000); ours is small but legitimate. Without a cap, linkat02's
+    // tst_fs_fill_hardlinks() keeps calling link() up to MAX_SANE_HARD_LINKS
+    // (65535) probing for the limit — 65k link()s plus the matching unlinks and
+    // a getdents sweep over a 65k-entry directory, which blows past the per-case
+    // timeout and then stalls the whole run inside the `rm -rf` cleanup (it cost
+    // the entire s-z tail of a full sweep: 1052 cases instead of 1291). Stopping
+    // at a bounded count makes the probe terminate immediately and linkat02's
+    // EMLINK subtest pass. The limit is the max value st_nlink reaches, so the
+    // probe returns exactly this and its `st_nlink == i` check holds.
+    const LINK_MAX: u32 = 1000;
+    if src_inode.nlink() >= LINK_MAX {
+        return -31; // EMLINK
+    }
     if let Some(td) = crate::fs::tmpfs::downcast_dir(&new_parent) {
         match td.place_inode(&new_name, src_inode.clone()) {
             Ok(()) => {
