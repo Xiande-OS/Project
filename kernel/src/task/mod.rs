@@ -681,6 +681,59 @@ static OOM_STREAK_START: AtomicU64 = AtomicU64::new(0);
 /// all here, looping so a chain (zombie parent -> newly-orphaned children)
 /// drains fully. Conservative — only Zombies, and Waiting (parked) tasks whose
 /// real parent is gone; never Ready/Running tasks. Returns the count freed.
+/// OOM killer: SIGKILL the live task holding the most resident user frames,
+/// so its memory is reclaimed when it exits. This is the real fix for two
+/// things: (1) oom01-05 fork a child that allocates until the kernel OOM-kills
+/// it and PASS when they see the victim die by SIGKILL; (2) the whole-run
+/// poweroff — instead of shutting down on sustained allocation failure, we
+/// shed the biggest hog and keep going, so the catch-all tail + libctest +
+/// benchmarks still run.
+///
+/// Never targets init (pid 1) or the contest driver shells (session <= 1):
+/// killing those aborts the entire run. Only fires on a real hog (RSS above a
+/// small floor) so transient pressure doesn't cull innocent small tasks; if no
+/// such victim exists the memory is pinned in unkillable kernel structures and
+/// the caller's terminal-OOM watchdog takes over. Returns the victim pid (0 if
+/// none). Snapshots Arcs under TABLE then inspects per-task locks afterwards,
+/// preserving the scheduler's state-before-TABLE lock order.
+pub fn oom_kill_largest() -> i32 {
+    const INIT_PID: i32 = 1;
+    const RSS_FLOOR: usize = 64; // 256 KiB — ignore trivially-small tasks
+    let cur = current_pid();
+    let candidates: Vec<Arc<Task>> = {
+        let t = TABLE.lock();
+        t.tasks.values().cloned().collect()
+    };
+    let mut best: Option<(i32, usize, Arc<Task>)> = None;
+    for task in candidates {
+        let pid = task.pid;
+        if pid == INIT_PID || task.sid.load(Ordering::Relaxed) <= 1 {
+            continue; // never kill init or the driver shells
+        }
+        if *task.state.lock() == TaskState::Zombie {
+            continue; // already dead, its frames free on reap
+        }
+        let rss = task.memory_set.lock().resident_frames();
+        if rss < RSS_FLOOR {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(_, b, _)| rss > *b) {
+            best = Some((pid, rss, task));
+        }
+    }
+    if let Some((pid, _rss, task)) = best {
+        // SIGKILL cascades to the victim's threads + descendants, so a
+        // multi-process hog (ksm's child set) collapses together. The frames
+        // return as each member hits free_user_frames() at exit. If the victim
+        // is the current task (the oom-test child faulting on its own
+        // allocation), it dies on the next trap-return via check_signals.
+        crate::signal::raise_signal(&task, crate::signal::SIGKILL);
+        let _ = cur;
+        return pid;
+    }
+    0
+}
+
 pub fn emergency_reclaim() -> usize {
     const INIT_PID: i32 = 1;
     let cur = current_pid();
@@ -725,6 +778,23 @@ pub fn emergency_reclaim() -> usize {
         total += freed;
         if freed == 0 {
             break;
+        }
+    }
+
+    // Reaping freed no dead scraps but an allocation is still failing — this is
+    // genuine memory pressure, not a backlog of zombies. Invoke the OOM killer:
+    // shed the largest live hog so its frames return as it exits. oom01-05 fork
+    // a child that allocates until it's OOM-killed and PASS when the victim dies
+    // by SIGKILL; this also stops a single memory-bomb test (ksm, mtest) from
+    // taking the whole run down via the terminal poweroff below. If a victim was
+    // killed, treat it as recovery and let the caller retry — the watchdog only
+    // fires when there is NOTHING killable (memory pinned in kernel structures).
+    if total == 0 {
+        let victim = oom_kill_largest();
+        if victim != 0 {
+            LAST_RECLAIM_TICK.store(crate::arch::now_ticks(), Ordering::Relaxed);
+            OOM_STREAK_START.store(0, Ordering::Relaxed);
+            return 1;
         }
     }
 
