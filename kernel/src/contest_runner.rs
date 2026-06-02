@@ -350,10 +350,23 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
         s.push_str("echo '#### OS COMP TEST GROUP END basic ####'\n");
         return s;
     }
-    // Sort the per-variant script list so cheap/finite scripts run
-    // first and the long-running benchmark ones run last. If a later
-    // script hangs we still bank the easy points.
+    // Two phases over the variants. Phase 0 emits every NON-benchmark group
+    // (basic/lua/busybox/ltp/libctest/iperf/netperf/libcbench/iozone) for
+    // BOTH libc variants; phase 1 then emits the fork-storm benchmarks
+    // (cyclictest/lmbench/unixbench). The variant loop is musl-then-glibc, and
+    // on LoongArch a benchmark fork-storm can fault init (pid 1) and end the
+    // whole run — so when musl's cyclictest killed init, the entire glibc
+    // column scored 0 (it never got to run). Banking both variants' high-yield
+    // correctness groups before any fork-storm benchmark means such a kill can
+    // only cost the benchmark groups (~0 points on LA), never a whole variant's
+    // correctness. order_scripts still orders the groups within each phase.
+    for phase in 0..2 {
+    let want_bench = phase == 1;
     for (dir, scripts) in variants {
+        // No script for this phase → don't even emit the variant header.
+        if !scripts.iter().any(|sc| is_deferred_benchmark(sc) == want_bench) {
+            continue;
+        }
         s.push_str(&alloc::format!("cd {}\n", dir));
         // Point the dynamic loader at this variant's own lib dir. glibc's
         // dynamic test binaries (ltp-glibc, libctest-glibc) DT_NEEDED
@@ -399,6 +412,10 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
         let variant = dir.rsplit('/').next().unwrap_or("musl");
         let ordered = order_scripts(scripts);
         for script in ordered {
+            // Emit only this phase's groups; the other phase covers the rest.
+            if is_deferred_benchmark(&script) != want_bench {
+                continue;
+            }
             // Wrap each script in `busybox timeout` so a single
             // misbehaving testcase can't eat the whole budget. The
             // testcode itself prints START + END markers, but if our
@@ -517,12 +534,27 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
             }
         }
     }
+    }
     s
 }
 
 /// `basic_testcode.sh` -> `basic`, `libctest_testcode.sh` -> `libctest`, etc.
 fn derive_group(script: &str) -> &str {
     script.strip_suffix("_testcode.sh").unwrap_or(script)
+}
+
+/// The fork-storm benchmark groups, deferred to the very end of the run (see
+/// the two-phase rationale in `build_driver_script`). These are the only groups
+/// whose fork/exec storm has faulted init (pid 1) on LoongArch and ended the
+/// run; deferring them past every variant's correctness groups means such a
+/// kill costs only these benchmarks (~0 points on LA), never a whole variant.
+/// lmbench is included because its `lat_proc fork`/`exec` measurements are the
+/// same fork storm; cyclictest spawns a stressor per CPU; unixbench's spawn/
+/// execl/shell loops fork in a tight loop.
+fn is_deferred_benchmark(script: &str) -> bool {
+    script.starts_with("cyclictest_")
+        || script.starts_with("lmbench_")
+        || script.starts_with("unixbench_")
 }
 
 fn order_scripts(scripts: &[String]) -> Vec<String> {
