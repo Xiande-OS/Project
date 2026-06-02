@@ -146,11 +146,12 @@ const CACHE_MAX_SECTORS: usize = 32768;
 /// let the hot set re-populate; with a 16 MiB ceiling that's infrequent.
 struct BlockCache {
     map: BTreeMap<usize, [u8; SECTOR_BYTES]>,
+    cap: usize,
 }
 
 impl BlockCache {
-    fn new() -> Self {
-        Self { map: BTreeMap::new() }
+    fn new(cap: usize) -> Self {
+        Self { map: BTreeMap::new(), cap }
     }
     fn get(&self, sector: usize, out: &mut [u8]) -> bool {
         if out.len() != SECTOR_BYTES {
@@ -167,7 +168,7 @@ impl BlockCache {
         if data.len() != SECTOR_BYTES {
             return;
         }
-        if self.map.len() >= CACHE_MAX_SECTORS && !self.map.contains_key(&sector) {
+        if self.map.len() >= self.cap && !self.map.contains_key(&sector) {
             self.map.clear();
         }
         let mut a = [0u8; SECTOR_BYTES];
@@ -271,9 +272,13 @@ fn probe_mmio() -> Vec<Arc<BlockDevice>> {
                 continue;
             }
         };
+        // Only the first block device (the read-heavy test image) gets the
+        // full 16 MiB read cache; later devices (our write-heavy scratch) get
+        // a small one so a second disk doesn't double the cache RAM.
+        let cap = if out.is_empty() { CACHE_MAX_SECTORS } else { 512 };
         let dev = Arc::new(BlockDevice {
             inner: Mutex::new(BlkInner::Mmio(blk)),
-            cache: Mutex::new(BlockCache::new()),
+            cache: Mutex::new(BlockCache::new(cap)),
         });
         crate::println!("[virtio-blk] online at {:#x}, capacity={} sectors", base, dev.capacity());
         out.push(dev);
@@ -309,9 +314,10 @@ fn probe_pci() -> Vec<Arc<BlockDevice>> {
                 continue;
             }
         };
+        let cap = if out.is_empty() { CACHE_MAX_SECTORS } else { 512 };
         let dev = Arc::new(BlockDevice {
             inner: Mutex::new(BlkInner::Pci(blk)),
-            cache: Mutex::new(BlockCache::new()),
+            cache: Mutex::new(BlockCache::new(cap)),
         });
         crate::println!(
             "[virtio-blk] online on PCI {}, capacity={} sectors",

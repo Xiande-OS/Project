@@ -33,6 +33,10 @@ pub fn active() -> bool {
     WATCH_COUNT.load(Ordering::Relaxed) > 0
 }
 
+/// Max queued events per group (Linux's default max_queued_events). Bounds
+/// per-group memory so a reader that stops draining can't leak the kernel.
+const EVENT_QUEUE_CAP: usize = 16384;
+
 /// A fresh nonzero cookie tying an IN_MOVED_FROM to its IN_MOVED_TO.
 static MOVE_COOKIE: AtomicU32 = AtomicU32::new(1);
 pub fn next_cookie() -> u32 {
@@ -160,6 +164,18 @@ impl InotifyGroup {
                 if last.wd == e.wd && last.mask == e.mask && last.name == e.name {
                     return;
                 }
+            }
+            // Bounded queue (Linux's max_queued_events): on overflow, keep a
+            // single IN_Q_OVERFLOW marker instead of growing without bound — a
+            // reader that stops draining must not be able to leak the kernel.
+            if q.len() >= EVENT_QUEUE_CAP {
+                if let Some(last) = q.back() {
+                    if last.mask == IN_Q_OVERFLOW {
+                        return;
+                    }
+                }
+                q.push_back(InEvent { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: None });
+                return;
             }
             q.push_back(e);
         }
@@ -462,6 +478,11 @@ impl FanotifyGroup {
                 if last.mask == e.mask && Arc::ptr_eq(&last.inode, &e.inode) {
                     return;
                 }
+            }
+            // Bounded queue: drop new events past the cap (a stalled reader
+            // must not grow the queue without bound).
+            if q.len() >= EVENT_QUEUE_CAP {
+                return;
             }
             q.push_back(e);
         }

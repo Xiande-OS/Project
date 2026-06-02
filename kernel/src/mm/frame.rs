@@ -19,6 +19,7 @@ static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(0);
 /// Pages currently handed out (in-use). Decremented on dealloc.
 static ALLOCATED_PAGES: AtomicUsize = AtomicUsize::new(0);
 
+
 /// Register the [start, end) physical range as the kernel's free frame pool.
 /// Pass `[__kernel_end .. MEMORY_END)` from boot.
 pub fn init(pa_start: PhysAddr, pa_end: PhysAddr) {
