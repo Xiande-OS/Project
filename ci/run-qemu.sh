@@ -41,7 +41,7 @@ else
       -drive file="$SCRATCH",if=none,format=raw,id=x1 \
       -device virtio-blk-pci,drive=x1 \
       -no-reboot \
-      -device virtio-net-pci,netdev=net -netdev user,id=net \
+      -device virtio-net-pci,netdev=net,romfile= -netdev user,id=net \
       -rtc base=utc > "$LOG" 2>&1 || true
 fi
 
