@@ -51,10 +51,3 @@ pub fn init() {
             .init(KERNEL_HEAP.as_mut_ptr() as usize, KERNEL_HEAP_SIZE);
     }
 }
-
-/// (used_bytes, total_bytes) of the kernel heap — for leak diagnosis. The
-/// buddy allocator tracks actual allocated bytes; total is our static pool.
-pub fn stats() -> (usize, usize) {
-    let used = HEAP_ALLOCATOR.0.lock().stats_alloc_actual();
-    (used, KERNEL_HEAP_SIZE)
-}

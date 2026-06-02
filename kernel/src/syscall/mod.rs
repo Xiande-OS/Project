@@ -7000,22 +7000,6 @@ fn looks_like_text(data: &[u8]) -> bool {
 }
 
 fn sys_execve(path_addr: usize, argv_addr: usize, envp_addr: usize) -> isize {
-    // TEMP leak diagnosis: every 25 execs, print heap + frame usage so we can
-    // see memory grow (and not recover) across the catch-all. Remove once the
-    // pre-existing leak that OOMs the run at ~1531 cases is fixed.
-    {
-        static EXEC_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-        let n = EXEC_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n % 25 == 0 {
-            let (hu, ht) = crate::mm::heap::stats();
-            let (fa, ft) = crate::mm::frame_stats();
-            crate::println!(
-                "[memstat exec#{}] heap {}/{} MiB  frames {}/{} ({} MiB)  tasks={}",
-                n, hu >> 20, ht >> 20, fa, ft, (fa * 4096) >> 20,
-                crate::task::all_tasks().len()
-            );
-        }
-    }
     let Some(path) = copy_path(path_addr) else {
         return EFAULT;
     };
