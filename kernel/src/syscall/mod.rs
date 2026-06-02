@@ -1571,6 +1571,31 @@ fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
             TTY_FG_PGID.store(pg, core::sync::atomic::Ordering::Relaxed);
             0
         }
+        // Block-device geometry. LTP's tst_device reads the device size and
+        // skips a device smaller than the test wants ("Skipping size 0MB");
+        // without these it saw 0 and every .needs_device case TBROK'd.
+        0x8008_1272 | 0x1260 | 0x1268 | 0x8008_1270 => {
+            const BLKGETSIZE64: u32 = 0x8008_1272; // u64 bytes
+            const BLKGETSIZE: u32 = 0x1260; // unsigned long, 512-byte sectors
+            const BLKSSZGET: u32 = 0x1268; // int, logical sector size
+            const BLKBSZGET: u32 = 0x8008_1270; // size_t, block size
+            let dev = task.fd_table.lock().get(fd).and_then(|f| {
+                f.inode
+                    .as_any()
+                    .downcast_ref::<crate::fs::devfs::BlockDevNode>()
+                    .map(|b| b.dev.clone())
+            });
+            let Some(dev) = dev else { return 0 };
+            let bytes: u64 = dev.capacity() * 512;
+            let _ = (BLKGETSIZE64, BLKGETSIZE, BLKSSZGET, BLKBSZGET);
+            let ok = match req {
+                BLKGETSIZE64 => task.copy_out_bytes(arg, &bytes.to_le_bytes()).is_some(),
+                BLKBSZGET => task.copy_out_bytes(arg, &4096u64.to_le_bytes()).is_some(),
+                BLKGETSIZE => task.copy_out_bytes(arg, &(bytes / 512).to_le_bytes()).is_some(),
+                _ => task.copy_out_bytes(arg, &512i32.to_le_bytes()).is_some(), // BLKSSZGET
+            };
+            if ok { 0 } else { EFAULT }
+        }
         _ => 0,
     }
 }
@@ -1804,7 +1829,10 @@ fn sys_fanotify_mark(fd: i32, flags: u32, mask: u64, dirfd: i32, path: usize) ->
     else {
         return EINVAL;
     };
+    const FAN_MARK_IGNORED_MASK: u32 = 0x0000_0020;
+    const FAN_MARK_IGNORE: u32 = 0x0000_0400;
     let mount = flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0;
+    let ignore = flags & (FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORE) != 0;
     if flags & FAN_MARK_FLUSH != 0 {
         group.flush(mount);
         return 0;
@@ -1827,7 +1855,7 @@ fn sys_fanotify_mark(fd: i32, flags: u32, mask: u64, dirfd: i32, path: usize) ->
         }
     };
     if flags & FAN_MARK_ADD != 0 {
-        group.add_mark(inode, mask, mount);
+        group.add_mark(inode, mask, mount, ignore);
         0
     } else if flags & FAN_MARK_REMOVE != 0 {
         group.remove_mark(&inode, mask, mount);

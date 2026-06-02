@@ -399,6 +399,10 @@ const FANOTIFY_METADATA_VERSION: u8 = 3;
 struct FanMark {
     inode: Arc<dyn Inode>,
     mask: u64,
+    /// Ignore mask: events in this set are suppressed for this object
+    /// (FAN_MARK_IGNORED_MASK). fanotify10 checks that inode + mount ignore
+    /// masks merge correctly.
+    ignore_mask: u64,
     mount: bool, // a mount/filesystem-wide mark: matches any object
 }
 
@@ -449,15 +453,20 @@ impl FanotifyGroup {
         self.report_fid || self.report_dir_fid
     }
 
-    pub fn add_mark(&self, inode: Arc<dyn Inode>, mask: u64, mount: bool) {
+    pub fn add_mark(&self, inode: Arc<dyn Inode>, mask: u64, mount: bool, ignore: bool) {
         let mut m = self.marks.lock();
         for mk in m.iter_mut() {
             if Arc::ptr_eq(&mk.inode, &inode) && mk.mount == mount {
-                mk.mask |= mask;
+                if ignore {
+                    mk.ignore_mask |= mask;
+                } else {
+                    mk.mask |= mask;
+                }
                 return;
             }
         }
-        m.push(FanMark { inode, mask, mount });
+        let (mask, ignore_mask) = if ignore { (0, mask) } else { (mask, 0) };
+        m.push(FanMark { inode, mask, ignore_mask, mount });
         WATCH_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -648,27 +657,34 @@ fn report_fanotify(
         return;
     }
     for g in groups {
-        let mut hit: Option<u64> = None;
+        let mut report_bits = 0u64;
+        let mut ignore_bits = 0u64;
         {
             let marks = g.marks.lock();
             for mk in marks.iter() {
-                if mk.mask & mask == 0 {
-                    continue;
-                }
-                if is_dir && mk.mask & FAN_ONDIR == 0 {
-                    continue;
-                }
                 // A mount/fs mark matches any object; an inode mark matches its
                 // own inode whether it's the target or the parent dir.
-                let m = mk.mount
+                let matches_obj = mk.mount
                     || target.map_or(false, |t| Arc::ptr_eq(&mk.inode, t))
                     || parent.map_or(false, |p| Arc::ptr_eq(&mk.inode, p));
-                if m {
-                    hit = Some(hit.unwrap_or(0) | (mk.mask & mask));
+                if !matches_obj {
+                    continue;
                 }
+                // For a directory event, a mark participates only if it asked
+                // for FAN_ONDIR (in its report or ignore set).
+                if is_dir && (mk.mask | mk.ignore_mask) & FAN_ONDIR == 0 {
+                    continue;
+                }
+                report_bits |= mk.mask & mask;
+                ignore_bits |= mk.ignore_mask & mask;
             }
         }
-        let Some(m) = hit else { continue };
+        // fanotify reports the bits a mark requested minus the bits an
+        // (merged inode + mount) ignore mask suppresses — fanotify10's check.
+        let m = report_bits & !ignore_bits;
+        if m == 0 {
+            continue;
+        }
         // Which object's handle the event reports, and whether to attach the
         // name: DFID/DFID_NAME report the parent directory; FID (and the
         // legacy fd mode) report the affected object itself.

@@ -78,7 +78,7 @@ endif
 # LTP cases. The read-only test image stays on x0; this never touches it.
 DISK_RV   := disk.img
 DISK_LA   := disk-la.img
-DISK_SIZE := 256M
+DISK_SIZE := 512M
 
 all: kernel-rv kernel-la disks
 
