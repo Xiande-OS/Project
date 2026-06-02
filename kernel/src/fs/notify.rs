@@ -404,7 +404,12 @@ struct FanMark {
 
 struct FanEvent {
     mask: u64,
-    inode: Arc<dyn Inode>,
+    // Weak so a queued event never keeps the affected object (and its data
+    // frames — e.g. a tmpfs file) alive after it's deleted/the test's
+    // `rm -rf /tmp/*`. A stale event (target gone) is dropped at read time.
+    // This is what stops a mount/filesystem-mark group from leaking memory
+    // as it accumulates system-wide events.
+    inode: Weak<dyn Inode>,
 }
 
 pub struct FanotifyGroup {
@@ -475,7 +480,7 @@ impl FanotifyGroup {
             let mut q = self.events.lock();
             // Coalesce identical consecutive events on the same object.
             if let Some(last) = q.back() {
-                if last.mask == e.mask && Arc::ptr_eq(&last.inode, &e.inode) {
+                if last.mask == e.mask && Weak::ptr_eq(&last.inode, &e.inode) {
                     return;
                 }
             }
@@ -522,8 +527,11 @@ impl FanotifyGroup {
                 q.pop_front()
             };
             let Some(ev) = ev else { break };
+            // Upgrade the weak target; a stale event (object already freed)
+            // is dropped — an fd to a deleted file would be useless anyway.
+            let Some(inode) = ev.inode.upgrade() else { continue };
             // Open an fd to the affected object for the reader.
-            let file = Arc::new(crate::fs::File::from_inode(ev.inode.clone(), true, false, false));
+            let file = Arc::new(crate::fs::File::from_inode(inode, true, false, false));
             let fd = match task.fd_table.lock().alloc(file, false) {
                 Ok(fd) => fd as i32,
                 Err(_) => -1,
@@ -580,7 +588,7 @@ fn report_fanotify(target: Option<&Arc<dyn Inode>>, mask: u64, is_dir: bool) {
             }
         }
         if let Some(m) = hit {
-            g.push_event(FanEvent { mask: m, inode: t.clone() });
+            g.push_event(FanEvent { mask: m, inode: Arc::downgrade(t) });
         }
     }
 }
