@@ -415,6 +415,11 @@ struct FanEvent {
     inode: Weak<dyn Inode>,
     // Entry name for DFID_NAME events (None for FID/DFID self events).
     name: Option<String>,
+    // PID of the process that triggered the event (captured when the fs-op
+    // hook fires, i.e. the process doing the open/read/etc.), NOT the reader.
+    // fanotify10 forks a child to generate events and checks event->pid ==
+    // child_pid; reporting the reader's pid failed every such case.
+    pid: i32,
 }
 
 pub struct FanotifyGroup {
@@ -610,7 +615,7 @@ impl FanotifyGroup {
                 buf[off + 6..off + 8].copy_from_slice(&(META as u16).to_le_bytes());
                 buf[off + 8..off + 16].copy_from_slice(&ev.mask.to_le_bytes());
                 buf[off + 16..off + 20].copy_from_slice(&FAN_NOFD.to_le_bytes());
-                buf[off + 20..off + 24].copy_from_slice(&(task.pid).to_le_bytes());
+                buf[off + 20..off + 24].copy_from_slice(&(ev.pid).to_le_bytes());
                 let i = off + META;
                 for b in &mut buf[i..off + total] {
                     *b = 0; // zero hdr pad + fsid + name padding
@@ -639,7 +644,7 @@ impl FanotifyGroup {
             buf[off + 6..off + 8].copy_from_slice(&(META as u16).to_le_bytes());
             buf[off + 8..off + 16].copy_from_slice(&ev.mask.to_le_bytes());
             buf[off + 16..off + 20].copy_from_slice(&fd.to_le_bytes());
-            buf[off + 20..off + 24].copy_from_slice(&(task.pid).to_le_bytes());
+            buf[off + 20..off + 24].copy_from_slice(&(ev.pid).to_le_bytes());
             off += META;
         }
         off
@@ -721,6 +726,7 @@ fn report_fanotify(
                 mask: em,
                 inode: Arc::downgrade(fo),
                 name: ev_name,
+                pid: crate::task::current_pid(),
             });
         }
     }
