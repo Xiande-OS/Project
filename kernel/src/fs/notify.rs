@@ -263,7 +263,7 @@ pub fn report(
         return;
     }
     // Fan to fanotify groups too (basic event bits share inotify's values).
-    report_fanotify(target, mask as u64, is_dir);
+    report_fanotify(target, parent, name, mask as u64, is_dir);
     // Snapshot live inotify groups, then release the registry lock before
     // touching any group (avoids holding two locks across the fan-out).
     let groups: Vec<Arc<InotifyGroup>> = {
@@ -404,12 +404,13 @@ struct FanMark {
 
 struct FanEvent {
     mask: u64,
-    // Weak so a queued event never keeps the affected object (and its data
-    // frames — e.g. a tmpfs file) alive after it's deleted/the test's
-    // `rm -rf /tmp/*`. A stale event (target gone) is dropped at read time.
-    // This is what stops a mount/filesystem-mark group from leaking memory
-    // as it accumulates system-wide events.
+    // The object whose file handle this event reports. In FID mode that's the
+    // affected object; in DFID/DFID_NAME mode it's the parent directory.
+    // Weak so a queued event never keeps it (or a tmpfs file's data) alive
+    // after deletion — a stale event is dropped at read time.
     inode: Weak<dyn Inode>,
+    // Entry name for DFID_NAME events (None for FID/DFID self events).
+    name: Option<String>,
 }
 
 pub struct FanotifyGroup {
@@ -417,26 +418,35 @@ pub struct FanotifyGroup {
     events: Mutex<VecDeque<FanEvent>>,
     read_waiters: Mutex<Vec<i32>>,
     pub nonblock: bool,
-    /// FAN_REPORT_FID: events carry a file handle (fanotify_event_info_fid)
-    /// and FAN_NOFD instead of an open fd.
+    /// FAN_REPORT_FID: events carry the affected object's file handle.
     pub report_fid: bool,
+    /// FAN_REPORT_DIR_FID: events carry the PARENT directory's file handle.
+    pub report_dir_fid: bool,
+    /// FAN_REPORT_NAME (with DIR_FID = FAN_REPORT_DFID_NAME): also the name.
+    pub report_name: bool,
 }
 
 static FAN_GROUPS: Mutex<Vec<Weak<FanotifyGroup>>> = Mutex::new(Vec::new());
 
 impl FanotifyGroup {
-    pub fn new(nonblock: bool, report_fid: bool) -> Arc<Self> {
+    pub fn new(nonblock: bool, report_fid: bool, report_dir_fid: bool, report_name: bool) -> Arc<Self> {
         let g = Arc::new(Self {
             marks: Mutex::new(Vec::new()),
             events: Mutex::new(VecDeque::new()),
             read_waiters: Mutex::new(Vec::new()),
             nonblock,
             report_fid,
+            report_dir_fid,
+            report_name,
         });
         let mut reg = FAN_GROUPS.lock();
         reg.retain(|w| w.strong_count() > 0);
         reg.push(Arc::downgrade(&g));
         g
+    }
+    /// Any FID-family reporting (FID, DFID, or DFID_NAME).
+    pub fn any_fid(&self) -> bool {
+        self.report_fid || self.report_dir_fid
     }
 
     pub fn add_mark(&self, inode: Arc<dyn Inode>, mask: u64, mount: bool) {
@@ -487,7 +497,7 @@ impl FanotifyGroup {
             // FAN_CLOSE_NOWRITE on one object into a single mask=0x30 event
             // (fanotify13 checks this). Distinct objects stay separate.
             if let Some(last) = q.back_mut() {
-                if Weak::ptr_eq(&last.inode, &e.inode) {
+                if Weak::ptr_eq(&last.inode, &e.inode) && last.name == e.name {
                     last.mask |= e.mask;
                     return;
                 }
@@ -538,25 +548,40 @@ impl FanotifyGroup {
             // Upgrade the weak target; a stale event (object already freed)
             // is dropped — an fd/handle to a deleted file is useless anyway.
             let Some(inode) = ev.inode.upgrade() else { continue };
-            if self.report_fid {
-                // FAN_REPORT_FID: metadata (fd = FAN_NOFD) followed by a
-                // fanotify_event_info_fid record carrying a file handle whose
-                // bytes equal name_to_handle_at(2)'s (both = the inode's
-                // st_ino == Arc pointer). Layout:
-                //   info hdr: info_type(u8)=1(FID), pad(u8), len(u16)
-                //   fsid: __kernel_fsid_t (two i32, =0 to match statfs)
+            if self.any_fid() {
+                // FID family: metadata (fd = FAN_NOFD) + a
+                // fanotify_event_info_fid record. info_type is DFID_NAME(2)
+                // when a name is reported, DFID(3) for dir-fid only, else
+                // FID(1). The handle bytes are the reported object's st_ino
+                // (== Arc pointer == name_to_handle_at(2)'s handle). Layout:
+                //   hdr(4): info_type(u8), pad(u8), len(u16)
+                //   fsid(8) = 0 (matches our statfs f_fsid)
                 //   file_handle: handle_bytes(u32)=8, handle_type(i32)=1,
                 //                f_handle[8] = st_ino
-                const INFO_LEN: usize = 4 + 8 + 16; // 28
-                const TOTAL: usize = META + INFO_LEN; // 52
-                if off + TOTAL > buf.len() {
-                    // Re-queue and stop; the caller will read it next time.
+                //   name[]: for DFID_NAME, NUL-terminated, right after f_handle
+                let st_ino = Arc::as_ptr(&inode) as *const () as u64;
+                let with_name = self.report_name && ev.name.is_some();
+                let info_type: u8 = if with_name {
+                    2 // FAN_EVENT_INFO_TYPE_DFID_NAME
+                } else if self.report_dir_fid {
+                    3 // FAN_EVENT_INFO_TYPE_DFID
+                } else {
+                    1 // FAN_EVENT_INFO_TYPE_FID
+                };
+                let nm: &[u8] = if with_name {
+                    ev.name.as_deref().unwrap().as_bytes()
+                } else {
+                    &[]
+                };
+                let name_field = if with_name { nm.len() + 1 } else { 0 };
+                let info_len = (4 + 8 + 16 + name_field + 3) & !3; // 4-byte aligned
+                let total = META + info_len;
+                if off + total > buf.len() {
                     self.events.lock().push_front(ev);
                     break;
                 }
-                let st_ino = Arc::as_ptr(&inode) as *const () as u64;
                 const FAN_NOFD: i32 = -1;
-                buf[off..off + 4].copy_from_slice(&(TOTAL as u32).to_le_bytes());
+                buf[off..off + 4].copy_from_slice(&(total as u32).to_le_bytes());
                 buf[off + 4] = FANOTIFY_METADATA_VERSION;
                 buf[off + 5] = 0;
                 buf[off + 6..off + 8].copy_from_slice(&(META as u16).to_le_bytes());
@@ -564,17 +589,19 @@ impl FanotifyGroup {
                 buf[off + 16..off + 20].copy_from_slice(&FAN_NOFD.to_le_bytes());
                 buf[off + 20..off + 24].copy_from_slice(&(task.pid).to_le_bytes());
                 let i = off + META;
-                buf[i] = 1; // FAN_EVENT_INFO_TYPE_FID
-                buf[i + 1] = 0;
-                buf[i + 2..i + 4].copy_from_slice(&(INFO_LEN as u16).to_le_bytes());
-                // fsid (8 bytes) = 0
-                for b in &mut buf[i + 4..i + 12] {
-                    *b = 0;
+                for b in &mut buf[i..off + total] {
+                    *b = 0; // zero hdr pad + fsid + name padding
                 }
-                buf[i + 12..i + 16].copy_from_slice(&8u32.to_le_bytes()); // handle_bytes
-                buf[i + 16..i + 20].copy_from_slice(&1i32.to_le_bytes()); // handle_type
+                buf[i] = info_type;
+                buf[i + 2..i + 4].copy_from_slice(&(info_len as u16).to_le_bytes());
+                // fsid at i+4..i+12 stays 0
+                buf[i + 12..i + 16].copy_from_slice(&8u32.to_le_bytes());
+                buf[i + 16..i + 20].copy_from_slice(&1i32.to_le_bytes());
                 buf[i + 20..i + 28].copy_from_slice(&st_ino.to_le_bytes());
-                off += TOTAL;
+                if with_name {
+                    buf[i + 28..i + 28 + nm.len()].copy_from_slice(nm);
+                }
+                off += total;
                 continue;
             }
             // Default (notification) mode: open an fd to the object.
@@ -606,7 +633,13 @@ impl Drop for FanotifyGroup {
 }
 
 /// Fan a filesystem event to fanotify groups. Called from [`report`].
-fn report_fanotify(target: Option<&Arc<dyn Inode>>, mask: u64, is_dir: bool) {
+fn report_fanotify(
+    target: Option<&Arc<dyn Inode>>,
+    parent: Option<&Arc<dyn Inode>>,
+    name: &str,
+    mask: u64,
+    is_dir: bool,
+) {
     let groups: Vec<Arc<FanotifyGroup>> = {
         let g = FAN_GROUPS.lock();
         g.iter().filter_map(|w| w.upgrade()).collect()
@@ -614,8 +647,6 @@ fn report_fanotify(target: Option<&Arc<dyn Inode>>, mask: u64, is_dir: bool) {
     if groups.is_empty() {
         return;
     }
-    let Some(t) = target else { return };
-    // A directory event only matches a mark that asked for FAN_ONDIR.
     for g in groups {
         let mut hit: Option<u64> = None;
         {
@@ -627,15 +658,40 @@ fn report_fanotify(target: Option<&Arc<dyn Inode>>, mask: u64, is_dir: bool) {
                 if is_dir && mk.mask & FAN_ONDIR == 0 {
                     continue;
                 }
-                // A mount/fs mark matches any object; an inode mark matches
-                // only its own inode.
-                if mk.mount || Arc::ptr_eq(&mk.inode, t) {
+                // A mount/fs mark matches any object; an inode mark matches its
+                // own inode whether it's the target or the parent dir.
+                let m = mk.mount
+                    || target.map_or(false, |t| Arc::ptr_eq(&mk.inode, t))
+                    || parent.map_or(false, |p| Arc::ptr_eq(&mk.inode, p));
+                if m {
                     hit = Some(hit.unwrap_or(0) | (mk.mask & mask));
                 }
             }
         }
-        if let Some(m) = hit {
-            g.push_event(FanEvent { mask: m, inode: Arc::downgrade(t) });
+        let Some(m) = hit else { continue };
+        // Which object's handle the event reports, and whether to attach the
+        // name: DFID/DFID_NAME report the parent directory; FID (and the
+        // legacy fd mode) report the affected object itself.
+        let (fid_obj, ev_name) = if g.report_dir_fid {
+            let p = parent.or(target);
+            let nm = if g.report_name && !name.is_empty() {
+                Some(String::from(name))
+            } else {
+                None
+            };
+            (p, nm)
+        } else {
+            (target.or(parent), None)
+        };
+        if let Some(fo) = fid_obj {
+            // FAN_ONDIR (== IN_ISDIR bit) when the affected entry is a
+            // directory — fanotify16 checks e.g. 0x40000100 for creating a dir.
+            let em = if is_dir { m | FAN_ONDIR } else { m };
+            g.push_event(FanEvent {
+                mask: em,
+                inode: Arc::downgrade(fo),
+                name: ev_name,
+            });
         }
     }
 }

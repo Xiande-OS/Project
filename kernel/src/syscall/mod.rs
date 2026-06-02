@@ -1765,12 +1765,20 @@ fn sys_inotify_rm_watch(fd: i32, wd: i32) -> isize {
 fn sys_fanotify_init(flags: u32, _event_f_flags: u32) -> isize {
     const FAN_CLOEXEC: u32 = 0x0000_0001;
     const FAN_NONBLOCK: u32 = 0x0000_0002;
-    const FAN_REPORT_DIR_FID: u32 = 0x0000_0400;
     const FAN_REPORT_FID: u32 = 0x0000_0200;
-    // FAN_REPORT_FID or FAN_REPORT_DFID_NAME (which includes DIR_FID) → the
-    // group reports file handles instead of fds.
-    let report_fid = flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID) != 0;
-    let group = crate::fs::notify::FanotifyGroup::new(flags & FAN_NONBLOCK != 0, report_fid);
+    const FAN_REPORT_DIR_FID: u32 = 0x0000_0400;
+    const FAN_REPORT_NAME: u32 = 0x0000_0800;
+    // FID reports the affected object's handle; DIR_FID reports the parent
+    // directory's; NAME (with DIR_FID = DFID_NAME) also reports the entry name.
+    let report_fid = flags & FAN_REPORT_FID != 0;
+    let report_dir_fid = flags & FAN_REPORT_DIR_FID != 0;
+    let report_name = flags & FAN_REPORT_NAME != 0;
+    let group = crate::fs::notify::FanotifyGroup::new(
+        flags & FAN_NONBLOCK != 0,
+        report_fid,
+        report_dir_fid,
+        report_name,
+    );
     let n: Arc<dyn Inode> = Arc::new(crate::fs::notify::FanotifyFd { group });
     let file = Arc::new(crate::fs::File::from_inode(n, true, false, false));
     match current_task().fd_table.lock().alloc(file, flags & FAN_CLOEXEC != 0) {
