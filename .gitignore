@@ -10,6 +10,10 @@
 /kernel-la
 # Local SYSTRACE=1 build used for ad-hoc debugging
 /kernel-rv-trace
+# Zeroed scratch disks `make all` generates for the writable `-drive
+# file=disk*.img` scratch device (LTP tst_device). Regenerated each build.
+/disk.img
+/disk-la.img
 
 # `make prepare` materialises these from cargo/ on contest boxes
 # where hidden dirs got stripped on clone. Don't commit them — the

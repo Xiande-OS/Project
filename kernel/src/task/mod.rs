@@ -825,6 +825,43 @@ pub fn any_waiting() -> bool {
 
 /// Diagnostic: dump why the scheduler can't make progress. Counts tasks by
 /// state and lists the Waiting/Running ones (with parent liveness) so a
+/// Env-gated leak tracer (`MEMTRACE=1` at build time). Prints free frames and
+/// task-state counts every ~2s of uptime so a long contest run shows whether
+/// memory or the task table is leaking — the suspected cause of the LA LTP
+/// throughput degradation (cases slow ~15x by mid-run). Compile-time gated:
+/// the body vanishes in a normal build, so it costs nothing in the shipped
+/// kernel.
+static MEMTRACE_LAST: AtomicU64 = AtomicU64::new(0);
+#[inline]
+pub fn memtrace_tick() {
+    if option_env!("MEMTRACE").is_none() {
+        return;
+    }
+    let now = crate::arch::now_ticks();
+    let last = MEMTRACE_LAST.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < crate::arch::TICKS_PER_SEC * 2 {
+        return;
+    }
+    MEMTRACE_LAST.store(now, Ordering::Relaxed);
+    let (total, free) = crate::mm::frame_stats();
+    let t = TABLE.lock();
+    let (mut ready, mut running, mut waiting, mut zombie) = (0u32, 0u32, 0u32, 0u32);
+    for task in t.tasks.values() {
+        match *task.state.lock() {
+            TaskState::Ready => ready += 1,
+            TaskState::Running => running += 1,
+            TaskState::Waiting => waiting += 1,
+            TaskState::Zombie => zombie += 1,
+        }
+    }
+    let n = t.tasks.len();
+    drop(t);
+    crate::println!(
+        "[memtrace] free={}/{} frames  tasks={} (rdy={} run={} wait={} zomb={})",
+        free, total, n, ready, running, waiting, zombie,
+    );
+}
+
 /// resource leak (hundreds of tasks) is distinguishable from a deadlock (a few
 /// stuck waiters). Retained for scheduler bring-up debugging.
 #[allow(dead_code)]
@@ -1756,6 +1793,9 @@ fn schedule_next_after_trap_inner(current_tf: *mut TrapFrame) -> *mut TrapFrame 
     }
 
     let cur_pid = current_pid();
+
+    // Env-gated (`MEMTRACE=1`) leak tracer; no-op in a normal build.
+    memtrace_tick();
 
     // Sweep futex timeouts every trap exit; cheap on an empty queue.
     crate::sync::futex::poll_timeouts();

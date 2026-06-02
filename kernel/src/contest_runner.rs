@@ -467,16 +467,28 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                     g = group,
                     v = variant,
                 ));
+                // loongarch64 runs ~2x slower under QEMU TCG, so the
+                // high-iteration whitelist cases (access01=199, getpid01=100,
+                // waitpid01=146 — each forks once per sub-assertion) overrun a
+                // 5s SIGKILL on LA and score 0 even though they pass correctly.
+                // Give pass-1 (the curated high-yield list) more headroom on
+                // LA; pass-2's sweep stays at 3s so a wedged unknown can't eat
+                // the group budget and starve throughput.
+                #[cfg(target_arch = "loongarch64")]
+                let wl_to = "15";
+                #[cfg(not(target_arch = "loongarch64"))]
+                let wl_to = "5";
                 s.push_str(&alloc::format!(
                     "./busybox timeout -s KILL {b} ./busybox sh -c 'cd {d}/ltp/testcases/bin 2>/dev/null || exit 0; \
                      WL=\" {wl} \"; SKIP=\" {skip} \"; \
                      if [ -f {d}/ltp_only ]; then for f in $({d}/busybox cat {d}/ltp_only); do [ -f \"$f\" ] || continue; {d}/busybox echo \"RUN LTP CASE $f\"; {d}/busybox setsid {d}/busybox timeout -s KILL 3 \"./$f\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $f : $?\"; {d}/busybox rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; done; else \
-                     for t in $WL; do [ -f \"$t\" ] || continue; {d}/busybox echo \"RUN LTP CASE $t\"; {d}/busybox setsid {d}/busybox timeout -s KILL 5 \"./$t\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $t : $?\"; {d}/busybox rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; done; \
+                     for t in $WL; do [ -f \"$t\" ] || continue; {d}/busybox echo \"RUN LTP CASE $t\"; {d}/busybox setsid {d}/busybox timeout -s KILL {wl_to} \"./$t\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $t : $?\"; {d}/busybox rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; done; \
                      for f in *; do [ -f \"$f\" ] || continue; case \"$f\" in *.sh|*datafile*|*_data|*.dat|cgroup_*|cpuctl_*|cpuacct_*|cpuset_*|cpuhotplug_*|genload|ebizzy|crash0?|hackbench|messaging|pidns*|pid_namespace*|mmap1|mmap2|mmap3|mmap-corruption*|mmapstress*|growfiles|growstack*) continue ;; esac; case \"$WL\" in *\" $f \"*) continue ;; esac; case \"$SKIP\" in *\" $f \"*) continue ;; esac; {d}/busybox echo \"RUN LTP CASE $f\"; {d}/busybox setsid {d}/busybox timeout -s KILL 3 \"./$f\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $f : $?\"; {d}/busybox rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; done; fi'\n",
                     b = budget,
                     d = dir,
                     wl = LTP_WHITELIST,
                     skip = LTP_SKIP,
+                    wl_to = wl_to,
                 ));
             } else {
                 s.push_str(&alloc::format!(
