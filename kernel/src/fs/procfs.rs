@@ -755,7 +755,14 @@ impl Inode for ProcSysVmDir {
             "min_free_kbytes" => Ok(ProcGenFile::new(|| b"4096\n".to_vec())),
             "nr_hugepages" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
             "nr_overcommit_hugepages" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
-            "drop_caches" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
+            // Writable: tests poke these (fanotify10 evicts inodes via
+            // drop_caches and saves/sets vfs_cache_pressure in setup). They
+            // only need the write to succeed and never read their own value
+            // back, so accept-and-discard is correct. Missing vfs_cache_pressure
+            // was a hard TBROK in fanotify10's setup (SAFE_FILE_SCANF ENOENT),
+            // aborting the whole test before any fanotify case ran.
+            "drop_caches" => Ok(ProcWritableFile::new(b"0\n")),
+            "vfs_cache_pressure" => Ok(ProcWritableFile::new(b"100\n")),
             "swappiness" => Ok(ProcGenFile::new(|| b"60\n".to_vec())),
             "dirty_ratio" => Ok(ProcGenFile::new(|| b"20\n".to_vec())),
             "panic_on_oom" => Ok(ProcGenFile::new(|| b"0\n".to_vec())),
@@ -773,6 +780,8 @@ impl Inode for ProcSysVmDir {
             ("nr_hugepages".into(), FileType::Regular),
             ("mmap_min_addr".into(), FileType::Regular),
             ("swappiness".into(), FileType::Regular),
+            ("drop_caches".into(), FileType::Regular),
+            ("vfs_cache_pressure".into(), FileType::Regular),
         ])
     }
 }
