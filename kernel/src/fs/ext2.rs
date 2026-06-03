@@ -871,6 +871,17 @@ impl Inode for Ext2Inode {
     fn size(&self) -> u64 {
         self.di().map(|d| d.size).unwrap_or(0)
     }
+    fn meta_times(&self) -> Option<((i64, i64), (i64, i64), (i64, i64))> {
+        let d = self.di().ok()?;
+        Some(((d.atime as i64, 0), (d.mtime as i64, 0), (d.ctime as i64, 0)))
+    }
+    fn set_times(&self, atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) -> bool {
+        let Ok(mut d) = self.di() else { return false };
+        if let Some((s, _)) = atime { d.atime = s as u32; }
+        if let Some((s, _)) = mtime { d.mtime = s as u32; }
+        d.ctime = now();
+        self.fs.write_inode(self.ino, &d).is_ok()
+    }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let di = self.di()?;
         if di.kind() == FileType::Directory {
