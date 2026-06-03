@@ -109,3 +109,26 @@ jobs:
           name: ltp-log-${{ matrix.name }}
           path: ci/${{ matrix.name }}.log
           retention-days: 14
+
+  # After all 4 cells, roll their logs up into a grade.txt-style score report:
+  # total preview, per-cell totals, then every case with its per-cell TPASS.
+  summary:
+    name: score-summary
+    needs: ltp
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all cell logs
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Aggregate scores (grade-style)
+        run: python3 ci/summary.py dl
+      - name: Upload score report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: score-report
+          path: score-report.md
+          retention-days: 14
