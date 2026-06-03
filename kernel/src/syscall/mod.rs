@@ -3177,6 +3177,15 @@ fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> isize {
 /// We route to openat after validating the open_how the way openat202/203
 /// expect — `size` must cover open_how, unknown RESOLVE_* bits are EINVAL, and
 /// a nonzero mode without O_CREAT/O_TMPFILE is EINVAL.
+/// True when the final component of `path` (relative to `dfd`) is itself a
+/// symlink — used to enforce openat2's RESOLVE_NO_SYMLINKS, which rejects a
+/// trailing symlink with ELOOP.
+fn path_final_is_symlink(dfd: i32, path: &str) -> bool {
+    resolve_at_nofollow(dfd, path)
+        .map(|i| i.kind() == FileType::Symlink)
+        .unwrap_or(false)
+}
+
 fn sys_openat2(dirfd: i32, path: usize, how: usize, size: usize) -> isize {
     const OPEN_HOW_SIZE: usize = 24; // u64 flags, u64 mode, u64 resolve
     if size < OPEN_HOW_SIZE {
@@ -3190,6 +3199,45 @@ fn sys_openat2(dirfd: i32, path: usize, how: usize, size: usize) -> isize {
     const RESOLVE_MASK: u64 = 0x3f; // NO_XDEV|NO_MAGICLINKS|NO_SYMLINKS|BENEATH|IN_ROOT|CACHED
     if resolve & !RESOLVE_MASK != 0 {
         return EINVAL;
+    }
+    const RESOLVE_NO_XDEV: u64 = 0x01;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    // Enforce the path-restriction RESOLVE_* flags (openat202). Our tree has a
+    // single sub-mount (procfs at /proc) and the magic symlinks all live under
+    // /proc/self, so a path-string analysis covers every case the test drives.
+    if resolve
+        & (RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS
+            | RESOLVE_NO_SYMLINKS)
+        != 0
+    {
+        if let Some(p) = copy_path(path) {
+            let abs = p.starts_with('/');
+            let into_proc = p == "/proc" || p.starts_with("/proc/");
+            // BENEATH/IN_ROOT: resolution may not leave the dirfd subtree — an
+            // absolute path or a leading ".." escapes it. IN_ROOT reinterprets an
+            // absolute path under dirfd ("/proc/version" -> "<cwd>/proc/version",
+            // ENOENT); BENEATH rejects the escape outright with EXDEV.
+            if resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT) != 0
+                && (abs || p == ".." || p.starts_with("../"))
+            {
+                return if resolve & RESOLVE_IN_ROOT != 0 { ENOENT } else { -18 /* EXDEV */ };
+            }
+            // NO_XDEV: forbid crossing a mount point — i.e. descending into /proc.
+            if resolve & RESOLVE_NO_XDEV != 0 && into_proc {
+                return -18; // EXDEV
+            }
+            // NO_MAGICLINKS: /proc/self/{exe,cwd,root,fd/*} are magic symlinks.
+            if resolve & RESOLVE_NO_MAGICLINKS != 0 && p.starts_with("/proc/self/") {
+                return -40; // ELOOP
+            }
+            // NO_SYMLINKS: refuse if the final component is a symlink.
+            if resolve & RESOLVE_NO_SYMLINKS != 0 && path_final_is_symlink(dirfd, &p) {
+                return -40; // ELOOP
+            }
+        }
     }
     const O_CREAT: u64 = 0o100;
     const O_TMPFILE: u64 = 0o20000000;
