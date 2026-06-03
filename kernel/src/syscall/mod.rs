@@ -3282,8 +3282,24 @@ impl crate::fs::Inode for TimerFd {
     }
 }
 
-fn sys_timerfd_create(_clockid: i32, flags: i32) -> isize {
+fn sys_timerfd_create(clockid: i32, flags: i32) -> isize {
     const TFD_CLOEXEC: i32 = 0o2000000;
+    const TFD_NONBLOCK: i32 = 0o4000;
+    // timerfd_create01: an unknown clock or unknown flag bit is EINVAL. Accept
+    // the clocks Linux allows for a timerfd.
+    const VALID_CLOCKS: [i32; 5] = [
+        0, // CLOCK_REALTIME
+        1, // CLOCK_MONOTONIC
+        7, // CLOCK_BOOTTIME
+        8, // CLOCK_REALTIME_ALARM
+        9, // CLOCK_BOOTTIME_ALARM
+    ];
+    if !VALID_CLOCKS.contains(&clockid) {
+        return EINVAL;
+    }
+    if flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0 {
+        return EINVAL;
+    }
     let tf = Arc::new(TimerFd {
         expiry: SpinMutex::new(0),
         interval_ticks: SpinMutex::new(0),
