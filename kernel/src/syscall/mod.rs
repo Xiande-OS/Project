@@ -1639,6 +1639,30 @@ fn sys_ioctl(fd: i32, req: u32, arg: usize) -> isize {
             };
             if ok { 0 } else { EFAULT }
         }
+        0x1262 | 0x1263 => {
+            // BLKRASET (set readahead, arg = value) / BLKRAGET (get, arg =
+            // *long). ioctl06 round-trips a value; store it system-wide (the
+            // test uses a single device) and default to Linux's 256.
+            const BLKRASET: u32 = 0x1262;
+            static READAHEAD: core::sync::atomic::AtomicUsize =
+                core::sync::atomic::AtomicUsize::new(256);
+            let is_blk = task.fd_table.lock().get(fd).is_some_and(|f| {
+                f.inode
+                    .as_any()
+                    .downcast_ref::<crate::fs::devfs::BlockDevNode>()
+                    .is_some()
+            });
+            if !is_blk {
+                return -25; // ENOTTY
+            }
+            if req == BLKRASET {
+                READAHEAD.store(arg, core::sync::atomic::Ordering::Relaxed);
+                0
+            } else {
+                let v = READAHEAD.load(core::sync::atomic::Ordering::Relaxed) as u64;
+                if task.copy_out_bytes(arg, &v.to_le_bytes()).is_some() { 0 } else { EFAULT }
+            }
+        }
         _ => 0,
     }
 }
