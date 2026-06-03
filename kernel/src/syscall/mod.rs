@@ -3317,26 +3317,48 @@ fn sys_timerfd_gettime(fd: i32, cur: usize) -> isize {
     0
 }
 
-fn sys_prctl(option: i32, a2: usize, _a3: usize, _a4: usize, _a5: usize) -> isize {
+fn sys_prctl(option: i32, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    const PR_SET_PDEATHSIG: i32 = 1;
+    const PR_SET_DUMPABLE: i32 = 4;
+    const PR_SET_TIMING: i32 = 14;
     const PR_SET_NAME: i32 = 15;
     const PR_GET_NAME: i32 = 16;
+    const PR_SET_SECCOMP: i32 = 22;
+    const PR_CAPBSET_DROP: i32 = 24;
+    const PR_SET_SECUREBITS: i32 = 28;
+    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    const PR_GET_NO_NEW_PRIVS: i32 = 39;
+    const PR_SET_THP_DISABLE: i32 = 41;
+    const PR_GET_THP_DISABLE: i32 = 42;
+    const PR_CAP_AMBIENT: i32 = 47;
+    const PR_GET_SPECULATION_CTRL: i32 = 52;
+    const PR_CAP_AMBIENT_IS_SET: usize = 1;
+    const PR_CAP_AMBIENT_RAISE: usize = 2;
+    const PR_CAP_AMBIENT_LOWER: usize = 3;
+    const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
+    const SECCOMP_MODE_FILTER: usize = 2;
+    const CAP_LAST_CAP: usize = 63;
+    const EPERM: isize = -1;
     let task = current_task();
     match option {
         PR_SET_NAME => {
-            if let Some(bytes) = task.copy_in_bytes(a2, 16) {
-                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                let mut cmd = task.cmdline.lock();
-                let mut parts: alloc::vec::Vec<alloc::vec::Vec<u8>> =
-                    cmd.split(|&b| b == 0).map(|s| s.to_vec()).collect();
-                if parts.is_empty() { parts.push(alloc::vec::Vec::new()); }
-                parts[0] = bytes[..end].to_vec();
-                let mut new = alloc::vec::Vec::new();
-                for (i, p) in parts.iter().enumerate() {
-                    if i > 0 { new.push(0); }
-                    new.extend_from_slice(p);
-                }
-                *cmd = new;
+            // prctl02: a bad name pointer must fault, not silently no-op.
+            let bytes = match task.copy_in_bytes(a2, 16) {
+                Some(b) => b,
+                None => return EFAULT,
+            };
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            let mut cmd = task.cmdline.lock();
+            let mut parts: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+                cmd.split(|&b| b == 0).map(|s| s.to_vec()).collect();
+            if parts.is_empty() { parts.push(alloc::vec::Vec::new()); }
+            parts[0] = bytes[..end].to_vec();
+            let mut new = alloc::vec::Vec::new();
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 { new.push(0); }
+                new.extend_from_slice(p);
             }
+            *cmd = new;
             0
         }
         PR_GET_NAME => {
@@ -3348,6 +3370,58 @@ fn sys_prctl(option: i32, a2: usize, _a3: usize, _a4: usize, _a5: usize) -> isiz
             if task.copy_out_bytes(a2, &buf).is_none() { return EFAULT; }
             0
         }
+        // ---- argument validation exercised by prctl02 ----
+        // The setup() probes (PR_GET_SECCOMP, PR_GET_NO_NEW_PRIVS,
+        // PR_GET_THP_DISABLE, PR_CAP_AMBIENT_CLEAR_ALL, PR_GET_SPECULATION_CTRL,
+        // all with zero args) must keep returning success here, otherwise the
+        // test marks the feature "unsupported" and skips (TCONF) the matching
+        // sub-cases instead of running them.
+        //
+        // PR_SET_PDEATHSIG: arg2 must be 0 (clear) or a valid signal number.
+        PR_SET_PDEATHSIG => if a2 > 64 { EINVAL } else { 0 },
+        // PR_SET_DUMPABLE: arg2 must be SUID_DUMP_DISABLE(0) or SUID_DUMP_USER(1).
+        PR_SET_DUMPABLE => if a2 > 1 { EINVAL } else { 0 },
+        // PR_SET_TIMING: only PR_TIMING_STATISTICAL(0) is accepted.
+        PR_SET_TIMING => if a2 != 0 { EINVAL } else { 0 },
+        // PR_SET_SECCOMP(MODE_FILTER): the filter pointer (arg3) must be
+        // readable (else EFAULT); we have no seccomp filter support and the
+        // caller lacks CAP_SYS_ADMIN, so a valid filter yields EACCES. Other
+        // modes are left as no-ops.
+        PR_SET_SECCOMP => {
+            if a2 == SECCOMP_MODE_FILTER {
+                if task.copy_in_bytes(a3, 8).is_none() { EFAULT } else { EACCES }
+            } else {
+                0
+            }
+        }
+        // PR_CAPBSET_DROP / PR_SET_SECUREBITS need CAP_SETPCAP (dropped) -> EPERM.
+        PR_CAPBSET_DROP | PR_SET_SECUREBITS => EPERM,
+        // PR_SET_NO_NEW_PRIVS: arg2 must be 1 and arg3..arg5 must be 0.
+        PR_SET_NO_NEW_PRIVS => {
+            if a2 != 1 || a3 != 0 || a4 != 0 || a5 != 0 { EINVAL } else { 0 }
+        }
+        // PR_GET_NO_NEW_PRIVS / PR_GET_THP_DISABLE: arg2..arg5 must all be 0.
+        PR_GET_NO_NEW_PRIVS | PR_GET_THP_DISABLE => {
+            if a2 != 0 || a3 != 0 || a4 != 0 || a5 != 0 { EINVAL } else { 0 }
+        }
+        // PR_SET_THP_DISABLE: arg3..arg5 must be 0.
+        PR_SET_THP_DISABLE => {
+            if a3 != 0 || a4 != 0 || a5 != 0 { EINVAL } else { 0 }
+        }
+        // PR_GET_SPECULATION_CTRL: the unused arg3..arg5 must be 0.
+        PR_GET_SPECULATION_CTRL => {
+            if a3 != 0 || a4 != 0 || a5 != 0 { EINVAL } else { 0 }
+        }
+        // PR_CAP_AMBIENT: validate the sub-operation and its arguments.
+        PR_CAP_AMBIENT => match a2 {
+            PR_CAP_AMBIENT_IS_SET | PR_CAP_AMBIENT_RAISE | PR_CAP_AMBIENT_LOWER => {
+                if a3 > CAP_LAST_CAP || a4 != 0 || a5 != 0 { EINVAL } else { 0 }
+            }
+            PR_CAP_AMBIENT_CLEAR_ALL => {
+                if a3 != 0 || a4 != 0 || a5 != 0 { EINVAL } else { 0 }
+            }
+            _ => EINVAL,
+        },
         _ => 0,
     }
 }
