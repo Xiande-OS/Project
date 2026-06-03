@@ -2520,6 +2520,19 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32, arg_ptr: usize) -> isize {
                     fl |= O_NONBLOCK;
                 }
             }
+            // An inotify/fanotify fd created with IN_NONBLOCK/FAN_NONBLOCK must
+            // report O_NONBLOCK via F_GETFL (inotify_init1_02 and the fanotify
+            // init nonblock checks).
+            if let Some(i) = file.inode.as_any().downcast_ref::<crate::fs::notify::InotifyFd>() {
+                if i.group.nonblock {
+                    fl |= O_NONBLOCK;
+                }
+            }
+            if let Some(fa) = file.inode.as_any().downcast_ref::<crate::fs::notify::FanotifyFd>() {
+                if fa.group.nonblock {
+                    fl |= O_NONBLOCK;
+                }
+            }
             fl as isize
         }
         F_SETFL => {
