@@ -7288,6 +7288,11 @@ pub fn sys_kill_current(status: i32) -> isize {
 ///         |CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID
 ///   a1=child_sp, a2=&tid (==ptid), a3=tls, a4=&tid (==ctid)
 fn sys_clone(flags: usize, child_sp: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
+    // Proactive memory throttle: if free frames are below the spawn reserve,
+    // drain finished cases' leftover parked orphans BEFORE copying a fresh
+    // address space — keep headroom so the run never slides into the OOM
+    // alloc-retry wedge instead of recovering from it after the fact.
+    crate::task::reclaim_if_low();
     if let Some(new_task) = crate::task::clone_current(flags, child_sp, ptid, ctid, tls) {
         return new_task.pid as isize;
     }
@@ -7372,6 +7377,9 @@ fn sys_clone3(uargs: usize, size: usize) -> isize {
     // wait bookkeeping matches the clone() convention.
     let cl_flags = (flags & !0xff) | (exit_signal & 0xff);
     let pidfd_ptr = rd(8) as usize;
+    // Proactive memory throttle, as in sys_clone: reap finished cases' leftover
+    // orphans before the address-space copy when below the spawn reserve.
+    crate::task::reclaim_if_low();
     match crate::task::clone_current(cl_flags, child_sp, parent_tid, child_tid, tls) {
         Some(new_task) => {
             // CLONE_PIDFD: hand the parent a pidfd referring to the new child
