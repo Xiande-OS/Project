@@ -380,10 +380,12 @@ const LTP_WHITELIST: &str = "\
     inotify11 inotify05 gethostname02 gethostbyname_r01 ftest02 fsync02 fremovexattr01 fptest02 fptest01 float_iperb fanotify20 fanotify15 \
     fallocate05 fallocate04 execveat03 epoll_wait04 dirtypipe diotest1 close_range01 waitpid10 userns07 stack_space sendmsg02 pth_str03 \
     pth_str02 pth_str01 page01 ioctl06 float_bessel \
+    select03 writev03 pselect02 pselect02_64 \
     ";
 #[cfg(target_arch = "loongarch64")]
 const LTP_WHITELIST: &str = "\
     epoll_ctl03 access01 rt_sigaction03 rt_sigaction02 rt_sigaction01 waitpid01 getpid01 pipe11 timer_settime02 clock_getres01 sysconf01 confstr01 \
+    select03 ioctl06 writev03 pselect02 pselect02_64 \
     epoll-ltp posix_fadvise03_64 posix_fadvise03 fanotify09 chmod01 process_vm_readv03 signal05 signal03 getitimer01 signal04 name_to_handle_at01 open11 \
     process_vm01 setregid03 mq_timedsend01 madvise01 linkat01 personality01 mq_timedreceive01 llseek03 prctl02 pathconf01 select01 openat201 \
     getrlimit03 getrlimit01 access02 setreuid05 setreuid03 ptrace05 link04 memfd_create01 kill11 stat01_64 stat01 setregid02 \
