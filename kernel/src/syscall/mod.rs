@@ -429,6 +429,17 @@ pub fn set_syscall_trace(on: bool) {
 }
 
 fn copy_path(addr: usize) -> Option<String> {
+    // A filesystem path is bounded by PATH_MAX.
+    copy_cstr(addr, 4096)
+}
+
+/// Read a NUL-terminated user string, up to `max` bytes. `copy_path` caps at
+/// PATH_MAX; argv/envp use a far larger cap (Linux's MAX_ARG_STRLEN is 128 KiB)
+/// — capping argv at PATH_MAX silently truncated long command lines, and a
+/// truncated string made `read_string_array` drop the whole vector, so execve
+/// fell back to an EMPTY argv and the new program crashed reading argv[0]
+/// (a 10 KB `sh -c` driver line did exactly this).
+fn copy_cstr(addr: usize, max: usize) -> Option<String> {
     if addr == 0 {
         return None;
     }
@@ -447,7 +458,7 @@ fn copy_path(addr: usize) -> Option<String> {
         }
         out.extend_from_slice(&bytes);
         cursor = page_end;
-        if out.len() > 4096 {
+        if out.len() > max {
             return None;
         }
     }
@@ -7452,7 +7463,10 @@ fn read_string_array(addr: usize) -> Option<alloc::vec::Vec<String>> {
         if ptr == 0 {
             break;
         }
-        let s = copy_path(ptr as usize)?;
+        // argv/envp entries can be far longer than a path (MAX_ARG_STRLEN =
+        // 128 KiB); truncating at PATH_MAX dropped the whole array and left
+        // execve with an empty argv.
+        let s = copy_cstr(ptr as usize, 128 * 1024)?;
         out.push(s);
         cursor += 8;
         if out.len() > 1024 {
