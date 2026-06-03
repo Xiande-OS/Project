@@ -2324,6 +2324,13 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32, arg_ptr: usize) -> isize {
         }
         F_GETFD => {
             let t = task.fd_table.lock();
+            // EBADF for a closed/never-opened fd. Reading only the cloexec
+            // vector made fcntl(fd, F_GETFD) succeed for any fd, so tests that
+            // verify a descriptor is gone via `fcntl(fd, F_GETFD) == -1`
+            // (close_range01/02) saw it "still open".
+            if t.get(fd).is_none() {
+                return EBADF;
+            }
             let c = t.cloexec.lock();
             if c.get(fd as usize).copied().unwrap_or(false) {
                 1
@@ -2338,6 +2345,10 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32, arg_ptr: usize) -> isize {
             // growing the cloexec vector to `fd` entries and OOM-panicking.
             let cap = t.soft_max.load(core::sync::atomic::Ordering::Relaxed);
             if fd < 0 || fd as usize >= cap {
+                return EBADF;
+            }
+            // Likewise EBADF for a closed fd, not just an out-of-range one.
+            if t.get(fd).is_none() {
                 return EBADF;
             }
             let mut c = t.cloexec.lock();
