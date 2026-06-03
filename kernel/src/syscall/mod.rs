@@ -3488,10 +3488,29 @@ fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: usize, count: usize) -> isi
     copied as isize
 }
 
-fn sys_copy_file_range(fd_in: i32, off_in: usize, fd_out: i32, off_out: usize, len: usize, _flags: u32) -> isize {
+fn sys_copy_file_range(fd_in: i32, off_in: usize, fd_out: i32, off_out: usize, len: usize, flags: u32) -> isize {
+    const EISDIR: isize = -21;
     let task = current_task();
     let in_file = match task.fd_table.lock().get(fd_in) { Some(f) => f, None => return EBADF };
     let out_file = match task.fd_table.lock().get(fd_out) { Some(f) => f, None => return EBADF };
+
+    // copy_file_range02 error paths (checked in the kernel's order):
+    //   flags must be 0; a directory operand is EISDIR; any non-regular
+    //   operand (char/block device, fifo, pipe, symlink) is EINVAL; finally
+    //   the input must be readable and the output writable and not append-only.
+    if flags != 0 {
+        return EINVAL;
+    }
+    for f in [&in_file, &out_file] {
+        match f.inode.kind() {
+            FileType::Regular => {}
+            FileType::Directory => return EISDIR,
+            _ => return EINVAL,
+        }
+    }
+    if !in_file.readable || !out_file.writable || out_file.append {
+        return EBADF;
+    }
 
     let mut in_off = if off_in != 0 {
         let bytes = task.copy_in_bytes(off_in, 8).unwrap_or(alloc::vec![0u8; 8]);
