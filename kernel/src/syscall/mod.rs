@@ -3253,12 +3253,11 @@ fn sys_name_to_handle_at(dfd: i32, path: usize, handle: usize, mount_id: usize, 
     if cap > MAX_HANDLE_SZ {
         return EINVAL;
     }
-    if cap < HANDLE_PAYLOAD {
-        // Report the size we need and fail, exactly as the kernel does so
-        // callers can resize and retry (name_to_handle_at01/02 EOVERFLOW case).
-        let _ = task.copy_out_bytes(handle, &HANDLE_PAYLOAD.to_le_bytes());
-        return -75; // EOVERFLOW
-    }
+    // Resolve the path FIRST, so a bad dirfd (EBADF), a non-directory dirfd
+    // (ENOTDIR), a bad path pointer (EFAULT) or an empty path (ENOENT) is
+    // reported before the buffer-size failure. name_to_handle_at02 memsets
+    // handle_bytes to 0 for every case, so the errno must come from the other
+    // bad argument — returning a blanket EOVERFLOW first masked all of them.
     let Some(pstr) = copy_path(path) else { return EFAULT };
     let inode = if pstr.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
@@ -3279,6 +3278,17 @@ fn sys_name_to_handle_at(dfd: i32, path: usize, handle: usize, mount_id: usize, 
             Err(e) => return e as isize,
         }
     };
+    // mount_id is an output pointer; a bad one is EFAULT, and the test expects
+    // that to beat the EOVERFLOW size failure (invalid-mount_id case).
+    if mount_id != 0 && task.copy_out_bytes(mount_id, &1i32.to_le_bytes()).is_none() {
+        return EFAULT;
+    }
+    // Buffer too small for our handle payload: report the size we need and fail
+    // so callers can resize and retry (name_to_handle_at01/02 EOVERFLOW case).
+    if cap < HANDLE_PAYLOAD {
+        let _ = task.copy_out_bytes(handle, &HANDLE_PAYLOAD.to_le_bytes());
+        return -75; // EOVERFLOW
+    }
     // Use the inode's stable identity (its st_ino == Arc pointer) as the
     // handle, so the SAME inode always yields the SAME handle bytes — this is
     // what lets a fanotify FAN_REPORT_FID event's file handle match the one
@@ -3292,9 +3302,6 @@ fn sys_name_to_handle_at(dfd: i32, path: usize, handle: usize, mount_id: usize, 
     out[4..8].copy_from_slice(&1i32.to_le_bytes()); // handle_type (nonzero)
     out[8..16].copy_from_slice(&id.to_le_bytes());
     if task.copy_out_bytes(handle, &out).is_none() {
-        return EFAULT;
-    }
-    if mount_id != 0 && task.copy_out_bytes(mount_id, &1i32.to_le_bytes()).is_none() {
         return EFAULT;
     }
     0
