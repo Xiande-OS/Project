@@ -547,14 +547,36 @@ fn sys_writev(fd: i32, iov: usize, count: usize) -> isize {
     // writev01: an invalid iov_len (negative, i.e. overflowing SSIZE_MAX) is
     // EINVAL — and it must be diagnosed before any I/O happens, so a bad entry
     // never half-writes. Mirror preadv's total-length check.
-    {
-        let mut total_len: isize = 0;
+    let mut total_len: isize = 0;
+    for v in iovs {
+        total_len = match total_len.checked_add(v.len as isize) {
+            Some(t) if t >= 0 => t,
+            _ => return EINVAL,
+        };
+    }
+    // writev07: a bad buffer anywhere in the list must leave the file (and its
+    // offset) untouched — no partial write. Gather every iovec up front, so an
+    // EFAULT is raised before any I/O happens. Cap the gather so a pathological
+    // multi-MB writev can't balloon the heap; past the cap fall back to the
+    // streaming path (atomicity only matters for the small partial-iovec cases).
+    if (total_len as usize) <= (1 << 20) {
+        let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         for v in iovs {
-            total_len = match total_len.checked_add(v.len as isize) {
-                Some(t) if t >= 0 => t,
-                _ => return EINVAL,
+            if v.len == 0 {
+                continue;
+            }
+            let Some(bytes) = task.copy_in_bytes(v.base, v.len) else {
+                return EFAULT;
             };
+            buf.extend_from_slice(&bytes);
         }
+        if buf.is_empty() {
+            return 0;
+        }
+        return match file.write(&buf) {
+            Ok(n) => n as isize,
+            Err(e) => err_to_isize(e),
+        };
     }
     let mut total = 0isize;
     for v in iovs {
@@ -562,7 +584,7 @@ fn sys_writev(fd: i32, iov: usize, count: usize) -> isize {
             continue;
         }
         let Some(bytes) = task.copy_in_bytes(v.base, v.len) else {
-            return EFAULT;
+            return if total == 0 { EFAULT } else { total };
         };
         match file.write(&bytes) {
             Ok(n) => total += n as isize,
