@@ -1,0 +1,135 @@
+name: full-contest
+
+# Faithful contest reproduction. Unlike ltp-ci (4 isolated, single-variant,
+# LTP-only boots), this boots ONE kernel per arch against the FULL combined disk
+# — both /musl and /glibc, every group — in a SINGLE QEMU instance, exactly as
+# the contest grader runs each arch. That is the only way to surface
+# cross-variant / accumulated-state failures, e.g. an la-musl poweroff during
+# ltp-musl that zeroes la-glibc (which ltp-ci, booting glibc separately, cannot
+# see).
+#
+# Two cells, rv and la — the contest does run the two arches as separate boots,
+# but BOTH libcs of an arch share one boot.
+#
+# Manual-only (heavy + slow under TCG). Run it before a contest submission.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mem:
+        description: "Guest memory (QEMU -m), e.g. 1G / 2G."
+        type: string
+        default: "1G"
+      smp:
+        description: "Guest CPUs (QEMU -smp)."
+        type: string
+        default: "1"
+      seconds:
+        description: "Per-arch wall cap in seconds (a poweroff/storm exits sooner)."
+        type: string
+        default: "14400"
+
+concurrency:
+  group: full-contest-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TEST_IMG_BASE: https://github.com/Xiande-OS/Project/releases/download/test-images
+
+jobs:
+  full:
+    name: full-${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: rv }
+          - { arch: la }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Install QEMU + cross linker + e2fsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-misc qemu-system-riscv64 \
+            gcc-riscv64-linux-gnu gcc-14-loongarch64-linux-gnu curl e2fsprogs
+          qemu-system-riscv64 --version | head -1
+          qemu-system-loongarch64 --version | head -1
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.arch == 'rv' && 'riscv64gc-unknown-none-elf' || 'loongarch64-unknown-none' }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('kernel/src/**') }}
+          restore-keys: |
+            cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-${{ matrix.arch }}-
+
+      - name: Build kernel (${{ matrix.arch }})
+        run: |
+          make prepare
+          TGT=${{ matrix.arch == 'rv' && 'riscv64gc-unknown-none-elf' || 'loongarch64-unknown-none' }}
+          # The contest build (whitelist only), identical to what the grader runs.
+          cargo build --release -p kernel --target "$TGT" --offline
+          cp "target/$TGT/release/kernel" "kernel-${{ matrix.arch }}"
+          ls -l "kernel-${{ matrix.arch }}"
+
+      - name: Prepare FULL combined disk (both variants)
+        run: |
+          chmod +x ci/*.sh
+          bash ci/prep-fulldisk.sh "${{ matrix.arch }}" "ci/img/full-${{ matrix.arch }}.img"
+
+      - name: Run the full contest flow under QEMU (one boot, both variants)
+        run: |
+          chmod +x ci/*.sh
+          bash ci/run-fulltest.sh "${{ matrix.arch }}" "ci/img/full-${{ matrix.arch }}.img" \
+            "full-${{ matrix.arch }}" "${{ inputs.seconds }}" "${{ inputs.mem }}" "${{ inputs.smp }}" \
+            | tee "ci/full-${{ matrix.arch }}.log"
+
+      - name: Observe — did glibc run, or did the kernel die during musl?
+        if: always()
+        run: |
+          LOG="ci/full-${{ matrix.arch }}.log"
+          echo "## Full-contest observation: ${{ matrix.arch }}"
+          echo "### Group markers seen"
+          grep -aoE 'OS COMP TEST GROUP (START|END) [A-Za-z0-9_.-]+' "$LOG" | sed -E 's/\x1b\[[0-9;]*m//g' | sort | uniq -c || true
+          musl_end=$(grep -acE 'GROUP END [^ ]*-musl' "$LOG" || true)
+          glibc_start=$(grep -acE 'GROUP START [^ ]*-glibc' "$LOG" || true)
+          faults=$(grep -acE 'kernel-mode fault|kernel fault storm' "$LOG" || true)
+          poweroff=$(grep -acE 'powering off|fault storm' "$LOG" || true)
+          echo "musl groups ENDED:    $musl_end"
+          echo "glibc groups STARTED: $glibc_start"
+          echo "kernel faults:        $faults"
+          echo "premature poweroff:   $poweroff"
+          if [ "$poweroff" -gt 0 ] && [ "$glibc_start" -eq 0 ]; then
+            echo "::error title=full-${{ matrix.arch }}::CONTEST FAILURE REPRODUCED — kernel powered off (fault storm) before ANY glibc group started. This is the glibc-${{ matrix.arch }}=0 the grader sees; ltp-ci cannot detect it because it boots glibc separately."
+            exit 1
+          fi
+          if [ "$faults" -gt 0 ]; then
+            echo "::warning title=full-${{ matrix.arch }}::kernel-mode faults occurred during the run (see log) but glibc still started."
+          fi
+
+      - name: Upload full serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-log-${{ matrix.arch }}
+          path: ci/full-${{ matrix.arch }}.log
+          retention-days: 14
