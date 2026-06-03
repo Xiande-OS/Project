@@ -852,11 +852,25 @@ pub fn sys_getsockname(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
             SocketKind::Udp => net::udp_local_endpoint(s.handle),
         }
     });
-    match res {
-        Ok(Some((a, p))) => write_endpoint(addr_ptr, len_ptr, SockAddrIn { addr: a, port: p }),
-        Ok(None) => write_endpoint(addr_ptr, len_ptr, SockAddrIn::ANY),
-        Err(e) => e,
+    let ep = match res {
+        Ok(x) => x,
+        Err(e) => return e, // EBADF / ENOTSOCK — the fd checks come first
+    };
+    // getsockname requires a valid in/out addrlen pointer (getsockname01): a
+    // NULL or unreadable pointer is EFAULT, a negative capacity is EINVAL.
+    let task = current_task();
+    if len_ptr == 0 {
+        return EFAULT;
     }
+    let Some(lb) = task.copy_in_bytes(len_ptr, 4) else { return EFAULT };
+    if i32::from_le_bytes(lb[0..4].try_into().unwrap()) < 0 {
+        return EINVAL;
+    }
+    let sa = match ep {
+        Some((a, p)) => SockAddrIn { addr: a, port: p },
+        None => SockAddrIn::ANY,
+    };
+    write_endpoint(addr_ptr, len_ptr, sa)
 }
 
 pub fn sys_getpeername(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
