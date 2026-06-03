@@ -1452,36 +1452,51 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
     // console_wait_readable() that ignored both the timeout and pending
     // signals, so a NULL-timeout poll on the console wedged the task
     // uninterruptibly (same class of bug as sys_pselect6's console branch).
-    let mut other_indices: alloc::vec::Vec<(usize, Arc<crate::fs::File>)> = alloc::vec::Vec::new();
-    for (i, p) in polls.iter().enumerate() {
-        if p.fd < 0 {
+    // Compute readiness for every pollfd in one pass:
+    //  * fd < 0           -> ignored (revents stays 0), as Linux does.
+    //  * fd >= 0 not open -> POLLNVAL (0x20), reported regardless of the
+    //    requested events (ppoll01 FD_ALREADY_CLOSED polls a closed fd and
+    //    expects revents=POLLNVAL and the fd counted in the return value).
+    //  * POLLIN  asked    -> set only when the source actually has data
+    //    (sockets check their loopback/smoltcp recv state; pipes the buffer) —
+    //    iperf3 loopback relies on us not lying, else the server spins reading
+    //    an empty control fd and never sees the data datagram on its UDP fd.
+    //  * POLLOUT asked    -> set when the fd is open for writing; a write to a
+    //    regular file (or a connected pipe/socket end) won't block. ppoll01
+    //    NORMAL polls an O_RDWR file for POLLIN|POLLOUT and expects both (0x5).
+    // Only an unsatisfied POLLIN can block, so remember those for the park path.
+    let mut pollin_waiters: alloc::vec::Vec<(usize, Arc<crate::fs::File>)> = alloc::vec::Vec::new();
+    let mut ready = 0;
+    for i in 0..polls.len() {
+        let fd = polls[i].fd;
+        if fd < 0 {
             continue;
         }
-        if let Some(f) = task.fd_table.lock().get(p.fd) {
-            if p.events & 0x1 != 0 {
-                other_indices.push((i, f));
-            }
-        }
-    }
-
-    let mut ready = 0;
-    // Non-console fd asked about POLLIN: tell userland it's readable
-    // only when the underlying source actually has data (sockets check
-    // their loopback/smoltcp recv state; pipes check the buffer). This
-    // matters for iperf3 loopback: if we lied, the server would try to
-    // read the empty control fd in a tight blocking loop and never see
-    // the data datagram on its UDP fd via select.
-    for (i, f) in &other_indices {
-        if fd_is_readable(f) {
-            polls[*i].revents = 0x1;
+        let ev = polls[i].events;
+        let Some(f) = task.fd_table.lock().get(fd) else {
+            polls[i].revents = 0x20; // POLLNVAL
             ready += 1;
+            continue;
+        };
+        let mut re: i16 = 0;
+        if ev & 0x1 != 0 && fd_is_readable(&f) {
+            re |= 0x1; // POLLIN
+        }
+        if ev & 0x4 != 0 && f.writable {
+            re |= 0x4; // POLLOUT
+        }
+        if re != 0 {
+            polls[i].revents = re;
+            ready += 1;
+        } else if ev & 0x1 != 0 {
+            pollin_waiters.push((i, f));
         }
     }
     // If nothing was ready, yield so peers can produce data. The poll
     // (selectish) caller will see EAGAIN-via-zero and rerun us via the
     // scheduler's socket-waiter wake path. A zero timeout (poll) must
     // return immediately with 0 instead of parking.
-    if ready == 0 && !other_indices.is_empty() && !zero_timeout {
+    if ready == 0 && !pollin_waiters.is_empty() && !zero_timeout {
         // Finite timeout? Install a sleep deadline so we wake up when it
         // expires even if no fd ever became readable.
         if let Some(t) = timeout_ticks {
@@ -1508,7 +1523,7 @@ fn sys_ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
         }
         // Lost-wakeup guard (see sys_pselect6): re-scan after parking so a
         // datagram/byte that landed during the park isn't missed.
-        for (_, f) in &other_indices {
+        for (_, f) in &pollin_waiters {
             if fd_is_readable(f) {
                 *task.state.lock() = crate::task::TaskState::Ready;
                 break;
