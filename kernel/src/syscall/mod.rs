@@ -336,7 +336,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_MQ_UNLINK => sys_mq_unlink(a0),
         nr::SYS_MQ_TIMEDSEND => sys_mq_timedsend(a0 as i32, a1, a2, a3 as u32, a4),
         nr::SYS_MQ_TIMEDRECEIVE => sys_mq_timedreceive(a0 as i32, a1, a2, a3, a4),
-        nr::SYS_MQ_GETSETATTR => 0,
+        nr::SYS_MQ_GETSETATTR => sys_mq_getsetattr(a0 as i32, a1, a2),
         nr::SYS_PIDFD_OPEN => sys_pidfd_open(a0 as i32, a1 as u32),
         nr::SYS_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(a0 as i32, a1 as i32, a2, a3 as u32),
         nr::SYS_PIDFD_GETFD => EBADF,
@@ -1740,6 +1740,36 @@ fn sys_mq_open(name: usize, oflag: i32, _mode: u32, attr: usize) -> isize {
         Ok(fd) => fd as isize,
         Err(e) => err_to_isize(e),
     }
+}
+
+/// mq_getsetattr(mqdes, newattr, oldattr): the kernel entry behind glibc's
+/// mq_getattr (newattr == NULL) and mq_setattr. We report the queue's
+/// attributes — mq_open01 creates a queue with a custom mq_maxmsg/mq_msgsize
+/// and reads them back, and the previous stub returned 0 without writing
+/// anything, so the caller read uninitialised stack as the attributes. Only
+/// mq_flags (O_NONBLOCK) is settable per-description, which we don't model, so
+/// a set is accepted as a no-op after the old attributes are reported.
+fn sys_mq_getsetattr(mqdes: i32, newattr: usize, oldattr: usize) -> isize {
+    let task = current_task();
+    let Some(file) = task.fd_table.lock().get(mqdes) else { return EBADF };
+    let Some(mq) = file.inode.as_any().downcast_ref::<PosixMq>() else { return EBADF };
+    if oldattr != 0 {
+        let curmsgs = mq.queue.lock().len();
+        // struct mq_attr (LP64): mq_flags@0, mq_maxmsg@8, mq_msgsize@16,
+        // mq_curmsgs@24 — all long. mq_flags stays 0 (no per-description
+        // O_NONBLOCK tracking).
+        let mut buf = [0u8; 32];
+        buf[8..16].copy_from_slice(&(mq.max_msgs as i64).to_le_bytes());
+        buf[16..24].copy_from_slice(&(mq.max_msg_size as i64).to_le_bytes());
+        buf[24..32].copy_from_slice(&(curmsgs as i64).to_le_bytes());
+        if task.copy_out_bytes(oldattr, &buf).is_none() {
+            return EFAULT;
+        }
+    }
+    if newattr != 0 && task.copy_in_bytes(newattr, 32).is_none() {
+        return EFAULT;
+    }
+    0
 }
 
 fn sys_mq_unlink(name: usize) -> isize {
