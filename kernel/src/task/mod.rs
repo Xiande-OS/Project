@@ -583,7 +583,16 @@ pub fn kill_session(sid: i32, except_pid: i32) {
             .collect()
     };
     for m in members {
-        crate::signal::raise_signal(&m, crate::signal::SIGKILL);
+        // Posting SIGKILL (raise_signal) wakes the member but doesn't guarantee
+        // it dies: a member re-entering a futex/fd wait re-blocks before acting
+        // on the pending kill, so it lingers in Waiting forever, pinning its
+        // whole address space — the cumulative drain that OOMs the run. Force it
+        // down NOW: kill_now frees its frames and fds eagerly (the same forcible
+        // path the reactive low-memory sweep uses), so the session leader's exit
+        // actually reclaims the session instead of leaving leftovers to pile up.
+        if !matches!(*m.state.lock(), TaskState::Zombie) {
+            crate::signal::kill_now(&m);
+        }
     }
 }
 
