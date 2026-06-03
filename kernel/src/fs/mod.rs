@@ -193,9 +193,28 @@ pub enum FileType {
     Symlink,
 }
 
+/// Stable identity for an inode: its fs-assigned inode number when it has one
+/// (ext2), else the Arc pointer (tmpfs caches one Arc per name, so the pointer
+/// is itself stable). Two `Arc<dyn Inode>` refer to the same logical object iff
+/// their identities are equal. Used by st_ino and the inotify/fanotify mark
+/// matching, which must work even when a filesystem (ext2) returns a fresh Arc
+/// for each lookup of the same on-disk inode.
+pub fn inode_identity(inode: &Arc<dyn Inode>) -> u64 {
+    inode.ino().unwrap_or_else(|| Arc::as_ptr(inode) as *const () as u64)
+}
+
 pub trait Inode: Send + Sync + core::any::Any {
     fn as_any(&self) -> &dyn core::any::Any;
     fn kind(&self) -> FileType;
+    /// A stable, fs-assigned inode number, if this inode type has one (ext2
+    /// returns its on-disk inode #). Types without one (tmpfs and friends)
+    /// return None and fall back to their cached Arc pointer for identity — see
+    /// [`inode_identity`]. Used for st_ino and inotify/fanotify mark matching so
+    /// the SAME on-disk object compares equal across separate lookups even when
+    /// a filesystem hands back a fresh Arc each time.
+    fn ino(&self) -> Option<u64> {
+        None
+    }
     fn size(&self) -> u64 {
         0
     }

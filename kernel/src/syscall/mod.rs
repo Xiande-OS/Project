@@ -3324,7 +3324,7 @@ fn sys_name_to_handle_at(dfd: i32, path: usize, handle: usize, mount_id: usize, 
     // what lets a fanotify FAN_REPORT_FID event's file handle match the one
     // name_to_handle_at(2) returns. Keyed into HANDLES so open_by_handle_at
     // still round-trips.
-    let id = Arc::as_ptr(&inode) as *const () as u64;
+    let id = crate::fs::inode_identity(&inode);
     HANDLES.lock().insert(id, inode);
     // struct file_handle: handle_bytes(4) + handle_type(4) + f_handle[8].
     let mut out = [0u8; 16];
@@ -6535,7 +6535,7 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
     s.st_size = inode.size() as i64;
     s.st_blksize = 4096;
     s.st_blocks = (s.st_size + 511) / 512;
-    s.st_ino = (Arc::as_ptr(inode) as *const () as usize) as u64;
+    s.st_ino = crate::fs::inode_identity(inode);
     s
 }
 
@@ -6715,7 +6715,7 @@ fn sys_statx(dfd: i32, path: usize, flags: i32, mask: u32, buf: usize) -> isize 
     }
     st.stx_size = inode.size();
     st.stx_blocks = (inode.size() + 511) / 512;
-    st.stx_ino = (Arc::as_ptr(&inode) as *const () as usize) as u64;
+    st.stx_ino = crate::fs::inode_identity(&inode);
     write_struct(buf, &st)
 }
 

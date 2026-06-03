@@ -865,6 +865,13 @@ impl Inode for Ext2Inode {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+    /// The on-disk inode number — a stable identity, unlike the per-lookup Arc
+    /// pointer. Lets st_ino stay constant across lookups (hardlinks compare
+    /// equal) and inotify/fanotify inode marks match operations on the same
+    /// file even though each lookup returns a fresh Ext2Inode Arc.
+    fn ino(&self) -> Option<u64> {
+        Some(self.ino as u64)
+    }
     fn kind(&self) -> FileType {
         self.di().map(|d| d.kind()).unwrap_or(FileType::Regular)
     }

@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 use crate::sync::Mutex;
-use super::{Inode, Result};
+use super::{inode_identity, Inode, Result};
 
 /// Total active watches across all groups. The fs-op hooks call [`report`]
 /// on every read/write/open/…; when nothing is being watched (the common
@@ -126,7 +126,7 @@ impl InotifyGroup {
         let eff = mask & (IN_ALL_EVENTS | IN_ISDIR);
         let mut w = self.watches.lock();
         for watch in w.iter_mut() {
-            if Arc::ptr_eq(&watch.inode, &inode) {
+            if inode_identity(&watch.inode) == inode_identity(&inode) {
                 watch.mask = if mask & IN_MASK_ADD != 0 {
                     watch.mask | eff
                 } else {
@@ -287,7 +287,7 @@ pub fn report(
                     continue;
                 }
                 if let Some(t) = target {
-                    if Arc::ptr_eq(&w.inode, t) {
+                    if inode_identity(&w.inode) == inode_identity(t) {
                         to_queue.push(InEvent {
                             wd: w.wd,
                             mask: mask | dirbit,
@@ -297,7 +297,7 @@ pub fn report(
                     }
                 }
                 if let Some(p) = parent {
-                    if Arc::ptr_eq(&w.inode, p) {
+                    if inode_identity(&w.inode) == inode_identity(p) {
                         to_queue.push(InEvent {
                             wd: w.wd,
                             mask: mask | dirbit,
@@ -334,7 +334,7 @@ pub fn inode_gone(inode: &Arc<dyn Inode>) {
         {
             let mut watches = g.watches.lock();
             watches.retain(|w| {
-                if Arc::ptr_eq(&w.inode, inode) {
+                if inode_identity(&w.inode) == inode_identity(inode) {
                     gone_wds.push(w.wd);
                     false
                 } else {
@@ -466,7 +466,7 @@ impl FanotifyGroup {
             .lock()
             .iter()
             .map(|m| {
-                let ino = Arc::as_ptr(&m.inode) as *const () as u64;
+                let ino = inode_identity(&m.inode);
                 (m.mask, m.ignore_mask, m.mount, ino)
             })
             .collect()
@@ -475,7 +475,7 @@ impl FanotifyGroup {
     pub fn add_mark(&self, inode: Arc<dyn Inode>, mask: u64, mount: bool, ignore: bool) {
         let mut m = self.marks.lock();
         for mk in m.iter_mut() {
-            if Arc::ptr_eq(&mk.inode, &inode) && mk.mount == mount {
+            if inode_identity(&mk.inode) == inode_identity(&inode) && mk.mount == mount {
                 if ignore {
                     mk.ignore_mask |= mask;
                 } else {
@@ -493,7 +493,7 @@ impl FanotifyGroup {
         let mut m = self.marks.lock();
         let mut removed = 0;
         m.retain_mut(|mk| {
-            if Arc::ptr_eq(&mk.inode, inode) && mk.mount == mount {
+            if inode_identity(&mk.inode) == inode_identity(inode) && mk.mount == mount {
                 mk.mask &= !mask;
                 if mk.mask == 0 {
                     removed += 1;
@@ -587,7 +587,7 @@ impl FanotifyGroup {
                 //   file_handle: handle_bytes(u32)=8, handle_type(i32)=1,
                 //                f_handle[8] = st_ino
                 //   name[]: for DFID_NAME, NUL-terminated, right after f_handle
-                let st_ino = Arc::as_ptr(&inode) as *const () as u64;
+                let st_ino = inode_identity(&inode);
                 let with_name = self.report_name && ev.name.is_some();
                 let info_type: u8 = if with_name {
                     2 // FAN_EVENT_INFO_TYPE_DFID_NAME
@@ -684,8 +684,8 @@ fn report_fanotify(
                 // A mount/fs mark matches any object; an inode mark matches its
                 // own inode whether it's the target or the parent dir.
                 let matches_obj = mk.mount
-                    || target.map_or(false, |t| Arc::ptr_eq(&mk.inode, t))
-                    || parent.map_or(false, |p| Arc::ptr_eq(&mk.inode, p));
+                    || target.map_or(false, |t| inode_identity(&mk.inode) == inode_identity(t))
+                    || parent.map_or(false, |p| inode_identity(&mk.inode) == inode_identity(p));
                 if !matches_obj {
                     continue;
                 }
