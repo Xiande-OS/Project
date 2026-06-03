@@ -716,7 +716,12 @@ static OOM_STREAK_START: AtomicU64 = AtomicU64::new(0);
 /// all here, looping so a chain (zombie parent -> newly-orphaned children)
 /// drains fully. Conservative — only Zombies, and Waiting (parked) tasks whose
 /// real parent is gone; never Ready/Running tasks. Returns the count freed.
-pub fn emergency_reclaim() -> usize {
+///
+/// The shared core of the reactive [`emergency_reclaim`] (run when an allocation
+/// has already failed) and the proactive low-memory throttle in process
+/// creation. Carries no OOM-poweroff detector, so a healthy below-watermark reap
+/// can call it freely without risking a false terminal-OOM shutdown.
+pub fn reclaim_dead_tasks() -> usize {
     const INIT_PID: i32 = 1;
     let cur = current_pid();
     let mut total = 0usize;
@@ -781,8 +786,18 @@ pub fn emergency_reclaim() -> usize {
             break;
         }
     }
+    total
+}
 
-    // Terminal-OOM detector. `emergency_reclaim` runs only when an allocation
+/// Reactive reclaim: [`reclaim_dead_tasks`] plus the terminal-OOM detector that
+/// powers off after a sustained, unrecoverable allocation-failure storm. Called
+/// from the allocation-failure path (heap/frame). The proactive throttle calls
+/// `reclaim_dead_tasks` directly instead, so reaping while still above the hard
+/// floor can never trip this detector.
+pub fn emergency_reclaim() -> usize {
+    let total = reclaim_dead_tasks();
+
+    // Terminal-OOM detector. The reactive path runs only when an allocation
     // is failing. If allocations keep failing continuously — for ~45s with no
     // genuine recovery gap — the machine is wedged (init can't fork the next
     // case; the 'sh: busybox: Out of memory' storm) and will never make
@@ -814,6 +829,23 @@ pub fn emergency_reclaim() -> usize {
         }
     }
     total
+}
+
+/// Proactive memory throttle for process creation — the "reserve headroom and
+/// delay the next case" strategy. Before spawning, if free frames have dropped
+/// below a reserve watermark, reap finished cases' leftover parked orphans
+/// FIRST, instead of waiting for an allocation to fail mid-fork (by which point
+/// a retry-loop may already be wedging under the watchdog). Sequential LTP cases
+/// reparent stuck children to init that then park forever on a fd/futex pinning
+/// their whole address space; draining them here keeps a headroom so init and
+/// the runner shell can always fork the next case. Reaps only dead sessions, so
+/// a live case's own legitimate fork-storm is never throttled.
+pub fn reclaim_if_low() {
+    let (total, free) = crate::mm::frame::frame_stats();
+    // Keep ~1/8 of the frame pool in reserve as spawn headroom.
+    if total > 0 && free.saturating_mul(8) < total {
+        reclaim_dead_tasks();
+    }
 }
 
 pub fn any_runnable_except(pid: i32) -> bool {
