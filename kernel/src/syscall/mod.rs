@@ -8326,6 +8326,28 @@ fn sys_kill(pid: i32, sig: i32) -> isize {
         tasks_in_pgrp(-pid)
     };
 
+    // A broadcast / process-group / session kill (pid <= 0) must never be able
+    // to terminate the test harness itself — init plus the driver/loop shells,
+    // all of which live in the init session (sid <= 1). A test that calls
+    // kill(0)/kill(-1)/kill(-pgid) (signal-suite cases do this constantly), or
+    // a leaked descendant that wasn't isolated into its own session, would
+    // otherwise SIGKILL the runner loop (sid=1) and abort the entire ltp sweep
+    // mid-run — the cumulative "loop Killed at ~case N" that caps the LA cells
+    // at half the suite. Drop sid<=1 members from a broadcast target set (the
+    // caller may still signal itself). Targeted kill(pid>0) is unaffected, so
+    // the per-case `timeout -s KILL` still kills its own case.
+    let targets: alloc::vec::Vec<Arc<crate::task::Task>> = if pid <= 0 {
+        targets
+            .into_iter()
+            .filter(|t| {
+                t.pid == me.pid
+                    || t.sid.load(core::sync::atomic::Ordering::Relaxed) > 1
+            })
+            .collect()
+    } else {
+        targets
+    };
+
     if targets.is_empty() {
         return ESRCH;
     }
