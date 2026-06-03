@@ -191,7 +191,9 @@ impl Inode for PipeEnd {
             n += 1;
         }
         if n == 0 && !buf.is_empty() {
-            return Err(EINVAL); // full
+            // Pipe full: signal "would block" so a non-blocking writer gets
+            // EAGAIN (pipe12), not EINVAL. sys_write surfaces it as-is.
+            return Err(-11); // EAGAIN
         }
         // Wake any reader that parked on an empty pipe, then fire the async-I/O
         // signal if the read end armed one (fcntl O_ASYNC + F_SETOWN/F_SETSIG).
