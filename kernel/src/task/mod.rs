@@ -128,6 +128,11 @@ pub struct Task {
     /// write 0 to *addr and `futex_wake(addr, 1)`. Set by `set_tid_address`
     /// and by CLONE_CHILD_CLEARTID. 0 = disabled.
     pub clear_child_tid: Mutex<usize>,
+    /// PR_SET_TIMERSLACK / PR_GET_TIMERSLACK (prctl08): the task's timer-slack
+    /// value in nanoseconds. We don't coalesce timers, but the value is
+    /// set/get/inherited like Linux's. Default 50000ns; inherited across fork;
+    /// PR_SET_TIMERSLACK(0) resets it to the default.
+    pub timer_slack: AtomicUsize,
     /// `clone(CLONE_VFORK)` parent suspension. POSIX vfork blocks the parent
     /// until the child either calls execve (gets its own address space) or
     /// exits. Without this, parent + child race on the shared stack and
@@ -1212,6 +1217,7 @@ fn make_task_with_ms(ms: MemorySet, tf: TrapFrame, ppid: i32) -> Arc<Task> {
         exe_path: Mutex::new(String::new()),
         signals: crate::signal::SignalState::new(),
         clear_child_tid: Mutex::new(0),
+        timer_slack: AtomicUsize::new(50000),
         vfork_child: Mutex::new(None),
         thread_stack_top: AtomicUsize::new(0),
         in_blocking_syscall: AtomicBool::new(false),
@@ -1510,6 +1516,8 @@ pub fn clone_current(
             parent.signals.fork_inherit()
         },
         clear_child_tid: Mutex::new(0),
+        // PR_*_TIMERSLACK: a forked child inherits the parent's current value.
+        timer_slack: AtomicUsize::new(parent.timer_slack.load(Ordering::Relaxed)),
         vfork_child: Mutex::new(None),
         // Record the thread stack only for genuine pthreads: CLONE_VM AND
         // CLONE_THREAD with an explicit, distinct stack, and NOT vfork.

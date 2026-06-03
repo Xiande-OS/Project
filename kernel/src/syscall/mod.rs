@@ -3438,6 +3438,8 @@ fn sys_prctl(option: i32, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     const PR_SET_TIMING: i32 = 14;
     const PR_SET_NAME: i32 = 15;
     const PR_GET_NAME: i32 = 16;
+    const PR_SET_TIMERSLACK: i32 = 29;
+    const PR_GET_TIMERSLACK: i32 = 30;
     const PR_SET_SECCOMP: i32 = 22;
     const PR_CAPBSET_DROP: i32 = 24;
     const PR_SET_SECUREBITS: i32 = 28;
@@ -3484,6 +3486,20 @@ fn sys_prctl(option: i32, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
             buf[..n].copy_from_slice(&name[..n]);
             if task.copy_out_bytes(a2, &buf).is_none() { return EFAULT; }
             0
+        }
+        // prctl08: round-trip the per-task timer slack. PR_SET_TIMERSLACK(0)
+        // resets it to the 50000ns default; any other value sets it verbatim.
+        // We don't actually coalesce timers; the value is just stored/reported
+        // and inherited across fork.
+        PR_SET_TIMERSLACK => {
+            task.timer_slack.store(
+                if a2 == 0 { 50_000 } else { a2 },
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            0
+        }
+        PR_GET_TIMERSLACK => {
+            task.timer_slack.load(core::sync::atomic::Ordering::Relaxed) as isize
         }
         // ---- argument validation exercised by prctl02 ----
         // The setup() probes (PR_GET_SECCOMP, PR_GET_NO_NEW_PRIVS,
