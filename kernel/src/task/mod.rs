@@ -756,8 +756,12 @@ pub fn emergency_reclaim() -> usize {
                         freed += 1;
                     }
                     // Parked orphan that can never be woken (real parent gone),
-                    // or any live member of a finished session.
-                    TaskState::Waiting if parent_dead || session_dead => {
+                    // or any live member of a finished session. sid > 1 guard:
+                    // never kill_now a parked task in the init session — the
+                    // runner loop waits in wait4 there, and killing it aborts
+                    // the whole ltp sweep (the "loop Killed at case N" that caps
+                    // the LA cells). Mirrors kill_session/reap_orphan_zombies.
+                    TaskState::Waiting if (parent_dead || session_dead) && sid > 1 => {
                         crate::signal::kill_now(&task);
                         drop(task);
                         reap(pid);

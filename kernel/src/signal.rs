@@ -467,6 +467,11 @@ fn collect_descendants(root_pid: i32) -> alloc::vec::Vec<Arc<crate::task::Task>>
 /// SIGKILLed fork test's leftovers used to pile up until the machine OOMed).
 pub fn post_sigkill_to_descendants(root_pid: i32) {
     for d in collect_descendants(root_pid) {
+        // Never SIGKILL the test harness (init session, sid<=1) even if a
+        // corrupted/reparented chain places it in the subtree being torn down.
+        if d.sid.load(Ordering::Relaxed) <= 1 {
+            continue;
+        }
         d.signals.pending.fetch_or(sigbit(SIGKILL), Ordering::SeqCst);
         {
             let mut s = d.state.lock();
