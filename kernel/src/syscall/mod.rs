@@ -7840,6 +7840,11 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
     if len == 0 {
         return EINVAL;
     }
+    // mmap06: flags must request a mapping type — MAP_SHARED(1), MAP_PRIVATE(2),
+    // or MAP_SHARED_VALIDATE(3). None set (e.g. a plain MAP_FILE) is EINVAL.
+    if (flags & 0x3) == 0 {
+        return EINVAL;
+    }
     let task = current_task();
     let aligned = (len + crate::mm::PAGE_SIZE - 1) & !(crate::mm::PAGE_SIZE - 1);
     if syscall_trace_enabled() {
@@ -7854,6 +7859,12 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
         let Some(file) = task.fd_table.lock().get(fd) else {
             return EBADF;
         };
+        // mmap06: a file mapping needs the fd open for reading (the page cache
+        // is populated by reading the file) — EACCES otherwise, even for a
+        // PROT_WRITE mapping.
+        if !file.readable {
+            return EACCES;
+        }
         let Some(mut buf) = try_zeroed_buf(aligned) else { return -12 };
         match file.inode.read_at(off as u64, &mut buf) {
             Ok(_) => Some(buf),
