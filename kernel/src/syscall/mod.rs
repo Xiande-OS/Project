@@ -1710,24 +1710,55 @@ fn sys_mq_unlink(name: usize) -> isize {
     if table.remove(&key).is_some() { 0 } else { ENOENT }
 }
 
-fn sys_mq_timedsend(fd: i32, msg: usize, len: usize, prio: u32, _abs: usize) -> isize {
+// Validate an abs_timeout pointer the way mq_timed{send,receive}01 expect: a
+// non-NULL but unreadable pointer is EFAULT, and a tv_nsec outside [0, 1e9) is
+// EINVAL. Ok(()) when absent or well-formed. We don't actually block, so a
+// full/empty queue with a timeout reports ETIMEDOUT rather than EAGAIN.
+fn mq_check_abstimeout(abs: usize) -> Result<(), isize> {
+    if abs == 0 {
+        return Ok(());
+    }
+    let task = current_task();
+    let Some(b) = task.copy_in_bytes(abs, 16) else { return Err(EFAULT) };
+    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
+    if !(0..1_000_000_000).contains(&nsec) {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+fn sys_mq_timedsend(fd: i32, msg: usize, len: usize, prio: u32, abs: usize) -> isize {
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
     let mq = match file.inode.as_any().downcast_ref::<PosixMq>() { Some(q) => q, None => return EBADF };
-    if len > mq.max_msg_size { return -90; }
+    // prio must be below MQ_PRIO_MAX (mq_timedsend01 probes a too-large prio).
+    if prio >= 32768 { return EINVAL; }
+    if len > mq.max_msg_size { return -90; } // EMSGSIZE
+    if let Err(e) = mq_check_abstimeout(abs) { return e; }
     let Some(data) = task.copy_in_bytes(msg, len) else { return EFAULT };
     let mut q = mq.queue.lock();
-    if q.len() >= mq.max_msgs { return -11; }
+    if q.len() >= mq.max_msgs {
+        // Full queue: with a timeout we'd block until it expires -> ETIMEDOUT;
+        // a plain non-blocking send is EAGAIN.
+        return if abs != 0 { -110 } else { -11 };
+    }
     q.push_back(PosixMsg { prio, data });
     0
 }
 
-fn sys_mq_timedreceive(fd: i32, msg: usize, len: usize, prio_ptr: usize, _abs: usize) -> isize {
+fn sys_mq_timedreceive(fd: i32, msg: usize, len: usize, prio_ptr: usize, abs: usize) -> isize {
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
     let mq = match file.inode.as_any().downcast_ref::<PosixMq>() { Some(q) => q, None => return EBADF };
+    // The receive buffer must be at least mq_msgsize (mq_timedreceive01 probes
+    // a short buffer expecting EMSGSIZE).
+    if len < mq.max_msg_size { return -90; } // EMSGSIZE
+    if let Err(e) = mq_check_abstimeout(abs) { return e; }
     let m = { let mut q = mq.queue.lock(); q.pop_front() };
-    let Some(m) = m else { return -11; };
+    let Some(m) = m else {
+        // Empty queue: with a timeout -> ETIMEDOUT; else EAGAIN.
+        return if abs != 0 { -110 } else { -11 };
+    };
     let n = core::cmp::min(len, m.data.len());
     if task.copy_out_bytes(msg, &m.data[..n]).is_none() { return EFAULT; }
     if prio_ptr != 0 { let _ = task.copy_out_bytes(prio_ptr, &m.prio.to_le_bytes()); }
