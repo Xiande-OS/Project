@@ -5473,6 +5473,67 @@ fn sys_timer_delete(timerid: i32) -> isize {
 // COUNT line that the wrapper script greps for.
 
 const ITIMER_REAL: i32 = 0;
+const ITIMER_VIRTUAL: i32 = 1;
+const ITIMER_PROF: i32 = 2;
+
+/// ITIMER_VIRTUAL / ITIMER_PROF round-trip storage, keyed by (pid, which) ->
+/// (interval_ticks, value_ticks). We don't actually fire SIGVTALRM/SIGPROF (no
+/// contest binary depends on them), but getitimer01 checks that setitimer()
+/// followed by getitimer() returns the same interval+value, so we must store
+/// and replay them rather than stub to zero.
+static ITIMER_VP: crate::sync::Mutex<alloc::collections::BTreeMap<(i32, i32), (u64, u64)>> =
+    crate::sync::Mutex::new(alloc::collections::BTreeMap::new());
+
+fn getitimer_vp(which: i32, cur_val: usize) -> isize {
+    if cur_val == 0 {
+        return EFAULT;
+    }
+    let pid = current_task().pid;
+    let (interval, value) = ITIMER_VP.lock().get(&(pid, which)).copied().unwrap_or((0, 0));
+    let out = Itimerval {
+        it_interval: ticks_to_timeval(interval),
+        it_value: ticks_to_timeval(value),
+    };
+    write_struct(cur_val, &out)
+}
+
+fn setitimer_vp(which: i32, new_val: usize, old_val: usize) -> isize {
+    let task = current_task();
+    let pid = task.pid;
+    if old_val != 0 {
+        let (interval, value) = ITIMER_VP.lock().get(&(pid, which)).copied().unwrap_or((0, 0));
+        let old = Itimerval {
+            it_interval: ticks_to_timeval(interval),
+            it_value: ticks_to_timeval(value),
+        };
+        if write_struct(old_val, &old) != 0 {
+            return EFAULT;
+        }
+    }
+    if new_val == 0 {
+        return 0;
+    }
+    let Some(buf) = task.copy_in_bytes(new_val, core::mem::size_of::<Itimerval>()) else {
+        return EFAULT;
+    };
+    let it_int_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+    let it_int_usec = i64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+    let it_val_sec = i64::from_le_bytes(buf[16..24].try_into().unwrap_or([0; 8]));
+    let it_val_usec = i64::from_le_bytes(buf[24..32].try_into().unwrap_or([0; 8]));
+    if it_int_usec < 0 || it_int_usec >= 1_000_000 || it_val_usec < 0 || it_val_usec >= 1_000_000
+        || it_int_sec < 0 || it_val_sec < 0
+    {
+        return EINVAL;
+    }
+    let interval = timeval_to_ticks(&Timeval { sec: it_int_sec, usec: it_int_usec });
+    let value = timeval_to_ticks(&Timeval { sec: it_val_sec, usec: it_val_usec });
+    if value == 0 {
+        ITIMER_VP.lock().remove(&(pid, which));
+    } else {
+        ITIMER_VP.lock().insert((pid, which), (interval, value));
+    }
+    0
+}
 
 #[repr(C)]
 struct Itimerval {
@@ -5495,9 +5556,11 @@ fn ticks_to_timeval(ticks: u64) -> Timeval {
 }
 
 fn sys_setitimer(which: usize, new_val: usize, old_val: usize) -> isize {
-    if which as i32 != ITIMER_REAL {
-        // ITIMER_VIRTUAL / ITIMER_PROF aren't used by any contest binary.
-        // Pretend success so dust-eyed callers don't bail.
+    let which = which as i32;
+    if which == ITIMER_VIRTUAL || which == ITIMER_PROF {
+        return setitimer_vp(which, new_val, old_val);
+    }
+    if which != ITIMER_REAL {
         return 0;
     }
     let task = current_task();
@@ -5556,7 +5619,11 @@ fn sys_setitimer(which: usize, new_val: usize, old_val: usize) -> isize {
 }
 
 fn sys_getitimer(which: usize, cur_val: usize) -> isize {
-    if which as i32 != ITIMER_REAL {
+    let which = which as i32;
+    if which == ITIMER_VIRTUAL || which == ITIMER_PROF {
+        return getitimer_vp(which, cur_val);
+    }
+    if which != ITIMER_REAL {
         if cur_val != 0 {
             let zero = Itimerval {
                 it_interval: Timeval { sec: 0, usec: 0 },
