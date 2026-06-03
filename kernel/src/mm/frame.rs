@@ -30,6 +30,19 @@ pub fn init(pa_start: PhysAddr, pa_end: PhysAddr) {
     TOTAL_PAGES.store(end - start, Ordering::Relaxed);
 }
 
+/// Force-release the frame pool's internal spinlock — the physical-memory twin
+/// of [`crate::mm::heap::force_unlock`]. A wedged/faulted stack abandoned inside
+/// `try_alloc_zeroed`/`dealloc` would otherwise strand this lock and hang every
+/// later page-fault, fork and execve (all of which take a frame) — cascading a
+/// single bad case into a dead run. Called from the fault/watchdog recovery.
+///
+/// # Safety
+/// Single-hart fault/watchdog recovery only; the abandoned stack is then the
+/// only possible holder.
+pub unsafe fn force_unlock() {
+    unsafe { FRAME_ALLOC.force_unlock() };
+}
+
 pub fn alloc() -> Option<FrameTracker> {
     if let Some(f) = try_alloc_zeroed() {
         return Some(f);

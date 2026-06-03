@@ -51,3 +51,20 @@ pub fn init() {
             .init(KERNEL_HEAP.as_mut_ptr() as usize, KERNEL_HEAP_SIZE);
     }
 }
+
+/// Force-release the buddy heap's internal spinlock. The preempt_disable bracket
+/// in alloc/dealloc keeps the scheduler from switching mid-allocation, but it
+/// can't help the watchdog/fault recovery path, which *abandons* the wedged
+/// stack without unwinding. If that stack was inside `alloc` (an LTP case that
+/// loops allocating until the 8 s watchdog fires is frequently mid-alloc when
+/// the timer lands), the heap lock stays held forever and EVERY later
+/// allocation — including pid 1's — spins, cascading the whole run to death.
+/// `force_release_locks_after_fault` calls this so a single wedged case can't
+/// strand the allocator.
+///
+/// # Safety
+/// Call only from the single-hart fault/watchdog recovery, where the abandoned
+/// stack is the only possible holder of the lock.
+pub unsafe fn force_unlock() {
+    unsafe { HEAP_ALLOCATOR.0.force_unlock() };
+}

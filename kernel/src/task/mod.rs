@@ -328,6 +328,14 @@ pub unsafe fn force_release_locks_after_fault() {
     // wedge preemption off forever. Zero it — we are force-releasing the locks
     // and switching to a fresh task anyway.
     crate::sync::preempt_reset();
+    // The wedged/faulted stack may have been abandoned *inside* the buddy
+    // allocator, holding its internal spinlock. Nothing below (kill_now,
+    // re-locking TABLE, freeing frames) can run if every alloc/dealloc now
+    // spins on a stranded heap lock — that is the cascade that walks a single
+    // wedged LTP case all the way up to killing pid 1 and ending the run. Free
+    // it first, before any allocation here.
+    crate::mm::heap::force_unlock();
+    crate::mm::frame::force_unlock();
     TABLE.force_unlock();
     // The abandoned operation may also be holding the *current task's own*
     // per-process locks — e.g. a syscall that wedged or faulted mid fd-table
