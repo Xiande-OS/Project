@@ -368,6 +368,10 @@ pub struct Ext4Dir {
     overlay_deleted: Mutex<BTreeSet<String>>,
     /// chmod/chown override (mode_perm_bits, uid, gid). None = read from disk.
     perm: Mutex<Option<(u32, u32, u32)>>,
+    /// utimensat() times override (atime, mtime) as (sec, nsec) pairs; None
+    /// until set. ext4 doesn't track on-disk times here, so utimes/stat
+    /// round-trip through this (utimensat01).
+    times: Mutex<Option<((i64, i64), (i64, i64))>>,
 }
 
 pub struct Ext4File {
@@ -377,6 +381,10 @@ pub struct Ext4File {
     mutated: Mutex<Option<Vec<u8>>>,
     /// chmod/chown override (mode_perm_bits, uid, gid). None = read from disk.
     perm: Mutex<Option<(u32, u32, u32)>>,
+    /// utimensat() times override (atime, mtime) as (sec, nsec) pairs; None
+    /// until set. ext4 doesn't track on-disk times here, so utimes/stat
+    /// round-trip through this (utimensat01).
+    times: Mutex<Option<((i64, i64), (i64, i64))>>,
 }
 
 impl Ext4Dir {
@@ -411,6 +419,7 @@ impl Ext4Dir {
                     overlay_added: Mutex::new(BTreeMap::new()),
                     overlay_deleted: Mutex::new(BTreeSet::new()),
                     perm: Mutex::new(None),
+                    times: Mutex::new(None),
                 }),
                 7 => {
                     // Symlink — present as a regular file holding the target.
@@ -420,6 +429,7 @@ impl Ext4Dir {
                         cached: Mutex::new(None),
                         mutated: Mutex::new(None),
                     perm: Mutex::new(None),
+                    times: Mutex::new(None),
                     })
                 }
                 _ => Arc::new(Ext4File {
@@ -428,6 +438,7 @@ impl Ext4Dir {
                     cached: Mutex::new(None),
                     mutated: Mutex::new(None),
                     perm: Mutex::new(None),
+                    times: Mutex::new(None),
                 }),
             };
             map.insert(name, child);
@@ -458,6 +469,16 @@ impl Inode for Ext4Dir {
         let nu = if uid != u32::MAX { uid } else { cur.1 };
         let ng = if gid != u32::MAX { gid } else { cur.2 };
         *p = Some((cur.0, nu, ng));
+        true
+    }
+    fn meta_times(&self) -> Option<((i64, i64), (i64, i64), (i64, i64))> {
+        let ((as_, an), (ms, mn)) = self.times.lock().unwrap_or(((0, 0), (0, 0)));
+        Some(((as_, an), (ms, mn), (ms, mn)))
+    }
+    fn set_times(&self, atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) -> bool {
+        let mut t = self.times.lock();
+        let cur = t.unwrap_or(((0, 0), (0, 0)));
+        *t = Some((atime.unwrap_or(cur.0), mtime.unwrap_or(cur.1)));
         true
     }
     fn kind(&self) -> FileType { FileType::Directory }
@@ -581,6 +602,16 @@ impl Inode for Ext4File {
         *p = Some((cur.0, nu, ng));
         true
     }
+    fn meta_times(&self) -> Option<((i64, i64), (i64, i64), (i64, i64))> {
+        let ((as_, an), (ms, mn)) = self.times.lock().unwrap_or(((0, 0), (0, 0)));
+        Some(((as_, an), (ms, mn), (ms, mn)))
+    }
+    fn set_times(&self, atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) -> bool {
+        let mut t = self.times.lock();
+        let cur = t.unwrap_or(((0, 0), (0, 0)));
+        *t = Some((atime.unwrap_or(cur.0), mtime.unwrap_or(cur.1)));
+        true
+    }
     fn kind(&self) -> FileType {
         let raw = match self.fs.read_inode(self.ino) {
             Ok(r) => r,
@@ -682,6 +713,7 @@ pub fn mount() -> core::result::Result<Arc<dyn Inode>, &'static str> {
         overlay_added: Mutex::new(BTreeMap::new()),
         overlay_deleted: Mutex::new(BTreeSet::new()),
                     perm: Mutex::new(None),
+                    times: Mutex::new(None),
     });
     Ok(root)
 }

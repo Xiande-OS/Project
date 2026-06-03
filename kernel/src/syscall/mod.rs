@@ -5182,6 +5182,10 @@ fn apply_times(inode: &Arc<dyn Inode>, atime: Option<(i64, i64)>, mtime: Option<
         let mut m = d.meta.lock();
         if let Some((s, ns)) = atime { m.atime_sec = s; m.atime_nsec = ns; }
         if let Some((s, ns)) = mtime { m.mtime_sec = s; m.mtime_nsec = ns; }
+    } else {
+        // ext4 (and any other inode that supports it) stores the times via the
+        // Inode trait so utimensat persists on the disk-backed test files.
+        inode.set_times(atime, mtime);
     }
 }
 
@@ -6361,7 +6365,9 @@ fn fill_stat(inode: &Arc<dyn Inode>) -> LinuxStat {
         let m = *d.meta.lock();
         ((m.atime_sec, m.atime_nsec), (m.mtime_sec, m.mtime_nsec), (m.ctime_sec, m.ctime_nsec))
     } else {
-        ((0, 0), (0, 0), (0, 0))
+        // ext4 and others report times via the Inode trait (utimensat01 sets
+        // them through set_times); default to zeros if unsupported.
+        inode.meta_times().unwrap_or(((0, 0), (0, 0), (0, 0)))
     };
     let (mode_bits, uid, gid) = inode.meta_perm().unwrap_or_else(|| {
         let d = match inode.kind() {

@@ -268,6 +268,17 @@ pub trait Inode: Send + Sync + core::any::Any {
     fn set_owner(&self, _uid: u32, _gid: u32) -> bool {
         false
     }
+    /// (atime, mtime, ctime) as (sec, nsec) pairs, for stat. None = use the
+    /// default zeros. Implemented by the in-memory fs and the ext4 overlay so
+    /// utimensat/stat round-trip (utimensat01).
+    fn meta_times(&self) -> Option<((i64, i64), (i64, i64), (i64, i64))> {
+        None
+    }
+    /// Set atime/mtime (utimensat); None leaves that field. Returns false if
+    /// unsupported.
+    fn set_times(&self, _atime: Option<(i64, i64)>, _mtime: Option<(i64, i64)>) -> bool {
+        false
+    }
     /// Hard-link count for st_nlink. Default 1 (a single name). A directory
     /// reports 2 + its subdirectory count (`.`, its entry in the parent, and
     /// each child's `..`); a regular file bumps this per extra hard link.
