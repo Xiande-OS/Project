@@ -3373,8 +3373,20 @@ fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: usize, count: usize) -> isi
     }
 
     let mut off = if offset_ptr != 0 {
-        let bytes = task.copy_in_bytes(offset_ptr, 8).unwrap_or(alloc::vec![0u8; 8]);
-        u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]))
+        // The offset pointer must be a readable AND writable user address:
+        // sendfile reads the start offset and writes the updated one back.
+        // sendfile04 passes PROT_NONE/PROT_EXEC/unmapped (unreadable) and
+        // PROT_READ (unwritable) buffers and expects EFAULT for each, so probe
+        // both directions up front instead of swallowing the failure.
+        let bytes = match task.copy_in_bytes(offset_ptr, 8) {
+            Some(b) => b,
+            None => return EFAULT,
+        };
+        let val = u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]));
+        if task.copy_out_bytes(offset_ptr, &val.to_le_bytes()).is_none() {
+            return EFAULT;
+        }
+        val
     } else {
         *in_file.offset.lock()
     };
