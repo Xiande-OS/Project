@@ -59,12 +59,12 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
           df -h /
 
-      - name: Install QEMU + cross linker + e2fsprogs
+      - name: Install QEMU + cross linker + disk tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-misc qemu-system-riscv64 \
-            gcc-riscv64-linux-gnu gcc-14-loongarch64-linux-gnu curl e2fsprogs
+            gcc-riscv64-linux-gnu gcc-14-loongarch64-linux-gnu curl e2fsprogs xz-utils
           qemu-system-riscv64 --version | head -1
           qemu-system-loongarch64 --version | head -1
 
