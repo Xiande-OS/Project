@@ -1248,7 +1248,27 @@ pub fn sys_socketpair(domain: i32, kind: i32, proto: i32, sv: usize) -> isize {
     // an unknown family is EAFNOSUPPORT.
     match domain {
         AF_UNIX => {}
-        AF_INET | AF_INET6 => return EOPNOTSUPP,
+        AF_INET | AF_INET6 => {
+            // socketpair has no operation for the IP families, but Linux still
+            // validates type and protocol first (socketpair01): an unknown
+            // socket type is EINVAL, an incompatible protocol is
+            // EPROTONOSUPPORT, and only a valid stream/dgram with the default
+            // or matching protocol reaches EOPNOTSUPP.
+            const SOCK_RAW: i32 = 3;
+            const IPPROTO_TCP: i32 = 6;
+            const IPPROTO_UDP: i32 = 17;
+            let base = kind & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+            let proto_ok = match base {
+                SOCK_STREAM => proto == 0 || proto == IPPROTO_TCP,
+                SOCK_DGRAM => proto == 0 || proto == IPPROTO_UDP,
+                SOCK_RAW => false, // raw sockets have no pair op -> EPROTONOSUPPORT
+                _ => return EINVAL, // unknown socket type
+            };
+            if !proto_ok {
+                return EPROTONOSUPPORT;
+            }
+            return EOPNOTSUPP;
+        }
         _ => return EAFNOSUPPORT,
     }
     let base = kind & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
