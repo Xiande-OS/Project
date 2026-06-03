@@ -4607,6 +4607,11 @@ fn sys_pselect6(
     _timeout: usize,
     _sigmask: usize,
 ) -> isize {
+    // select03: a negative nfds is EINVAL (it arrives sign-extended to a huge
+    // usize, so test it as a signed value).
+    if (nfds as isize) < 0 {
+        return EINVAL;
+    }
     if nfds == 0 {
         return 0;
     }
@@ -4639,12 +4644,20 @@ fn sys_pselect6(
                     (false, Some(t))
                 }
             }
-            None => (false, None),
+            // select03: a non-NULL but unreadable timeout pointer is EFAULT.
+            None => return EFAULT,
         }
     } else {
         (false, None)
     };
     let bytes = (nfds + 7) / 8;
+    // select03: a non-NULL fd_set pointer that can't be read is EFAULT (the
+    // test passes a deliberately bad address for each of read/write/except).
+    for addr in [rfds, wfds, efds] {
+        if addr != 0 && task.copy_in_bytes(addr, bytes).is_none() {
+            return EFAULT;
+        }
+    }
     let read_set = |addr: usize| -> alloc::vec::Vec<u8> {
         if addr == 0 { alloc::vec![0u8; bytes] }
         else { task.copy_in_bytes(addr, bytes).unwrap_or_else(|| alloc::vec![0u8; bytes]) }
