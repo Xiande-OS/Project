@@ -871,10 +871,17 @@ fn sys_pwrite(fd: i32, buf: usize, len: usize, off: u64) -> isize {
 }
 
 fn sys_lseek(fd: i32, offset: i64, whence: i32) -> isize {
+    const ESPIPE: isize = -29;
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
+    // lseek02: a pipe or FIFO is not seekable -> ESPIPE. Without this the
+    // seek "succeeded" on the pipe read end and the named-fifo fds the test
+    // opens.
+    if matches!(file.inode.kind(), FileType::Pipe) {
+        return ESPIPE;
+    }
     match file.seek(offset, whence) {
         Ok(o) => o as isize,
         Err(e) => err_to_isize(e),
