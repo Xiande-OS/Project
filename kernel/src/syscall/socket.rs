@@ -890,9 +890,31 @@ pub fn sys_getpeername(fd: i32, addr_ptr: usize, len_ptr: usize) -> isize {
 
 // ---------- setsockopt / getsockopt ----------
 
-pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: usize, _optlen: i32) -> isize {
+pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: usize, optlen: i32) -> isize {
     const SOL_SOCKET: i32 = 1;
+    const IPPROTO_IP: i32 = 0;
+    const IPPROTO_TCP: i32 = 6;
     const SO_RCVTIMEO: i32 = 20;
+    const ENOPROTOOPT: isize = -92;
+    // The fd must name an open socket (EBADF if not open, ENOTSOCK otherwise).
+    if let Err(e) = with_socket(fd, |_| ()) {
+        return e;
+    }
+    // Only the levels our IPv4 sockets implement are valid; an unknown level
+    // or a non-positive option name is ENOPROTOOPT (setsockopt01).
+    if level != SOL_SOCKET && level != IPPROTO_IP && level != IPPROTO_TCP {
+        return ENOPROTOOPT;
+    }
+    if optname <= 0 {
+        return ENOPROTOOPT;
+    }
+    // The option value must be a readable buffer at least int-sized.
+    if optval == 0 {
+        return EFAULT;
+    }
+    if optlen < 4 {
+        return EINVAL;
+    }
     // iperf3 puts a finite SO_RCVTIMEO on its UDP socket so its blocking
     // recvfrom won't hang forever when no packet arrives. Convert the
     // timeval to mtime ticks (10 MHz on QEMU virt) and stash it on the
