@@ -36,15 +36,19 @@ const EEXIST: isize = -17;
 const ENOSPC: isize = -28;
 const ENOMEM: isize = -12;
 
-/// Linux spaces SysV IPC ids by IPCMNI (the per-namespace id-space size) via
-/// its `seq * IPCMNI + index` encoding, so an id's arithmetic neighbours
-/// (msqid±1, a just-removed id, …) are never themselves valid ids. LTP's
-/// {msg,shm,sem}ctl04 derive a "bad id" exactly that way — `msg_id - 1`, a
-/// created-then-removed id — and expect EINVAL. With densely packed ids
-/// (1, 2, 3, …) that bad id collided with an object a different test left
-/// live earlier in the same boot (SysV objects persist past process exit),
-/// so the ctl call found a queue and "succeeded" instead. Handing out ids
-/// spaced IPCMNI apart (and never reusing one) restores the invariant.
+/// Linux encodes a SysV IPC id as `seq * IPCMNI + index`, where the slot index
+/// AND the sequence counter BOTH advance on every allocation. The crucial
+/// consequence: `id - k*IPCMNI` (for k != 0) decodes to a slot whose live seq
+/// no longer matches, so it is never itself a valid id. {msg,shm,sem}ctl04
+/// derive their "bad id" exactly this way — `msg_id - IPCMNI`, `msg_id - 1`, a
+/// created-then-removed id — and expect EINVAL. We assign ids `n * (IPCMNI+1)`
+/// (a monotonic n standing in for both index and seq, never reused), which
+/// reproduces that invariant: ids are spaced IPCMNI+1 apart, so neither an
+/// arithmetic neighbour nor `id - k*IPCMNI` ever collides with a live object.
+/// Densely packed ids (1, 2, 3, …) failed because the bad id hit a queue a
+/// different test left live earlier in the boot (SysV objects persist past
+/// process exit); a plain IPCMNI stride still let `msg_id - IPCMNI` hit the
+/// previous live id.
 const IPCMNI: i32 = 32768;
 
 // ── ipc / shm command + flag constants (asm-generic, shared by rv64 & la64)
@@ -173,7 +177,7 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: i32) -> isize {
     SHM_TOTAL_PAGES.fetch_add(pages, Ordering::Relaxed);
 
     let id = t.next_id;
-    t.next_id = t.next_id.wrapping_add(IPCMNI).max(1);
+    t.next_id = t.next_id.wrapping_add(IPCMNI + 1).max(1);
     let pid = crate::task::current_pid();
     let now = now_secs();
     let seg = ShmSeg {
@@ -506,7 +510,7 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> isize {
         return ENOSPC;
     }
     let id = t.next_id;
-    t.next_id = t.next_id.wrapping_add(IPCMNI).max(1);
+    t.next_id = t.next_id.wrapping_add(IPCMNI + 1).max(1);
     let now = now_secs();
     let q = MsgQueue {
         msqid: id,
@@ -788,7 +792,7 @@ pub fn sys_semget(key: i32, nsems: usize, semflg: i32) -> isize {
         return ENOSPC;
     }
     let id = t.next_id;
-    t.next_id = t.next_id.wrapping_add(IPCMNI).max(1);
+    t.next_id = t.next_id.wrapping_add(IPCMNI + 1).max(1);
     let now = now_secs();
     let set = SemSet {
         semid: id,
