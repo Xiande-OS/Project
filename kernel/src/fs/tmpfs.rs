@@ -211,6 +211,11 @@ impl Inode for TmpfsFile {
         Ok(n)
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        // memfd seals (memfd_create01): F_SEAL_WRITE (0x8) and
+        // F_SEAL_FUTURE_WRITE (0x10) forbid modifying the contents. EPERM = -1.
+        if self.seals.load(Ordering::Relaxed) & 0x18 != 0 {
+            return Err(-1);
+        }
         let mut data = self.data.lock();
         let off = offset as usize;
         let end = off.checked_add(buf.len()).ok_or(EINVAL)?;
@@ -259,6 +264,21 @@ impl Inode for TmpfsFile {
         Ok(buf.len())
     }
     fn truncate(&self, len: u64) -> Result<()> {
+        // memfd seals (memfd_create01): F_SEAL_SHRINK (0x2) forbids shrinking,
+        // F_SEAL_GROW (0x4) forbids growing. EPERM = -1.
+        let seals = self.seals.load(Ordering::Relaxed);
+        if seals & 0x6 != 0 {
+            let cur = core::cmp::max(
+                self.data.lock().len() as u64,
+                self.logical_len.load(Ordering::Relaxed),
+            );
+            if len < cur && seals & 0x2 != 0 {
+                return Err(-1);
+            }
+            if len > cur && seals & 0x4 != 0 {
+                return Err(-1);
+            }
+        }
         let mut data = self.data.lock();
         let new_len = len as usize;
         if new_len > data.len() {

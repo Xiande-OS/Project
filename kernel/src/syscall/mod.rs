@@ -3713,7 +3713,16 @@ fn sys_copy_file_range(fd_in: i32, off_in: usize, fd_out: i32, off_out: usize, l
 /// memfd_create(name, flags) — anonymous in-memory file.
 fn sys_memfd_create(_name: usize, flags: u32) -> isize {
     const MFD_CLOEXEC: u32 = 1;
-    let file_inode: Arc<dyn Inode> = Arc::new(crate::fs::tmpfs::TmpfsFile::new());
+    const MFD_ALLOW_SEALING: u32 = 2;
+    let tf = crate::fs::tmpfs::TmpfsFile::new();
+    // Without MFD_ALLOW_SEALING the file is born sealed-shut (F_SEAL_SEAL), so a
+    // later F_ADD_SEALS returns EPERM and F_GET_SEALS reports F_SEAL_SEAL
+    // (memfd_create01 no_sealing). F_SEAL_SEAL alone blocks only further sealing,
+    // not writes/truncates, so a plain memfd still works normally.
+    if flags & MFD_ALLOW_SEALING == 0 {
+        tf.add_seals(0x0001); // F_SEAL_SEAL
+    }
+    let file_inode: Arc<dyn Inode> = Arc::new(tf);
     let f = Arc::new(crate::fs::File::from_inode(file_inode, true, true, false));
     match current_task().fd_table.lock().alloc(f, flags & MFD_CLOEXEC != 0) {
         Ok(fd) => fd as isize,
