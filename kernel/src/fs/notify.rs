@@ -413,6 +413,12 @@ struct FanEvent {
     // Weak so a queued event never keeps it (or a tmpfs file's data) alive
     // after deletion — a stale event is dropped at read time.
     inode: Weak<dyn Inode>,
+    // Stable identity of `inode` captured at report time. Coalescing keys on
+    // this rather than `Weak::ptr_eq`, which fails on ext2 (a fresh Arc per
+    // lookup, so the open event's Weak and the close event's Weak never compare
+    // equal even for the same on-disk file — fanotify13 then sees FAN_OPEN and
+    // FAN_CLOSE_NOWRITE as two events instead of one merged mask=0x30).
+    ino: u64,
     // Entry name for DFID_NAME events (None for FID/DFID self events).
     name: Option<String>,
     // PID of the process that triggered the event (captured when the fs-op
@@ -520,13 +526,18 @@ impl FanotifyGroup {
     fn push_event(&self, e: FanEvent) {
         {
             let mut q = self.events.lock();
-            // Coalesce with the most-recent unread event on the SAME object by
-            // OR-ing the masks — fanotify merges e.g. FAN_OPEN then
-            // FAN_CLOSE_NOWRITE on one object into a single mask=0x30 event
-            // (fanotify13 checks this). Distinct objects stay separate.
-            if let Some(last) = q.back_mut() {
-                if Weak::ptr_eq(&last.inode, &e.inode) && last.name == e.name {
-                    last.mask |= e.mask;
+            // Coalesce with ANY queued unread event on the same object by OR-ing
+            // the masks — fanotify merges e.g. FAN_OPEN then FAN_CLOSE_NOWRITE on
+            // one object into a single mask=0x30 event (fanotify13). Linux walks
+            // the whole notification queue, not just the tail: a case that opens
+            // file1, file2, dir and THEN closes them interleaves other objects'
+            // events between open(file1) and close(file1), so a back()-only check
+            // would leave them as two events (mask 0x20 then 0x10) instead of one
+            // merged 0x30. Distinct objects (and, for DFID_NAME, distinct names)
+            // stay separate.
+            for ev in q.iter_mut() {
+                if ev.ino == e.ino && ev.name == e.name {
+                    ev.mask |= e.mask;
                     return;
                 }
             }
@@ -725,6 +736,7 @@ fn report_fanotify(
             g.push_event(FanEvent {
                 mask: em,
                 inode: Arc::downgrade(fo),
+                ino: inode_identity(fo),
                 name: ev_name,
                 pid: crate::task::current_pid(),
             });
