@@ -86,6 +86,18 @@ pub fn now_ticks() -> u64 {
 /// Ticks of [`now_ticks`] per wall-clock second.
 pub const TICKS_PER_SEC: u64 = imp::time::TICKS_PER_SEC;
 
+/// Tell the timer layer the raw counter frequency the platform advertises (the
+/// device tree's `timebase-frequency`). riscv64 rescales its mtime to the fixed
+/// `TICKS_PER_SEC` from this; loongarch64 reads a constant-rate counter and
+/// ignores it. Call once, early in boot.
+#[inline]
+pub fn set_timer_raw_hz(hz: u64) {
+    #[cfg(target_arch = "riscv64")]
+    imp::time::set_raw_hz(hz);
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = hz;
+}
+
 // ---- Power ------------------------------------------------------------
 
 /// Power the machine off cleanly (normal completion).

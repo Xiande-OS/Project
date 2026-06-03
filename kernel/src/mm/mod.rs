@@ -42,6 +42,17 @@ fn detect_memory_end(dtb_pa: usize) -> usize {
         // bogus value can't fault us by reading non-existent physical memory.
         if dtb_pa >= RAM_START && dtb_pa < MEMORY_END_DEFAULT {
             if let Ok(fdt) = unsafe { fdt::Fdt::from_ptr(dtb_pa as *const u8) } {
+                // Learn the real mtime frequency so the timer layer can rescale
+                // it to the kernel's assumed 10 MHz. A non-10 MHz board would
+                // otherwise make every timeout and the in-kernel watchdog run
+                // at the wrong rate (the contest-machine execl01 cascade).
+                if let Some(hz) = fdt
+                    .find_node("/cpus")
+                    .and_then(|n| n.property("timebase-frequency"))
+                    .and_then(|p| p.as_usize())
+                {
+                    crate::arch::set_timer_raw_hz(hz as u64);
+                }
                 let mut end = 0usize;
                 for region in fdt.memory().regions() {
                     if let Some(size) = region.size {

@@ -88,6 +88,12 @@ pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
 
     mm::init(dtb_pa);
     println!("  RAM end @ {:#x}", mm::mm_end());
+    #[cfg(target_arch = "riscv64")]
+    println!(
+        "  timer raw {} Hz -> normalised {} Hz",
+        arch::riscv64::time::raw_hz(),
+        arch::TICKS_PER_SEC
+    );
     arch::trap_init();
     // Parse the embedded vDSO once (panics early on any layout problem).
     vdso::init();
