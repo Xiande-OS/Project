@@ -4028,6 +4028,27 @@ fn sys_set_id(nr: usize, a0: usize, a1: usize, a2: usize) -> isize {
     0
 }
 
+/// Persisted ntp-discipline fields. We never steer the clock, but clock_adjtime01
+/// sets a field via its mode bit and then reads it back, requiring the value to
+/// stick — Linux keeps the same state in the global timekeeper. tick defaults to
+/// the HZ=100 nominal (10000us); the rest default to 0.
+struct AdjtimexState {
+    offset: i64,
+    freq: i64,
+    maxerror: i64,
+    esterror: i64,
+    constant: i64,
+    tick: i64,
+}
+static ADJTIMEX_STATE: crate::sync::Mutex<AdjtimexState> = crate::sync::Mutex::new(AdjtimexState {
+    offset: 0,
+    freq: 0,
+    maxerror: 0,
+    esterror: 0,
+    constant: 0,
+    tick: 10_000,
+});
+
 /// adjtimex(2). We don't steer the system clock, but we implement the
 /// syscall's validation and reporting semantics (mirroring the kernel's
 /// ntp_validate_timex) so the LTP adjtimex group runs:
@@ -4074,9 +4095,31 @@ fn sys_adjtimex(buf: usize) -> isize {
             return EINVAL;
         }
     }
-    // Success: report a synced clock (status@40 = TIME_OK, tick@88 = nominal).
+    // Round-trip the discipline fields for a normal adjtimex (not the
+    // ADJ_ADJTIME single-shot path): store each field whose mode bit is set,
+    // then report the whole persisted state back. clock_adjtime01 sets a field
+    // and reads it back expecting the value to stick. The ADJ_ADJTIME path
+    // keeps its prior behaviour (report the nominal tick).
+    if modes & ADJ_ADJTIME == 0 {
+        let mut st = ADJTIMEX_STATE.lock();
+        let rd = |o: usize| i64::from_le_bytes(tx[o..o + 8].try_into().unwrap());
+        if modes & 0x0001 != 0 { st.offset = rd(8); }   // ADJ_OFFSET
+        if modes & 0x0002 != 0 { st.freq = rd(16); }     // ADJ_FREQUENCY
+        if modes & 0x0004 != 0 { st.maxerror = rd(24); } // ADJ_MAXERROR
+        if modes & 0x0008 != 0 { st.esterror = rd(32); } // ADJ_ESTERROR
+        if modes & 0x0020 != 0 { st.constant = rd(48); } // ADJ_TIMECONST
+        if modes & ADJ_TICK != 0 { st.tick = rd(88); }   // ADJ_TICK (range-checked above)
+        tx[8..16].copy_from_slice(&st.offset.to_le_bytes());
+        tx[16..24].copy_from_slice(&st.freq.to_le_bytes());
+        tx[24..32].copy_from_slice(&st.maxerror.to_le_bytes());
+        tx[32..40].copy_from_slice(&st.esterror.to_le_bytes());
+        tx[48..56].copy_from_slice(&st.constant.to_le_bytes());
+        tx[88..96].copy_from_slice(&st.tick.to_le_bytes());
+    } else {
+        tx[88..96].copy_from_slice(&TICK_NOMINAL.to_le_bytes());
+    }
+    // status@40 always reports a synced clock (TIME_OK).
     tx[40..44].copy_from_slice(&0i32.to_le_bytes());
-    tx[88..96].copy_from_slice(&TICK_NOMINAL.to_le_bytes());
     let _ = task.copy_out_bytes(buf, &tx);
     TIME_OK
 }
