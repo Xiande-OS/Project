@@ -181,6 +181,7 @@ pub const SYS_MUNLOCK: usize = 229;
 pub const SYS_MLOCKALL: usize = 230;
 pub const SYS_MUNLOCKALL: usize = 231;
 pub const SYS_MREMAP: usize = 216;
+pub const SYS_ADD_KEY: usize = 217;
 pub const SYS_CLOSE_RANGE: usize = 436;
 pub const SYS_FSTATFS: usize = 44;
 pub const SYS_PREADV: usize = 69;

@@ -306,6 +306,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_UNSHARE => sys_unshare(a0),
         nr::SYS_GETRUSAGE => sys_getrusage(a0 as i32, a1),
         nr::SYS_MEMBARRIER => 0,
+        nr::SYS_ADD_KEY => sys_add_key(a0, a1, a2, a3, a4 as i32),
         nr::SYS_TIMES => sys_times(a0),
         nr::SYS_READLINKAT => sys_readlinkat(a0 as i32, a1, a2, a3),
         nr::SYS_RENAMEAT2 => sys_renameat2(a0 as i32, a1, a2 as i32, a3, a4 as u32),
@@ -451,6 +452,30 @@ fn copy_path(addr: usize) -> Option<String> {
         }
     }
     core::str::from_utf8(&out).ok().map(String::from)
+}
+
+/// add_key(2): create a key of `type` and return a fresh key serial. We
+/// validate the key type and the per-type payload-length limits that LTP's
+/// add_key01 checks (keyrings carry no payload; user/logon cap at 32767;
+/// big_key caps at 1 MiB-1) and hand back a unique positive serial. Full
+/// keyring storage (keyctl/request_key) is a separate piece of work.
+fn sys_add_key(type_ptr: usize, _desc: usize, _payload: usize, plen: usize, _ringid: i32) -> isize {
+    const ENODEV: isize = -19;
+    let Some(ktype) = copy_path(type_ptr) else {
+        return EFAULT;
+    };
+    let max_plen: usize = match ktype.as_str() {
+        "keyring" => 0,             // a keyring takes no payload
+        "user" | "logon" => 32767,  // KEY payload cap for these types
+        "big_key" => (1 << 20) - 1, // big_key max is 1 MiB - 1
+        _ => return ENODEV,         // key type not registered
+    };
+    if plen > max_plen {
+        return EINVAL;
+    }
+    static NEXT_KEY: core::sync::atomic::AtomicI32 =
+        core::sync::atomic::AtomicI32::new(0x3000_0000);
+    NEXT_KEY.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as isize
 }
 
 fn cwd_inode() -> Arc<dyn Inode> {
