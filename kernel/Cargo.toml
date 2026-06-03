@@ -27,6 +27,11 @@ default = ["contest"]
 # Contest mode: boot straight into the OS-comp test runner and shut
 # down when done. Default so `make all` produces a contest-ready ELF.
 contest = []
+# Diagnostic LTP mode: after the per-arch whitelist, also sweep every other
+# binary in testcases/bin (pass 2). Off by default so the contest build runs
+# only the known-good scoring whitelist (no stress/OOM case can wedge it); CI
+# turns it on to discover new scorers to fold back into the whitelist.
+diag_full_ltp = []
 bare_hello = []
 musl_hello = []
 rust_git = []
