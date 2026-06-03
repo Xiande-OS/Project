@@ -922,18 +922,37 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: usize, _optlen:
     0
 }
 
-pub fn sys_getsockopt(_fd: i32, level: i32, optname: i32, optval: usize, optlen_ptr: usize) -> isize {
+pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: usize, optlen_ptr: usize) -> isize {
     // Linux setsockopt(2) names (subset). iperf3 / netperf inspect a
     // handful of these and refuse to proceed if any return 0.
     const SOL_SOCKET: i32 = 1;
-    const SOL_TCP: i32 = 6;
+    const IPPROTO_IP: i32 = 0;
+    const IPPROTO_TCP: i32 = 6;
     const SO_SNDBUF: i32 = 7;
     const SO_RCVBUF: i32 = 8;
     const SO_ERROR: i32 = 4;
     const SO_TYPE: i32 = 3;
+    const SO_OOBINLINE: i32 = 10;
     const TCP_MAXSEG: i32 = 2;
+    const ENOPROTOOPT: isize = -92;
+    const EOPNOTSUPP: isize = -95;
 
+    // The fd must name an open socket (EBADF if not open, ENOTSOCK otherwise).
+    if let Err(e) = with_socket(fd, |_| ()) {
+        return e;
+    }
     let task = current_task();
+    // getsockopt writes through both pointers, so neither may be NULL.
+    if optval == 0 || optlen_ptr == 0 {
+        return EFAULT;
+    }
+    // Only the levels our stream sockets actually implement are valid; any
+    // other level (e.g. IPPROTO_UDP on a TCP socket, or a bogus number) is
+    // EOPNOTSUPP, matching Linux's per-protocol getsockopt dispatch.
+    if level != SOL_SOCKET && level != IPPROTO_IP && level != IPPROTO_TCP {
+        return EOPNOTSUPP;
+    }
+    // A known level with an unknown option name is ENOPROTOOPT.
     let val: i32 = match (level, optname) {
         // 64 KiB matches our loopback pipe BUF_CAP and smoltcp default.
         (SOL_SOCKET, SO_SNDBUF) | (SOL_SOCKET, SO_RCVBUF) => 65536,
@@ -941,15 +960,20 @@ pub fn sys_getsockopt(_fd: i32, level: i32, optname: i32, optval: usize, optlen_
         // is what it actually needs.
         (SOL_SOCKET, SO_ERROR) => 0,
         (SOL_SOCKET, SO_TYPE) => 1, // SOCK_STREAM
-        (SOL_TCP, TCP_MAXSEG) => 1460,
-        _ => 0,
+        (SOL_SOCKET, SO_OOBINLINE) => 0,
+        (IPPROTO_TCP, TCP_MAXSEG) => 1460,
+        _ => return ENOPROTOOPT,
     };
-    if optval != 0 {
-        let _ = task.copy_out_bytes(optval, &val.to_le_bytes());
+    // The caller's optlen must be a sane buffer length.
+    let lenb = match task.copy_in_bytes(optlen_ptr, 4) {
+        Some(b) => b,
+        None => return EFAULT,
+    };
+    if i32::from_le_bytes([lenb[0], lenb[1], lenb[2], lenb[3]]) < 0 {
+        return EINVAL;
     }
-    if optlen_ptr != 0 {
-        let _ = task.copy_out_bytes(optlen_ptr, &4u32.to_le_bytes());
-    }
+    let _ = task.copy_out_bytes(optval, &val.to_le_bytes());
+    let _ = task.copy_out_bytes(optlen_ptr, &4u32.to_le_bytes());
     0
 }
 
