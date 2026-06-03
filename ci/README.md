@@ -21,16 +21,27 @@ Each holds that variant's `busybox` + `lib/` + `ltp/` tree under `/<libc>/` (the
 in-kernel runner generates its own ltp driver, so a `ltp_testcode.sh` trigger is
 enough).
 
-### Producing them from the official sdcards
+## Test images (already uploaded)
 
-The official contest images are per-arch and combined (both `/musl` and
-`/glibc`). Split each into the two per-cell uploads with `ci/split-sdcard.sh`:
+All four cell images are present in the `test-images` release, so CI runs
+out of the box. How each was produced, for when they need rebuilding:
 
-    sudo ci/split-sdcard.sh rv  /path/sdcard-rv.img  ./out
-    sudo ci/split-sdcard.sh la  /path/sdcard-la.img  ./out
-    # → out/sdcard-{rv,la}-{musl,glibc}.img  →  upload all 4 to the release
+- `rv-musl`, `rv-glibc`, `la-glibc` — split from the official combined per-arch
+  sdcards with `ci/split-sdcard.sh` (each official image has both `/musl` and
+  `/glibc`):
 
-After re-uploading images, bump `IMG_VERSION` in `ci.yml` to refresh the cache.
+      sudo ci/split-sdcard.sh rv  /path/sdcard-rv.img  ./out
+      sudo ci/split-sdcard.sh la  /path/sdcard-la.img  ./out
+
+- `la-musl` — has no packaged toolchain and isn't in any official split, so it
+  is cross-built from upstream LTP with `ci/build-lamusl.sh` (needs a
+  loongarch64-linux-musl toolchain + a static musl-LA busybox):
+
+      MUSL_LA=/opt/loongarch64-linux-musl BUSYBOX=/path/busybox \
+        ci/build-lamusl.sh sdcard-la-musl.img
+
+Upload the produced `sdcard-<arch>-<libc>.img` files to the release, then bump
+`IMG_VERSION` in `ci.yml` to refresh the per-cell image cache.
 
 ## How it works per cell
 
