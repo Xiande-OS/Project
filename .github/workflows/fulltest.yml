@@ -118,8 +118,13 @@ jobs:
           echo "glibc groups STARTED: $glibc_start"
           echo "kernel faults:        $faults"
           echo "premature poweroff:   $poweroff"
-          if [ "$poweroff" -gt 0 ] && [ "$glibc_start" -eq 0 ]; then
-            echo "::error title=full-${{ matrix.arch }}::CONTEST FAILURE REPRODUCED — kernel powered off (fault storm) before ANY glibc group started. This is the glibc-${{ matrix.arch }}=0 the grader sees; ltp-ci cannot detect it because it boots glibc separately."
+          # The contest failure is "glibc never runs". It manifests two ways:
+          # a clean fault-storm poweroff, OR a silent kernel wedge (scheduler/
+          # timer stalls, QEMU killed by the wall cap) — in both cases the musl
+          # section ran but no glibc group ever started. Gate on that, not on the
+          # poweroff string.
+          if [ "$musl_end" -gt 0 ] && [ "$glibc_start" -eq 0 ]; then
+            echo "::error title=full-${{ matrix.arch }}::CONTEST FAILURE REPRODUCED — the musl section ran but NO glibc group ever started (kernel died/wedged mid-musl). This is the glibc-${{ matrix.arch }}=0 the grader sees; ltp-ci cannot detect it because it boots glibc separately."
             exit 1
           fi
           if [ "$faults" -gt 0 ]; then
