@@ -269,6 +269,8 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
     // kernel fault, so the consecutive-fault run is broken.
     if from_user {
         KERNEL_FAULTS.store(0, Ordering::Relaxed);
+        // Start the in-kernel sojourn clock for the unarmed-wedge watchdog below.
+        crate::task::kernel_sojourn_begin();
     }
 
     if ecode == 0 {
@@ -285,6 +287,16 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 // and switch (it resumes here later); otherwise carry on.
                 if crate::task::watchdog_overrun() {
                     return unsafe { crate::task::watchdog_kill_current(tf as *mut _) };
+                }
+                // The syscall watchdog only fires inside the armed `dispatch`
+                // window. A wedge in any OTHER in-kernel path (signal delivery
+                // for pthread_cancel, the scheduler) leaves ARMED=false, so the
+                // check above never fires and the run hangs silently. Break that
+                // too: a user task stuck in-kernel far longer than any real
+                // operation, with the timer still ticking (so it isn't the
+                // benign IE-off idle spin), is a wedge.
+                if crate::task::kernel_sojourn_overrun() {
+                    return unsafe { crate::task::kernel_wedge_recover(tf as *mut _) };
                 }
                 // No mid-syscall preempt-switch — it loses wakeups across a
                 // blocking syscall's non-atomic check-then-park. Concurrency
