@@ -503,7 +503,9 @@ fn clear_pending(task: &Arc<Task>, signo: u32) {
 
 /// 32 general-purpose registers as the kernel-side mcontext expects them.
 /// Field order matches Linux's `struct user_regs_struct` (which is also
-/// `__gregs[0..32]` in musl's mcontext_t).
+/// `__gregs[0..32]` in musl's mcontext_t). riscv64 only — loongarch64 uses a
+/// register-indexed `sc_regs[32]` instead (see its `KMContext` below).
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct KGRegs {
@@ -525,8 +527,10 @@ pub struct KGRegs {
 /// Linux generic mcontext = struct sigcontext = { gregs[32], fpregs }.
 /// fpregs is a 528-byte tail (union of __riscv_{f,d,q}_ext_state). We zero
 /// it; user code that doesn't touch FP through getcontext is unaffected.
+#[cfg(target_arch = "riscv64")]
 const FPREGS_LEN: usize = 528;
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct KMContext {
@@ -534,11 +538,49 @@ pub struct KMContext {
     pub fpregs: [u8; FPREGS_LEN],
 }
 
+#[cfg(target_arch = "riscv64")]
 impl Default for KMContext {
     fn default() -> Self {
         Self {
             regs: KGRegs::default(),
             fpregs: [0u8; FPREGS_LEN],
+        }
+    }
+}
+
+/// loongarch64 mcontext = Linux `struct sigcontext`:
+/// `{ __pc; __gregs[32]; __flags; __extcontext[] (16-aligned) }`. musl/glibc
+/// SA_SIGINFO handlers read the interrupted PC from `__pc` (mcontext offset 0)
+/// and the GPRs from `__gregs[i]` = register `$r{i}`. This is a DIFFERENT shape
+/// AND offset from riscv64's generic mcontext: combined with the 128-byte LA
+/// sigset (vs 136 on rv) it places `uc_mcontext` at ucontext offset 168, not
+/// 176. An RV-shaped frame put `__pc` 8 bytes past where musl-LA reads it, so
+/// the pthread_cancel handler saw a garbage PC, never recognised the
+/// cancellation point, and (handler is SA_RESTART) restarted the blocked
+/// syscall forever — the pthread_cancel_points wedge that took glibc-la to 0.
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KMContext {
+    pub sc_pc: u64,
+    pub sc_regs: [u64; 32],
+    pub sc_flags: u32,
+    pub _pad: u32,
+    /// Extended (FP/LSX/LASX) save area. We leave it zeroed: a zero leading
+    /// word is the "end of extended context" marker (no FP state saved), and
+    /// the cancel/unwind handlers never read past `__gregs`.
+    pub sc_extcontext: [u64; 8],
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl Default for KMContext {
+    fn default() -> Self {
+        Self {
+            sc_pc: 0,
+            sc_regs: [0u64; 32],
+            sc_flags: 0,
+            _pad: 0,
+            sc_extcontext: [0u64; 8],
         }
     }
 }
@@ -562,14 +604,32 @@ pub struct KStackT {
 /// and the saved mcontext (incl. PC) at offset 176, so this padding is
 /// load-bearing — the pthread_cancel handler reads the interrupted PC
 /// from 176(ucontext) and writes the redirect target back there.
+/// riscv64: 136 bytes, so `uc_mcontext` lands at ucontext offset 176.
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct KSigSet {
     pub bits: u64,
     pub _pad: [u8; 128],
 }
+#[cfg(target_arch = "riscv64")]
 impl Default for KSigSet {
     fn default() -> Self { Self { bits: 0, _pad: [0u8; 128] } }
+}
+
+/// loongarch64: a full sigset_t is 128 bytes (1024 bits). That 8-byte
+/// difference from rv's padded 136 is exactly what moves `uc_mcontext` from
+/// offset 176 (rv) to 168 (la), the offset musl-LA's handlers read `__pc` at.
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KSigSet {
+    pub bits: u64,
+    pub _pad: [u8; 120],
+}
+#[cfg(target_arch = "loongarch64")]
+impl Default for KSigSet {
+    fn default() -> Self { Self { bits: 0, _pad: [0u8; 120] } }
 }
 
 /// What the kernel writes for `struct ucontext` on the rt_sigframe.
@@ -613,12 +673,22 @@ pub struct RtSigFrame {
     pub uc: KUContext,
 }
 
-// Lock the ABI: musl/glibc SA_SIGINFO handlers read the saved register
-// file (and PC) from offset 176 of the ucontext. If this ever drifts,
+// Lock the ABI: musl/glibc SA_SIGINFO handlers read the saved register file
+// (and PC) from a fixed offset in the ucontext. If this ever drifts,
 // pthread_cancel / swapcontext silently break, so fail the build instead.
+// riscv64 generic layout: uc_mcontext @ 176. loongarch64: uc_mcontext @ 168
+// with __pc first and __gregs (register-indexed) right after.
+#[cfg(target_arch = "riscv64")]
 const _: () = {
     assert!(core::mem::offset_of!(KUContext, uc_mcontext) == 176);
     assert!(core::mem::offset_of!(KUContext, uc_sigmask) == 40);
+};
+#[cfg(target_arch = "loongarch64")]
+const _: () = {
+    assert!(core::mem::offset_of!(KUContext, uc_mcontext) == 168);
+    assert!(core::mem::offset_of!(KUContext, uc_sigmask) == 40);
+    assert!(core::mem::offset_of!(KMContext, sc_pc) == 0);
+    assert!(core::mem::offset_of!(KMContext, sc_regs) == 8);
 };
 
 impl Default for RtSigFrame {
@@ -634,18 +704,19 @@ pub const SIGFRAME_SIZE: usize = size_of::<RtSigFrame>();
 
 // ----- Building a sigframe + entering the user handler -----
 
-// Sigcontext save / restore is the riscv64 register-name dance, so it
-// lives on TrapFrame itself (in arch/riscv64/trap.rs). These two thin
-// wrappers preserve the old call sites.
+// Mcontext save / restore is the arch register-name dance, so it lives on
+// TrapFrame itself (in each arch's trap.rs): riscv64 maps x[N] → named gregs,
+// loongarch64 maps r[i] → sc_regs[i] and era → sc_pc. These two thin wrappers
+// keep the shared frame builder / sigreturn unaware of which arch they're on.
 
-fn copy_tf_to_gregs(tf: &TrapFrame) -> KGRegs {
-    let mut g = KGRegs::default();
-    tf.save_to_sigcontext(&mut g);
-    g
+fn copy_tf_to_mcontext(tf: &TrapFrame) -> KMContext {
+    let mut mc = KMContext::default();
+    tf.save_to_mcontext(&mut mc);
+    mc
 }
 
-fn restore_tf_from_gregs(tf: &mut TrapFrame, g: &KGRegs) {
-    tf.restore_from_sigcontext(g);
+fn restore_tf_from_mcontext(tf: &mut TrapFrame, mc: &KMContext) {
+    tf.restore_from_mcontext(mc);
 }
 
 /// Inspect signals and possibly start delivering one. Returns true when
@@ -921,8 +992,8 @@ fn deliver_user_handler(
         frame.uc.uc_stack.ss_flags = ast.ss_flags;
         frame.uc.uc_stack.ss_size = ast.ss_size as u64;
     }
-    frame.uc.uc_mcontext.regs = copy_tf_to_gregs(tf);
-    // fpregs already zeroed.
+    frame.uc.uc_mcontext = copy_tf_to_mcontext(tf);
+    // any FP/ext save area is left zeroed.
     let old_mask = task.signals.mask.load(Ordering::SeqCst);
     frame.uc.uc_sigmask.bits = old_mask;
 
@@ -1014,7 +1085,7 @@ pub fn do_sigreturn(task: &Arc<Task>, tf: &mut TrapFrame) -> isize {
     let frame = unsafe { core::ptr::read(bytes.as_ptr() as *const RtSigFrame) };
 
     // Restore TF GPRs + pc.
-    restore_tf_from_gregs(tf, &frame.uc.uc_mcontext.regs);
+    restore_tf_from_mcontext(tf, &frame.uc.uc_mcontext);
 
     // Restore sig_mask.
     let mask = frame.uc.uc_sigmask.bits & !unblockable_mask();

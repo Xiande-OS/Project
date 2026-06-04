@@ -127,78 +127,29 @@ impl TrapFrame {
 
     // --- Signal frame mcontext save / restore --------------------------
     //
-    // First-pass mapping (handoff option A): populate the riscv-named
-    // KGRegs slots with their loongarch equivalents where they overlap.
-    // gp/r21/t7/t8/s10/s11 have no slot and are not round-tripped; this
-    // is symmetric (save/restore are inverse) which is all the RV-shaped
-    // sigreturn path needs until the musl-LA sigcontext layer is forked.
+    // loongarch64's mcontext is register-indexed: `sc_pc` then `sc_regs[i]` =
+    // register `$r{i}` (r0 included, hardwired 0). This is the native layout
+    // musl/glibc handlers expect — unlike the earlier RV-named stopgap, the
+    // saved PC now lands exactly where pthread_cancel reads it (mcontext
+    // offset 0 = ucontext offset 168), so a thread interrupted at a
+    // cancellation-point syscall is recognised and redirected to __cp_cancel
+    // instead of having SA_RESTART restart it forever.
 
-    pub fn save_to_sigcontext(&self, g: &mut crate::signal::KGRegs) {
-        let r = &self.r;
-        g.pc = self.era as u64;
-        g.ra = r[1] as u64;
-        g.sp = r[3] as u64;
-        g.gp = 0;
-        g.tp = r[2] as u64;
-        g.a0 = r[4] as u64;
-        g.a1 = r[5] as u64;
-        g.a2 = r[6] as u64;
-        g.a3 = r[7] as u64;
-        g.a4 = r[8] as u64;
-        g.a5 = r[9] as u64;
-        g.a6 = r[10] as u64;
-        g.a7 = r[11] as u64;
-        g.t0 = r[12] as u64;
-        g.t1 = r[13] as u64;
-        g.t2 = r[14] as u64;
-        g.t3 = r[15] as u64;
-        g.t4 = r[16] as u64;
-        g.t5 = r[17] as u64;
-        g.t6 = r[18] as u64;
-        g.s0 = r[23] as u64;
-        g.s1 = r[24] as u64;
-        g.s2 = r[25] as u64;
-        g.s3 = r[26] as u64;
-        g.s4 = r[27] as u64;
-        g.s5 = r[28] as u64;
-        g.s6 = r[29] as u64;
-        g.s7 = r[30] as u64;
-        g.s8 = r[31] as u64;
-        g.s9 = r[22] as u64; // fp
-        g.s10 = 0;
-        g.s11 = 0;
+    pub fn save_to_mcontext(&self, mc: &mut crate::signal::KMContext) {
+        mc.sc_pc = self.era as u64;
+        for i in 0..32 {
+            mc.sc_regs[i] = self.r[i] as u64;
+        }
+        mc.sc_flags = 0;
     }
 
-    pub fn restore_from_sigcontext(&mut self, g: &crate::signal::KGRegs) {
-        self.era = g.pc as usize;
-        self.r[1] = g.ra as usize;
-        self.r[3] = g.sp as usize;
-        self.r[2] = g.tp as usize;
-        self.r[4] = g.a0 as usize;
-        self.r[5] = g.a1 as usize;
-        self.r[6] = g.a2 as usize;
-        self.r[7] = g.a3 as usize;
-        self.r[8] = g.a4 as usize;
-        self.r[9] = g.a5 as usize;
-        self.r[10] = g.a6 as usize;
-        self.r[11] = g.a7 as usize;
-        self.r[12] = g.t0 as usize;
-        self.r[13] = g.t1 as usize;
-        self.r[14] = g.t2 as usize;
-        self.r[15] = g.t3 as usize;
-        self.r[16] = g.t4 as usize;
-        self.r[17] = g.t5 as usize;
-        self.r[18] = g.t6 as usize;
-        self.r[23] = g.s0 as usize;
-        self.r[24] = g.s1 as usize;
-        self.r[25] = g.s2 as usize;
-        self.r[26] = g.s3 as usize;
-        self.r[27] = g.s4 as usize;
-        self.r[28] = g.s5 as usize;
-        self.r[29] = g.s6 as usize;
-        self.r[30] = g.s7 as usize;
-        self.r[31] = g.s8 as usize;
-        self.r[22] = g.s9 as usize; // fp
+    pub fn restore_from_mcontext(&mut self, mc: &crate::signal::KMContext) {
+        self.era = mc.sc_pc as usize;
+        // r0 is hardwired zero; restore r1..r31. This honours any redirect the
+        // handler wrote to sc_pc (e.g. pthread_cancel's __cp_cancel target).
+        for i in 1..32 {
+            self.r[i] = mc.sc_regs[i] as usize;
+        }
     }
 }
 

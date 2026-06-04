@@ -190,6 +190,16 @@ impl TrapFrame {
         self.x[29] = g.t5 as usize;
         self.x[30] = g.t6 as usize;
     }
+
+    /// Fill the mcontext the signal frame carries. riscv64's mcontext is the
+    /// named-greg dance above plus a zeroed fpregs tail (already default).
+    pub fn save_to_mcontext(&self, mc: &mut crate::signal::KMContext) {
+        self.save_to_sigcontext(&mut mc.regs);
+    }
+    /// Inverse of `save_to_mcontext` for rt_sigreturn.
+    pub fn restore_from_mcontext(&mut self, mc: &crate::signal::KMContext) {
+        self.restore_from_sigcontext(&mc.regs);
+    }
 }
 
 /// One scheduler tick. 10 MHz mtimer → 1ms preemption quantum. Short
