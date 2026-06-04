@@ -386,6 +386,9 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         "[kernel fault storm] pid={} {:?} sepc={:#x} stval={:#x} — powering off cleanly so the run still scores",
                         crate::task::current_pid(), e, tf.sepc, stval,
                     );
+                    if crate::ksyms::available() {
+                        crate::ksyms::print_frame("sepc", tf.sepc);
+                    }
                     crate::arch::shutdown();
                 }
                 crate::println!(
@@ -393,6 +396,10 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     crate::task::current_pid(), e, tf.sepc, stval,
                     if lo { "(bad user ptr)" } else { "(kernel access)" },
                 );
+                if crate::ksyms::available() {
+                    crate::ksyms::print_frame("sepc", tf.sepc);
+                    crate::ksyms::print_frame("  ra", tf.x[0]);
+                }
                 let task = crate::task::current_task();
                 crate::signal::kill_now(&task);
                 // Fall through to schedule_next_after_trap: kill_now marked the

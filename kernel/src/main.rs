@@ -27,6 +27,7 @@ mod console;
 mod contest_runner;
 mod drivers;
 mod fs;
+mod ksyms;
 mod loader;
 mod mm;
 mod net;
@@ -85,6 +86,19 @@ fn ld_musl_blob() -> &'static [u8] {
 pub extern "C" fn kmain(hartid: usize, dtb_pa: usize) -> ! {
     println!("xiande-os booting on hart {}", hartid);
     println!("  dtb @ {:#x}", dtb_pa);
+
+    // Report the in-kernel symbol table and self-check it on a known PC, so a
+    // contest log shows up-front whether faults will be symbolized (and proves
+    // the post-link two-pass embed worked for this exact build).
+    if ksyms::available() {
+        let a = kmain as usize;
+        match ksyms::resolve(a) {
+            Some((n, o)) => println!("  ksyms: loaded; resolve(kmain={:#x}) = {}+{:#x}", a, n, o),
+            None => println!("  ksyms: loaded but kmain unresolved (?)"),
+        }
+    } else {
+        println!("  ksyms: none (faults print raw addresses)");
+    }
 
     mm::init(dtb_pa);
     println!("  RAM end @ {:#x}", mm::mm_end());

@@ -91,4 +91,29 @@ fn main() {
         out_dir.join("la_hello.elf"),
         "LA_HELLO_ELF_PATH",
     );
+
+    // In-kernel symbol table ("ksyms"). `ksyms.rs` does
+    // `include_bytes!(env!("KSYMS_BIN_PATH"))`; we point it straight at
+    // `ksyms-<arch>.bin` at the workspace root. A post-link Makefile step
+    // (`ksyms-embed`) regenerates that file from the just-linked kernel and
+    // rebuilds — rustc tracks include_bytes! inputs in its dep-info, so the
+    // second `cargo build` recompiles `ksyms.rs` with the real table and
+    // relinks (two-pass). The blob lives in .rodata (after .text in the link),
+    // so embedding it never moves a .text address, and the addresses a pass-1
+    // blob records stay correct for the pass-2 kernel.
+    //
+    // A normal one-pass build (or a direct `cargo build`) just sees the empty
+    // placeholder created here — `ksyms::resolve` returns None and the kernel
+    // prints raw addresses exactly as before. So this is purely additive and
+    // can never break the build.
+    let ksyms = workspace_root.join(format!("ksyms-{target_arch}.bin"));
+    if !ksyms.exists() {
+        let _ = std::fs::write(&ksyms, []);
+    }
+    // Re-run this script (and recompile ksyms.rs) whenever the blob is
+    // (re)generated or removed — this recreates the placeholder on a rebuild
+    // where the file was deleted but the cached build script would otherwise be
+    // skipped, and drives the pass-2 pickup of a freshly generated table.
+    println!("cargo:rerun-if-changed={}", ksyms.display());
+    println!("cargo:rustc-env=KSYMS_BIN_PATH={}", ksyms.display());
 }

@@ -33,6 +33,22 @@ KERNEL_ELF_LA := $(RELEASE_DIR_LA)/$(KERNEL_PKG)
 # directory will just fail fast instead of half-replacing components.
 export RUSTUP_AUTO_INSTALL := 0
 
+# Reproducible builds + debuggable crash traces.
+#   --remap-path-prefix strips machine/user-specific absolute paths (panic
+#     strings, debuginfo) so the same commit + toolchain produces a
+#     byte-identical kernel on any machine/dir — addresses then line up across
+#     rebuilds, which is what makes a contest crash log addr2line-able.
+#   force-frame-pointers keeps the return-address chain intact for the fault
+#     handler's `kra` (and any fp backtrace).
+# rustc is otherwise deterministic for fixed (version, flags, sources), so
+# pinning these is most of "reproducible". The remaining variable is the rustc
+# VERSION (the grader's default, which we can't pin via rust-toolchain.toml
+# without breaking it) — the in-kernel ksyms table below removes that
+# dependency entirely by symbolizing faults in the running kernel itself.
+# CARGO_INCREMENTAL=0 keeps codegen unit ordering deterministic.
+export CARGO_INCREMENTAL := 0
+export RUSTFLAGS := $(RUSTFLAGS) --remap-path-prefix=$(CURDIR)=. --remap-path-prefix=$(HOME)=~ -Cforce-frame-pointers=yes
+
 # --- China detection + rustup-mirror swap --------------------------------
 # If the build host is in mainland China, switch rustup to a domestic
 # mirror so `rustup target add` (the one rustup operation we may need)
@@ -68,7 +84,7 @@ endif
 endif
 # -------------------------------------------------------------------------
 
-.PHONY: all prepare kernel-rv kernel-la disks clean
+.PHONY: all prepare kernel-rv kernel-la disks clean ksyms-embed
 
 # Writable scratch disks attached as the SECOND virtio-blk device (x1,
 # virtio-mmio-bus.1). The grader runs these as `-drive file=disk.img` /
@@ -113,6 +129,7 @@ prepare:
 kernel-rv: prepare
 	$(CARGO) build --release -p $(KERNEL_PKG) --target $(TARGET_RV) --offline
 	cp $(KERNEL_ELF) kernel-rv
+	@$(MAKE) --no-print-directory ksyms-embed ARCH=riscv64 ELF=$(KERNEL_ELF) TGT=$(TARGET_RV) OUT=kernel-rv
 
 # LoongArch64 kernel. Built from the same crate as kernel-rv via the
 # arch backend in src/arch/loongarch64. If the loongarch target is not
@@ -121,9 +138,26 @@ kernel-rv: prepare
 kernel-la: prepare
 	@if $(CARGO) build --release -p $(KERNEL_PKG) --target $(TARGET_LA) --offline; then \
 		cp $(KERNEL_ELF_LA) kernel-la; \
+		$(MAKE) --no-print-directory ksyms-embed ARCH=loongarch64 ELF=$(KERNEL_ELF_LA) TGT=$(TARGET_LA) OUT=kernel-la; \
 	else \
 		echo "[kernel-la] loongarch target unavailable — using placeholder ELF"; \
 		bash scripts/build_la_stub.sh kernel-la; \
+	fi
+
+# Two-pass in-kernel symbol embed (best-effort, NEVER fatal). Pass 1 already
+# produced $(OUT) with an empty ksyms placeholder; here we regenerate the table
+# from that kernel, rebuild so include_bytes! picks it up (only ksyms.rs +
+# relink — .text is unchanged, so the addresses stay valid), and copy out. On
+# any failure (no python3, gen error, ...) the symbol-less pass-1 kernel stands,
+# so `make all` can never regress. ksyms-<ARCH>.bin is the include_bytes! target
+# build.rs points at.
+ksyms-embed:
+	@if command -v python3 >/dev/null 2>&1 \
+	    && python3 scripts/gen_ksyms.py "$(ELF)" "ksyms-$(ARCH).bin" \
+	    && $(CARGO) build --release -p $(KERNEL_PKG) --target $(TGT) --offline; then \
+		cp "$(ELF)" "$(OUT)"; echo "[ksyms] embedded symbol table into $(OUT)"; \
+	else \
+		echo "[ksyms] skipped — $(OUT) keeps raw-address (un-symbolized) fault traces"; \
 	fi
 
 clean:

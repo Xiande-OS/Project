@@ -327,9 +327,19 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                             "[kernel fault storm] ecode={:#x} era={:#x} badv={:#x} — powering off cleanly so the run still scores",
                             ecode, tf.era, badv,
                         );
+                        if crate::ksyms::available() {
+                            crate::ksyms::print_frame("era", tf.era);
+                        }
                         crate::arch::shutdown();
                     }
                     let task = crate::task::current_task();
+                    // Diagnostics: which user syscall was being serviced (user
+                    // a7), and the kernel return address of the faulting frame
+                    // (its caller). Both localise the offending kernel path even
+                    // when the contest build's .text layout differs from a local
+                    // one (so a bare `era` won't addr2line).
+                    let svc_no = unsafe { (*task.tf_ptr()).syscall_no() };
+                    let kra = tf.r[1];
                     if task.pid == 1 {
                         // The victim is init. Killing it ends the whole run: the
                         // contest harness runs musl first, then launches the
@@ -347,15 +357,23 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         // a genuine fault *loop* is still caught by the storm
                         // breaker above (clean shutdown, run still scores).
                         crate::println!(
-                            "[kernel-mode fault] pid=1 (init) ecode={:#x} era={:#x} badv={:#x} — skipping faulting insn to keep the run alive",
-                            ecode, tf.era, badv,
+                            "[kernel-mode fault] pid=1 (init) ecode={:#x} era={:#x} badv={:#x} svc=#{} kra={:#x} — skipping faulting insn to keep the run alive",
+                            ecode, tf.era, badv, svc_no, kra,
                         );
+                        if crate::ksyms::available() {
+                            crate::ksyms::print_frame("era", tf.era);
+                            crate::ksyms::print_frame("kra", kra);
+                        }
                         tf.era += 4;
                     } else {
                         crate::println!(
-                            "[kernel-mode fault recovered] pid={} ecode={:#x} era={:#x} badv={:#x} — killing task",
-                            task.pid, ecode, tf.era, badv,
+                            "[kernel-mode fault recovered] pid={} ecode={:#x} era={:#x} badv={:#x} svc=#{} kra={:#x} — killing task",
+                            task.pid, ecode, tf.era, badv, svc_no, kra,
                         );
+                        if crate::ksyms::available() {
+                            crate::ksyms::print_frame("era", tf.era);
+                            crate::ksyms::print_frame("kra", kra);
+                        }
                         crate::signal::kill_now(&task);
                         // Fall through to schedule_next_after_trap: kill_now
                         // marked the task Zombie, so the scheduler picks another
