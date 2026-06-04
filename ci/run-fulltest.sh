@@ -24,7 +24,9 @@ SMP="${6:-1}"
 SCRATCH="$(mktemp -p "${RUNNER_TEMP:-/tmp}" scratch.XXXX.img)"
 truncate -s 512M "$SCRATCH"
 trap 'rm -f "$SCRATCH"' EXIT
-LOG="$(mktemp)"
+# Stream QEMU's serial straight to stdout (the workflow tees it to the log AND
+# to GitHub live), so progress is visible during the multi-hour run instead of
+# appearing only when QEMU finally exits.
 
 if [ "$ARCH" = "rv" ]; then
   timeout --signal=KILL "$SECS" \
@@ -37,7 +39,7 @@ if [ "$ARCH" = "rv" ]; then
       -rtc base=utc \
       -drive file="$SCRATCH",if=none,format=raw,id=x1 \
       -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 \
-      > "$LOG" 2>&1 || true
+      2>&1 || true
 else
   # LA: virtio-pci. romfile= suppresses the PXE option ROM (absent in CI). The
   # net hostfwd on 5555 matches the official LA command.
@@ -51,8 +53,5 @@ else
       -rtc base=utc \
       -drive file="$SCRATCH",if=none,format=raw,id=x1 \
       -device virtio-blk-pci,drive=x1 \
-      > "$LOG" 2>&1 || true
+      2>&1 || true
 fi
-
-cat "$LOG"
-rm -f "$LOG"
