@@ -382,19 +382,6 @@ static WATCHDOG_ANCHOR: AtomicU64 = AtomicU64::new(0);
 /// Whether a syscall is currently being timed (set between arm and disarm).
 static WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
 
-/// `now_ticks()` at the most recent trap from user mode — the start of the
-/// current in-kernel sojourn. The per-syscall watchdog (above) only times the
-/// `dispatch` window; this catches a wedge in ANY other in-kernel path that
-/// never disarms (signal delivery, the scheduler), which the syscall watchdog
-/// ignores (ARMED=false) and which would otherwise hang the whole run silently —
-/// musl's pthread_cancel_points wedged loongarch here and took the entire
-/// glibc-la quarter to 0.
-static KERNEL_ENTRY_TICK: AtomicU64 = AtomicU64::new(0);
-/// Far above the 8 s syscall watchdog and above any legitimate in-kernel
-/// sojourn: blocking syscalls PARK (they re-enter and re-anchor), so a single
-/// uninterrupted sojourn this long is a genuine non-returning wedge.
-const KERNEL_SOJOURN_BUDGET_SECS: u64 = 30;
-
 /// Start timing the current syscall. Called at syscall entry, just before the
 /// timer is enabled for the dispatch window.
 #[inline]
@@ -448,56 +435,6 @@ pub unsafe fn watchdog_kill_current(current_tf: *mut TrapFrame) -> *mut TrapFram
             );
             crate::signal::kill_now(&task);
         }
-    }
-    schedule_next_after_trap(current_tf)
-}
-
-/// Record the start of an in-kernel sojourn — call on every trap from user mode.
-#[inline]
-pub fn kernel_sojourn_begin() {
-    KERNEL_ENTRY_TICK.store(crate::arch::now_ticks(), Ordering::Relaxed);
-}
-
-/// True once the current in-kernel sojourn has run past the budget. Lock-free
-/// (only atomics + `now_ticks()`), safe from the nested timer trap.
-#[inline]
-pub fn kernel_sojourn_overrun() -> bool {
-    let anchor = KERNEL_ENTRY_TICK.load(Ordering::Relaxed);
-    if anchor == 0 {
-        return false;
-    }
-    let elapsed = crate::arch::now_ticks().wrapping_sub(anchor);
-    elapsed > KERNEL_SOJOURN_BUDGET_SECS.saturating_mul(crate::arch::TICKS_PER_SEC)
-}
-
-/// Break an in-kernel wedge the per-syscall watchdog never armed for (signal
-/// delivery, the trap/scheduler path). Killing the wedged task tears down its
-/// whole thread group — so a parked pthread_cancel target dies and its joiner /
-/// the runner shell make progress and the run reaches the next group. init is
-/// spared (killing pid 1 ends the run); it just yields and re-enters on its next
-/// trap.
-///
-/// # Safety
-/// Single-hart nested-timer path only, after `kernel_sojourn_overrun()` is true.
-pub unsafe fn kernel_wedge_recover(current_tf: *mut TrapFrame) -> *mut TrapFrame {
-    KERNEL_ENTRY_TICK.store(0, Ordering::Relaxed);
-    unsafe { force_release_locks_after_fault(); }
-    let pid = current_pid();
-    if pid != 1 {
-        if let Some(task) = task_by_pid(pid) {
-            if matches!(*task.state.lock(), TaskState::Ready | TaskState::Running) {
-                crate::println!(
-                    "[sojourn watchdog] pid={} wedged in-kernel >{}s (unarmed path) — killing the case so the run continues",
-                    pid, KERNEL_SOJOURN_BUDGET_SECS,
-                );
-                crate::signal::kill_now(&task);
-            }
-        }
-    } else {
-        crate::println!(
-            "[sojourn watchdog] pid=1 (init) in-kernel >{}s — yielding to keep the run alive",
-            KERNEL_SOJOURN_BUDGET_SECS,
-        );
     }
     schedule_next_after_trap(current_tf)
 }
