@@ -16,7 +16,7 @@
 - 单组实测：**lua-musl 9/9**。
 
 ## 已实现（功能面）
-- **启动/内存**：Sv39 三级页表、buddy 帧分配器、内核 heap、从 DTB 读 RAM 大小（非硬编码 1 GiB）、内核高半区映射。
+- **启动/内存**：Sv39 三级页表、buddy 帧分配器、内核 heap、从 DTB 读 RAM 大小（非硬编码 1 GiB；riscv64 用 a1 传入的 DTB 指针，loongarch64 直接扫低位 RAM 找 FDT magic）、内核高半区映射。
 - **进程/调度**：`fork`/`clone`（精确解析 flag：CLONE_VM/THREAD/FS/FILES/SIGHAND/SETTLS）/`execve`；单 hart **协作式 + trap 边界抢占**调度（非 async）；per-syscall in-kernel 看门狗；OOM killer + 孤儿/线程风暴回收。
 - **信号**：POSIX 信号投递、`rt_sigframe`、**vDSO** `__vdso_rt_sigreturn`（带 CFI 供 glibc unwind）、CPU fault → signal、fault-loop 断路器。
 - **文件系统**：三层 VFS（Inode/Dentry/File）、**ext4 只读**（评测盘主路径）、fat32、tmpfs、devfs、procfs（`/proc/self/{exe,maps,status,ns,...}`）、pipe、AF_UNIX/socket、memfd seals、硬链接 nlink 跟踪。
@@ -40,6 +40,10 @@
 > LTP 由评测驱动跑（两遍），是分值大头，但 README 表里没单列分数，这里也不臆造。
 
 ## 进行中 / 已知问题
+- **【已修 2026-06-04】loongarch64 评测机崩溃（CI 出分、比赛机崩）**：现象是 CI（QEMU 8.2）正常出分，比赛机（更新的 QEMU）跑到一半 `[kernel-mode fault] ... ecode=0x8 ... svc=#220`（clone）后 pid=1 中招关机。
+  - 根因：帧分配器把 RAM 末端当成硬编码 `MEMORY_END_DEFAULT=0xC000_0000`。该默认只对 QEMU 8.2 的 `virt` 布局成立（高位 RAM 节点在 `0x9000_0000`，size `0x3000_0000` → 末端 `0xC000_0000`）。**QEMU ≥ 9 把高位 RAM 基址下移到 `0x8000_0000`**，`-m 1G` 时真实末端是 `0xB000_0000`。沿用旧默认会让分配器在 `[0xB000_0000,0xC000_0000)` 这段未backing的空洞里发帧；run 深处帧用尽后 `fork()` 的逐页 `memcpy` 经直映窗口写到这种地址 → 内核态 ADE。CI 因 RAM 真到 `0xC000_0000` 而无事。
+  - 修复（`mm/mod.rs`，commit `3e0f02d`）：loongarch64 扫低位 RAM 找 QEMU 载入的 FDT（直接启动不经寄存器传 DTB 指针），取**包含内核固定载入地址的那段 memory region** 的末端。任意 QEMU 都得到真实末端（-m 1G→`0xB000_0000`，-m 2G→`0xF000_0000`）。QEMU 8.2 自身 DTB 有 bug（memory `reg` 高 32 位被填成 0x2，节点声称 RAM 在 `~0x2_9000_0000`），这些假区间不跨内核地址 → 8.2 找不到匹配、回退到对 8.2 正确的 `0xC000_0000` 默认。riscv64 不变。
+  - 验证：QEMU 10.0.8 `-m 1G` 全量 glibc-LA LTP 跑完零 kernel fault（修复前在第 2134 行关机），分数 4463 TPASS / 782 例 ≈ 镜像 CI（QEMU 8.2）的 4464 / 766；RV 重测 `0xC000_0000` + 10MHz 不变。
 - **mallocstress 类 wedge（未修）**：全量评测跑到 LTP `mallocstress` 时卡死，既不继续也不关机（评测机现象）。
   - 诊断：per-syscall 看门狗只盯"单条 syscall 在内核里 >8s"；`mallocstress` 是"大量短 syscall"型，每次 `watchdog_arm` 重置锚点，逃过 8s 预算。最后兜底关机只在 pid 1（contest init）变 Zombie 时触发，而那时 init 还在 `wait4`，所以不关机 → 评测机一直 `正在评判`。
   - ground truth：本会话用 LTP 真二进制 + `-m 1G` **单独**跑 mallocstress 并未 wedge（3s 被 `timeout` SIGKILL，FAIL 打出，run 继续，rc=0 干净关机）→ 卡死与全量累积内存/状态相关，须在真语境复现。
