@@ -49,8 +49,9 @@ _start:
     li.w        $t0, 0x7
     csrwr       $t0, 0x2
 
-    # kmain(hartid = 0, dtb = 0). LA direct boot has no SBI-style args we
-    # rely on; the common kmain only prints them.
+    # kmain(hartid = 0, dtb = 0). QEMU enters with a0..a3 carrying efi-style
+    # scalars (not a DTB pointer), so we don't forward them; the kernel finds
+    # the flattened device tree by scanning low RAM in mm::init instead.
     move        $a0, $zero
     move        $a1, $zero
     bl          kmain
