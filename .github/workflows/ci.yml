@@ -29,6 +29,10 @@ env:
   TEST_IMG_BASE: https://github.com/Xiande-OS/Project/releases/download/test-images
   # Bump when you re-upload images, to invalidate the per-cell image cache.
   IMG_VERSION: v1
+  # QEMU version the contest judge runs. CI builds exactly this from source so it
+  # exercises the same machine model the grader does (the distro's 8.2 has the
+  # old LoongArch high-RAM base and silently hides judge-only memory bugs).
+  QEMU_VERSION: "9.2.1"
 
 jobs:
   ltp:
@@ -52,14 +56,21 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
           df -h /
 
-      - name: Install QEMU + cross linker
+      - name: Install cross linker + QEMU runtime deps
         run: |
           sudo apt-get update
+          # qemu-system-* is installed only for its runtime-library closure
+          # (glib, pixman, slirp, fdt, ...) needed by the source-built contest
+          # QEMU below, which shadows these distro binaries on PATH. gcc-* are
+          # the kernel build's cross linkers.
           sudo apt-get install -y --no-install-recommends \
             qemu-system-misc qemu-system-riscv64 \
             gcc-riscv64-linux-gnu gcc-14-loongarch64-linux-gnu curl
-          qemu-system-riscv64 --version | head -1
-          qemu-system-loongarch64 --version | head -1
+
+      - name: Build & select contest QEMU (${{ env.QEMU_VERSION }})
+        uses: ./.github/actions/setup-qemu-contest
+        with:
+          version: ${{ env.QEMU_VERSION }}
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.arch == 'rv' && 'riscv64gc-unknown-none-elf' || 'loongarch64-unknown-none' }}

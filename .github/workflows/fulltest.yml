@@ -38,6 +38,9 @@ permissions:
 
 env:
   TEST_IMG_BASE: https://github.com/Xiande-OS/Project/releases/download/test-images
+  # QEMU version the contest judge runs — built from source so this faithful
+  # reproduction uses the grader's exact machine model (not the distro's 8.2).
+  QEMU_VERSION: "9.2.1"
 
 jobs:
   full:
@@ -59,14 +62,20 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
           df -h /
 
-      - name: Install QEMU + cross linker + disk tools
+      - name: Install cross linker + disk tools + QEMU runtime deps
         run: |
           sudo apt-get update
+          # qemu-system-* is installed only for its runtime-library closure; the
+          # actual emulator is the source-built contest QEMU below (it shadows
+          # these on PATH). gcc-*/e2fsprogs/xz-utils are build + disk tooling.
           sudo apt-get install -y --no-install-recommends \
             qemu-system-misc qemu-system-riscv64 \
             gcc-riscv64-linux-gnu gcc-14-loongarch64-linux-gnu curl e2fsprogs xz-utils
-          qemu-system-riscv64 --version | head -1
-          qemu-system-loongarch64 --version | head -1
+
+      - name: Build & select contest QEMU (${{ env.QEMU_VERSION }})
+        uses: ./.github/actions/setup-qemu-contest
+        with:
+          version: ${{ env.QEMU_VERSION }}
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.arch == 'rv' && 'riscv64gc-unknown-none-elf' || 'loongarch64-unknown-none' }}

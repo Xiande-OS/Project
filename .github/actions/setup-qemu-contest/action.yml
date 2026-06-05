@@ -1,0 +1,57 @@
+name: "Set up contest QEMU"
+description: >
+  Build qemu-system-riscv64 + qemu-system-loongarch64 at the exact version the
+  contest judge runs, cache it, and put it ahead of the distro QEMU on PATH.
+  CI used to run the distro's qemu-system (8.2 on ubuntu-24.04); QEMU >= 9 moved
+  the LoongArch `virt` high-RAM base from 0x9000_0000 to 0x8000_0000, so an 8.2
+  CI cannot reproduce judge-only memory-map bugs. Pinning the judge's version
+  closes that gap.
+
+inputs:
+  version:
+    description: "QEMU version to build (must match the contest judge)."
+    required: false
+    default: "9.2.1"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cache QEMU ${{ inputs.version }}
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/qemu-contest
+        key: qemu-contest-${{ inputs.version }}-ubuntu24-rvla-v1
+
+    - name: Build QEMU ${{ inputs.version }} from source (cache miss)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential ninja-build python3 python3-venv python3-pip \
+          pkg-config libglib2.0-dev libpixman-1-dev libslirp-dev \
+          zlib1g-dev libfdt-dev wget xz-utils
+        wget -qO /tmp/qemu.tar.xz \
+          "https://download.qemu.org/qemu-${{ inputs.version }}.tar.xz"
+        mkdir -p /tmp/qemu-src
+        tar -xf /tmp/qemu.tar.xz -C /tmp/qemu-src --strip-components=1
+        cd /tmp/qemu-src
+        # Only the two contest targets; -nographic guests need no UI backends.
+        # The source tarball ships the prebuilt pc-bios blobs (OpenSBI for
+        # `-bios default`, efi-virtio.rom for virtio-pci), so `make install`
+        # gives a self-contained emulator under the prefix.
+        ./configure --prefix="$HOME/qemu-contest" \
+          --target-list=riscv64-softmmu,loongarch64-softmmu \
+          --enable-slirp --disable-docs --disable-tools --disable-werror
+        make -j"$(nproc)"
+        make install
+
+    - name: Select contest QEMU (shadow the distro build on PATH)
+      shell: bash
+      run: |
+        set -euxo pipefail
+        echo "$HOME/qemu-contest/bin" >> "$GITHUB_PATH"
+        "$HOME/qemu-contest/bin/qemu-system-riscv64" --version | head -1
+        "$HOME/qemu-contest/bin/qemu-system-loongarch64" --version | head -1
