@@ -509,6 +509,7 @@ pub fn reap(pid: i32) {
     crate::sync::futex::forget_task(pid);
     forget_itimer(pid);
     crate::syscall::forget_creds(pid);
+    crate::syscall::keys::forget_proc_keyrings(pid);
     crate::syscall::forget_sched(pid);
     crate::syscall::forget_timers(pid);
     crate::syscall::forget_personality(pid);
