@@ -1104,12 +1104,36 @@ fn keyctl_get_security(id: i32, buf: usize, buflen: usize) -> isize {
     copy_out_capped(buf, buflen, &[0u8])
 }
 
-/// Drop a thread-group's keyring bindings when it exits (mirrors
-/// forget_creds). The keys themselves persist if still linked elsewhere; the
-/// special-keyring *bindings* are what go away.
+/// Drop a thread-group's keyring bindings when it exits (mirrors forget_creds)
+/// and reclaim the keys reachable only through its per-process special keyrings.
+/// The per-uid user / user-session keyrings persist (tracked separately in
+/// user_ring/user_ses_ring), so those serials are never reclaimed. Without this
+/// cascade the registry has no refcount/GC, so every exiting process leaks its
+/// keys into `reg.keys` — a long sweep of thousands of forked test processes
+/// then exhausts the heap and OOM-powers-off mid-run.
 pub fn forget_proc_keyrings(tgid: i32) {
     let mut reg = REG.lock();
-    reg.procs.remove(&tgid);
+    let Some(pk) = reg.procs.remove(&tgid) else { return };
+    let keep: Vec<i32> = reg
+        .user_ring
+        .values()
+        .chain(reg.user_ses_ring.values())
+        .copied()
+        .collect();
+    let mut stack: Vec<i32> = [pk.thread, pk.process, pk.session]
+        .into_iter()
+        .flatten()
+        .collect();
+    while let Some(s) = stack.pop() {
+        if keep.contains(&s) {
+            continue;
+        }
+        if let Some(k) = reg.keys.remove(&s) {
+            if k.is_keyring() {
+                stack.extend(k.members);
+            }
+        }
+    }
 }
 
 // Keep ERANGE / EDQUOT referenced (reserved for future quota handling) so the
