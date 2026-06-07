@@ -258,11 +258,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_CLOCK_SETTIME => sys_clock_settime(a0, a1),
         nr::SYS_CLOCK_ADJTIME => sys_clock_adjtime(a0, a1),
         nr::SYS_CLOCK_GETRES => sys_clock_getres(a0, a1),
-        // clock_nanosleep: route to nanosleep. We ignore the clockid +
-        // TIMER_ABSTIME flag; callers (musl pthread_cond_timedwait, etc.)
-        // mostly use it for relative sleeps and a missing-syscall ENOSYS
-        // here makes them fall back to a noisy retry loop.
-        nr::SYS_CLOCK_NANOSLEEP => sys_nanosleep(a2, a3),
+        // clock_nanosleep(clockid, flags, request, remain): honours the
+        // target clock and TIMER_ABSTIME (an absolute deadline), updates
+        // `remain` on EINTR, and rejects the CPU-time clocks. Routing it to
+        // a plain relative nanosleep made absolute deadlines hang for ~1.7
+        // billion seconds (clock_nanosleep04 / leapsec01).
+        nr::SYS_CLOCK_NANOSLEEP => sys_clock_nanosleep(a0 as i32, a1 as i32, a2, a3),
         // Real epoll: a fd-backed interest set with ready reporting.
         nr::SYS_EPOLL_CREATE1 => sys_epoll_create1(a0 as i32),
         nr::SYS_EPOLL_CTL => sys_epoll_ctl(a0 as i32, a1 as i32, a2 as i32, a3),
@@ -431,6 +432,42 @@ pub fn set_syscall_trace(on: bool) {
 fn copy_path(addr: usize) -> Option<String> {
     // A filesystem path is bounded by PATH_MAX.
     copy_cstr(addr, 4096)
+}
+
+/// Like `copy_path` but reports the precise POSIX errno: a string longer than
+/// PATH_MAX is ENAMETOOLONG, an unreadable/unmapped address is EFAULT. Plain
+/// `copy_path` collapses both into None, which forces callers to pick one errno
+/// for both — wrong for statfs02 (over-long path → ENAMETOOLONG, bad pointer →
+/// EFAULT in the same test).
+fn copy_path_err(addr: usize) -> core::result::Result<String, i32> {
+    const PATH_MAX: usize = 4096;
+    if addr == 0 {
+        return Err(EFAULT as i32);
+    }
+    let task = current_task();
+    let mut out = alloc::vec::Vec::new();
+    let mut cursor = addr;
+    loop {
+        let page_end = (cursor & !4095) + 4096;
+        let chunk = page_end - cursor;
+        let bytes = match task.copy_in_bytes(cursor, chunk) {
+            Some(b) => b,
+            None => return Err(EFAULT as i32), // address fault
+        };
+        if let Some(pos) = bytes.iter().position(|&b| b == 0) {
+            out.extend_from_slice(&bytes[..pos]);
+            break;
+        }
+        out.extend_from_slice(&bytes);
+        cursor = page_end;
+        if out.len() > PATH_MAX {
+            return Err(fs::ENAMETOOLONG); // pathname exceeds PATH_MAX
+        }
+    }
+    match core::str::from_utf8(&out) {
+        Ok(s) => Ok(String::from(s)),
+        Err(_) => Err(EFAULT as i32),
+    }
 }
 
 /// Read a NUL-terminated user string, up to `max` bytes. `copy_path` caps at
@@ -2451,10 +2488,19 @@ fn sys_fcntl(fd: i32, cmd: i32, arg: i32, arg_ptr: usize) -> isize {
             }
             let chosen = chosen.unwrap_or_else(|| {
                 let i = tab.len();
-                tab.push(None);
-                c.push(false);
                 i
             });
+            // EMFILE: the duplicate must land below RLIMIT_NOFILE. When every
+            // slot in [min_fd, cap) is taken, F_DUPFD can't allocate — fcntl12
+            // fills the table to the limit, then expects fcntl(1, F_DUPFD, 1) to
+            // fail with EMFILE rather than silently growing past the limit.
+            if chosen >= cap {
+                return -24; // EMFILE
+            }
+            while tab.len() <= chosen {
+                tab.push(None);
+                c.push(false);
+            }
             tab[chosen] = Some(file);
             if c.len() <= chosen {
                 c.resize(chosen + 1, false);
@@ -2753,8 +2799,23 @@ fn statfs_for(_inode: &Arc<dyn Inode>) -> Statfs {
 }
 
 fn sys_statfs(path: usize, buf: usize) -> isize {
-    let Some(p) = copy_path(path) else { return EFAULT };
-    let Some(i) = resolve_at(AT_FDCWD, &p) else { return ENOENT };
+    // statfs02 distinguishes the path errors: an over-long pathname is
+    // ENAMETOOLONG and a bad pointer is EFAULT (not a blanket EFAULT/ENOENT).
+    let p = match copy_path_err(path) {
+        Ok(p) => p,
+        Err(e) => return e as isize,
+    };
+    // Search permission must hold along the path prefix (statfs03 EACCES, run as
+    // "nobody" against a 0444 — no-search — directory component).
+    if let Err(e) = check_search_perm(AT_FDCWD, &p) {
+        return e;
+    }
+    // Preserve the precise resolution errno (ENOTDIR/ENOENT/ELOOP) instead of
+    // collapsing every lookup failure to ENOENT — statfs02 checks each.
+    let i = match resolve_at_with_err(AT_FDCWD, &p) {
+        Ok(i) => i,
+        Err(e) => return e as isize,
+    };
     let s = statfs_for(&i);
     write_struct(buf, &s)
 }
@@ -3708,6 +3769,11 @@ fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: usize, count: usize) -> isi
             None => return EFAULT,
         };
         let val = u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]));
+        // A negative start offset is invalid: sendfile05 passes offset = -1 and
+        // expects EINVAL (the offset must be a valid non-negative file position).
+        if (val as i64) < 0 {
+            return EINVAL;
+        }
         if task.copy_out_bytes(offset_ptr, &val.to_le_bytes()).is_none() {
             return EFAULT;
         }
@@ -4184,6 +4250,10 @@ struct AdjtimexState {
     esterror: i64,
     constant: i64,
     tick: i64,
+    /// NTP status flags (STA_*). Settable via ADJ_STATUS; read back by
+    /// leapsec01 (which sets STA_PLL / STA_INS and checks they stick) and the
+    /// adjtimex group.
+    status: i32,
 }
 static ADJTIMEX_STATE: crate::sync::Mutex<AdjtimexState> = crate::sync::Mutex::new(AdjtimexState {
     offset: 0,
@@ -4192,6 +4262,7 @@ static ADJTIMEX_STATE: crate::sync::Mutex<AdjtimexState> = crate::sync::Mutex::n
     esterror: 0,
     constant: 0,
     tick: 10_000,
+    status: 0,
 });
 
 /// adjtimex(2). We don't steer the system clock, but we implement the
@@ -4245,6 +4316,12 @@ fn sys_adjtimex(buf: usize) -> isize {
     // then report the whole persisted state back. clock_adjtime01 sets a field
     // and reads it back expecting the value to stick. The ADJ_ADJTIME path
     // keeps its prior behaviour (report the nominal tick).
+    // ADJ_STATUS (0x0010): set the NTP status flags. STA_RONLY (0x8000) is
+    // read-only and ignored on write. leapsec01 sets STA_PLL/STA_INS and
+    // requires them to read back, so we must persist this rather than always
+    // reporting 0.
+    const ADJ_STATUS: u32 = 0x0010;
+    const STA_RONLY: i32 = 0x8000;
     if modes & ADJ_ADJTIME == 0 {
         let mut st = ADJTIMEX_STATE.lock();
         let rd = |o: usize| i64::from_le_bytes(tx[o..o + 8].try_into().unwrap());
@@ -4252,19 +4329,34 @@ fn sys_adjtimex(buf: usize) -> isize {
         if modes & 0x0002 != 0 { st.freq = rd(16); }     // ADJ_FREQUENCY
         if modes & 0x0004 != 0 { st.maxerror = rd(24); } // ADJ_MAXERROR
         if modes & 0x0008 != 0 { st.esterror = rd(32); } // ADJ_ESTERROR
+        if modes & ADJ_STATUS != 0 {                      // ADJ_STATUS
+            let new_status = i32::from_le_bytes(tx[40..44].try_into().unwrap());
+            st.status = (new_status & !STA_RONLY) | (st.status & STA_RONLY);
+        }
         if modes & 0x0020 != 0 { st.constant = rd(48); } // ADJ_TIMECONST
         if modes & ADJ_TICK != 0 { st.tick = rd(88); }   // ADJ_TICK (range-checked above)
         tx[8..16].copy_from_slice(&st.offset.to_le_bytes());
         tx[16..24].copy_from_slice(&st.freq.to_le_bytes());
         tx[24..32].copy_from_slice(&st.maxerror.to_le_bytes());
         tx[32..40].copy_from_slice(&st.esterror.to_le_bytes());
+        tx[40..44].copy_from_slice(&st.status.to_le_bytes());
         tx[48..56].copy_from_slice(&st.constant.to_le_bytes());
         tx[88..96].copy_from_slice(&st.tick.to_le_bytes());
     } else {
         tx[88..96].copy_from_slice(&TICK_NOMINAL.to_le_bytes());
+        // Report current status even on the ADJ_ADJTIME path.
+        tx[40..44].copy_from_slice(&ADJTIMEX_STATE.lock().status.to_le_bytes());
     }
-    // status@40 always reports a synced clock (TIME_OK).
-    tx[40..44].copy_from_slice(&0i32.to_le_bytes());
+    // Always report the current CLOCK_REALTIME in tx->time (timeval at
+    // tv_sec@72, tv_usec@80). leapsec01's wall-clock loop reads this back and
+    // spins until it advances past the simulated leap second, so a stale/zero
+    // time field would hang it.
+    let mtime = crate::arch::now_ticks();
+    let real_sec = (mtime / 10_000_000) as i64
+        + WALL_OFFSET_SECS.load(core::sync::atomic::Ordering::Relaxed);
+    let real_usec = ((mtime % 10_000_000) / 10) as i64;
+    tx[72..80].copy_from_slice(&real_sec.to_le_bytes());
+    tx[80..88].copy_from_slice(&real_usec.to_le_bytes());
     let _ = task.copy_out_bytes(buf, &tx);
     TIME_OK
 }
@@ -5620,6 +5712,146 @@ fn sys_nanosleep(req: usize, _rem: usize) -> isize {
     0
 }
 
+/// clock_nanosleep(clockid, flags, request, remain).
+///
+/// Unlike plain nanosleep, this honours the target clock and the
+/// `TIMER_ABSTIME` flag. The old code routed straight to `sys_nanosleep`
+/// (a relative sleep), so an absolute deadline like `clock_gettime(...) +
+/// 10ms` was treated as a *relative* sleep of ~1.7 billion seconds and the
+/// caller hung forever (clock_nanosleep04 / leapsec01). It also never
+/// rejected the CPU-time clocks (clock_nanosleep01 expects ENOTSUP for
+/// CLOCK_THREAD_CPUTIME_ID) and never updated `remain` on EINTR.
+///
+/// We translate everything into the same absolute mtime-tick deadline the
+/// scheduler's `wake_expired_sleepers` already understands, then park with
+/// the rewind/re-enter machinery shared with `sys_nanosleep`.
+const TIMER_ABSTIME: i32 = 1;
+
+fn sys_clock_nanosleep(clockid: i32, flags: i32, req: usize, rem: usize) -> isize {
+    // Clock selection. CLOCK_REALTIME(0)/MONOTONIC(1)/BOOTTIME(7) are
+    // sleepable. The CPU-time clocks are not valid sleep clocks: Linux
+    // returns ENOTSUP (EOPNOTSUPP) for CLOCK_THREAD_CPUTIME_ID, and a
+    // process needs CLOCK_PROCESS_CPUTIME_ID set up explicitly (we don't
+    // support per-process CPU timers here), so both are ENOTSUP. Anything
+    // outside the known clock range is EINVAL.
+    let realtime = match clockid {
+        0 | 5 | 8 => true,           // REALTIME / REALTIME_COARSE / REALTIME_ALARM
+        1 | 4 | 6 | 7 | 9 => false,  // MONOTONIC family + BOOTTIME(_ALARM)
+        2 | 3 => return ENOTSUP,     // PROCESS/THREAD_CPUTIME — not sleepable
+        c if (c as usize) <= MAX_CLOCK_ID => false,
+        _ => return EINVAL,
+    };
+    if (flags & !TIMER_ABSTIME) != 0 {
+        return EINVAL; // only TIMER_ABSTIME is defined
+    }
+    let abs = (flags & TIMER_ABSTIME) != 0;
+    if req == 0 {
+        return EFAULT;
+    }
+    let task = current_task();
+    let Some(b) = task.copy_in_bytes(req, 16) else { return EFAULT };
+    let sec = i64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
+    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        return EINVAL;
+    }
+
+    // Convert the request to an absolute mtime-tick deadline. The same
+    // 10MHz (100ns/tick) conversion that sys_clock_gettime / sys_nanosleep
+    // use on this platform — proven correct by clock_gettime04 /
+    // clock_nanosleep02 — so the deadline lines up with what userspace reads
+    // back from clock_gettime.
+    let req_ticks = (sec as u64)
+        .saturating_mul(10_000_000)
+        .saturating_add((nsec as u64) / 100);
+    // CLOCK_REALTIME carries the settable wall offset; an absolute REALTIME
+    // deadline is expressed in wall-clock seconds, so subtract the offset to
+    // map it back onto the raw counter the scheduler compares against.
+    let wall_off_ticks = if realtime {
+        WALL_OFFSET_SECS.load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_mul(10_000_000)
+    } else {
+        0
+    };
+    let now = crate::arch::now_ticks();
+
+    // Is there already a deadline installed for us? Some(_) means this is a
+    // re-entry of the parked sleep; None means this is the first entry.
+    let existing = crate::task::sleeper_deadline(task.pid);
+    let deadline = existing.unwrap_or_else(|| {
+        let d = if abs {
+            // Absolute: deadline = requested_abs - wall_offset.
+            (req_ticks as i64 - wall_off_ticks).max(0) as u64
+        } else {
+            now.saturating_add(req_ticks)
+        };
+        crate::task::sleep_until(task.pid, d);
+        d
+    });
+
+    // Deadline reached: the sleep completed normally. Linux leaves `remain`
+    // untouched on a full sleep (and the tests don't read it then).
+    if now >= deadline {
+        crate::task::forget_sleeper(task.pid);
+        return 0;
+    }
+
+    // Re-entry with the deadline NOT yet reached means we were woken early.
+    // For a pure sleep the only thing that flips a parked task back to Ready
+    // before its deadline is `raise_signal` (a signal arrived and its handler
+    // was just delivered) — so an early re-entry is exactly a signal
+    // interruption: EINTR. For a *relative* sleep we report the time left in
+    // `remain` (clock_nanosleep01's SEND_SIGINT case checks it); a bad
+    // `remain` pointer here is EFAULT (its BAD_TS_ADDR_REM case). TIMER_ABSTIME
+    // never writes remain. Computing the remainder here (after the handler ran)
+    // yields an accurate value, matching Linux's restart-block semantics.
+    if existing.is_some() {
+        crate::task::forget_sleeper(task.pid);
+        if !abs && rem != 0 {
+            let left = deadline - now; // ticks remaining (> 0 here)
+            let r_sec = (left / 10_000_000) as i64;
+            let r_nsec = ((left % 10_000_000) * 100) as i64;
+            let mut out = [0u8; 16];
+            out[0..8].copy_from_slice(&r_sec.to_le_bytes());
+            out[8..16].copy_from_slice(&r_nsec.to_le_bytes());
+            if task.copy_out_bytes(rem, &out).is_none() {
+                return EFAULT;
+            }
+        }
+        return -4; // EINTR
+    }
+
+    // First entry, deadline not reached, and a deliverable signal is already
+    // pending (arrived before we ever slept): also EINTR, with remain == the
+    // full request. Otherwise park until the deadline (or a signal wake).
+    use crate::signal::*;
+    let pending = task.signals.pending.load(core::sync::atomic::Ordering::SeqCst);
+    let mask = task.signals.mask.load(core::sync::atomic::Ordering::SeqCst);
+    if pending & !(mask & !unblockable_mask()) != 0 {
+        crate::task::forget_sleeper(task.pid);
+        if !abs && rem != 0 {
+            let left = deadline - now;
+            let r_sec = (left / 10_000_000) as i64;
+            let r_nsec = ((left % 10_000_000) * 100) as i64;
+            let mut out = [0u8; 16];
+            out[0..8].copy_from_slice(&r_sec.to_le_bytes());
+            out[8..16].copy_from_slice(&r_nsec.to_le_bytes());
+            if task.copy_out_bytes(rem, &out).is_none() {
+                return EFAULT;
+            }
+        }
+        return -4; // EINTR
+    }
+
+    // Park until the deadline (or a signal). Rewind so the ecall re-runs on
+    // wake; the deadline is preserved across re-entry above.
+    unsafe {
+        (*task.tf_ptr()).rewind_syscall();
+    }
+    *task.state.lock() = crate::task::TaskState::Waiting;
+    0
+}
+
 // ---------- supplementary groups + getcpu ----------
 
 /// Supplementary group list per thread-group (default empty). getgroups/
@@ -5731,11 +5963,15 @@ fn sys_readahead(fd: i32) -> isize {
 // ---------- POSIX per-process interval timers (timer_create family) ----------
 //
 // timer_create(2)/timer_settime/timer_gettime/timer_getoverrun/timer_delete.
-// We don't run a real expiry+signal engine for these (that path is covered by
-// setitimer/SIGALRM and timerfd); instead we model a per-process timer table
-// that validates arguments and round-trips the interval/value, which is what
-// the LTP timer_* group checks (creation, error errnos, and a freshly created
-// timer reading back as zero). The store survives until timer_delete or exit.
+// A per-process timer table validates arguments and round-trips the
+// interval/value (creation, error errnos, fresh timer reads back zero — what
+// the LTP timer_* argument tests check). On top of that, an armed timer now
+// has a real expiry: timer_settime records an absolute raw-counter deadline
+// and the scheduler's `fire_expired_posix_timers` raises the timer's signal
+// when it elapses (rearming on the interval). Without this, a SIGEV_SIGNAL
+// timer never fired, so clock_settime03 / leapsec01 — which arm a CLOCK_REALTIME
+// timer and then sigwait() for its signal — blocked forever. The store
+// survives until timer_delete or exit.
 
 // sigev_notify values.
 const SIGEV_SIGNAL: i32 = 0;
@@ -5745,11 +5981,17 @@ const SIGEV_THREAD_ID: i32 = 4;
 
 #[derive(Clone, Copy)]
 struct PosixTimer {
-    _clockid: i32,
-    _notify: i32,
-    _signo: i32,
-    interval: (i64, i64), // it_interval (sec, nsec)
-    value: (i64, i64),    // it_value (sec, nsec) — armed remaining
+    clockid: i32,
+    notify: i32,
+    signo: i32,
+    interval: (i64, i64), // it_interval (sec, nsec) — reported verbatim by gettime
+    /// Absolute raw-counter deadline of the next expiry (0 = disarmed). The
+    /// scheduler's `fire_expired_posix_timers` compares `now_ticks()` against
+    /// this and raises `signo` when reached; timer_gettime derives the relative
+    /// it_value remaining from it (Linux returns relative remaining time).
+    deadline_ticks: u64,
+    /// Reload period in raw-counter ticks (0 = single-shot).
+    interval_ticks: u64,
 }
 
 /// All POSIX timers, keyed by (pid, timer_id). Per-process ids start at 0 and
@@ -5764,6 +6006,48 @@ static POSIX_TIMER_NEXT: crate::sync::Mutex<alloc::collections::BTreeMap<i32, i3
 pub fn forget_timers(pid: i32) {
     POSIX_TIMERS.lock().retain(|&(p, _), _| p != pid);
     POSIX_TIMER_NEXT.lock().remove(&pid);
+}
+
+/// Raise the configured signal on every armed POSIX timer whose deadline has
+/// elapsed, then either rearm it on its interval or disarm it (single-shot).
+/// Called from the scheduler alongside `wake_expired_itimers`. A SIGEV_NONE
+/// timer fires no signal but still advances/disarms its deadline. Raising the
+/// signal flips a task parked in sigwait()/rt_sigtimedwait back to Ready, which
+/// is what lets clock_settime03 / leapsec01 make progress.
+pub fn fire_expired_posix_timers(now: u64) {
+    // Collect (pid, signo, notify) of fired timers under the lock, then raise
+    // outside it (raise_signal takes its own locks).
+    let mut fired: alloc::vec::Vec<(i32, i32, i32)> = alloc::vec::Vec::new();
+    {
+        let mut g = POSIX_TIMERS.lock();
+        for (&(pid, _id), t) in g.iter_mut() {
+            if t.deadline_ticks == 0 || now < t.deadline_ticks {
+                continue;
+            }
+            fired.push((pid, t.signo, t.notify));
+            if t.interval_ticks > 0 {
+                // Rearm: advance the deadline to the first multiple of the
+                // interval strictly past `now`, in one step — so a tiny
+                // interval after a long scheduling gap doesn't spin (a 100ns
+                // interval with a 50ms gap would otherwise loop ~500k times).
+                let behind = now - t.deadline_ticks; // now >= deadline here
+                let steps = behind / t.interval_ticks + 1;
+                let advance = steps.saturating_mul(t.interval_ticks);
+                t.deadline_ticks = t.deadline_ticks.saturating_add(advance).max(1);
+            } else {
+                t.deadline_ticks = 0; // single-shot: disarm
+            }
+        }
+    }
+    for (pid, signo, notify) in fired {
+        // SIGEV_NONE delivers no notification.
+        if notify == SIGEV_NONE {
+            continue;
+        }
+        if let Some(task) = crate::task::task_by_pid(pid) {
+            let _ = crate::signal::raise_signal(&task, signo as u32);
+        }
+    }
 }
 
 /// A clockid is accepted if it names one of the clocks the timer tests use.
@@ -5803,7 +6087,14 @@ fn sys_timer_create(clockid: i32, sevp: usize, timerid_out: usize) -> isize {
     };
     POSIX_TIMERS.lock().insert(
         (pid, id),
-        PosixTimer { _clockid: clockid, _notify: notify, _signo: signo, interval: (0, 0), value: (0, 0) },
+        PosixTimer {
+            clockid,
+            notify,
+            signo,
+            interval: (0, 0),
+            deadline_ticks: 0,
+            interval_ticks: 0,
+        },
     );
     if task.copy_out_bytes(timerid_out, &id.to_le_bytes()).is_none() {
         POSIX_TIMERS.lock().remove(&(pid, id));
@@ -5812,7 +6103,7 @@ fn sys_timer_create(clockid: i32, sevp: usize, timerid_out: usize) -> isize {
     0
 }
 
-fn sys_timer_settime(timerid: i32, _flags: i32, new_value: usize, old_value: usize) -> isize {
+fn sys_timer_settime(timerid: i32, flags: i32, new_value: usize, old_value: usize) -> isize {
     let task = current_task();
     let pid = task.pid;
     // itimerspec: it_interval (sec@0,nsec@8), it_value (sec@16,nsec@24) — 32B.
@@ -5833,19 +6124,65 @@ fn sys_timer_settime(timerid: i32, _flags: i32, new_value: usize, old_value: usi
     let Some(t) = g.get_mut(&(pid, timerid)) else { return EINVAL };
     let prev = *t;
     t.interval = (i_sec, i_nsec);
-    t.value = (v_sec, v_nsec);
+
+    // Compute the absolute raw-counter deadline for the next expiry. it_value
+    // == {0,0} disarms the timer. Otherwise convert to ticks (same 100ns/tick
+    // conversion as clock_gettime/nanosleep) and, for a relative arming, add
+    // `now`; for TIMER_ABSTIME the value is already an absolute time on the
+    // timer's clock, so subtract the CLOCK_REALTIME wall offset to land on the
+    // raw counter the scheduler compares against.
+    if v_sec == 0 && v_nsec == 0 {
+        t.deadline_ticks = 0;
+        t.interval_ticks = 0;
+    } else {
+        let v_ticks = (v_sec as u64)
+            .saturating_mul(10_000_000)
+            .saturating_add((v_nsec as u64) / 100);
+        let realtime = matches!(t.clockid, 0 | 5 | 8);
+        let deadline = if (flags & TIMER_ABSTIME) != 0 {
+            let off = if realtime {
+                WALL_OFFSET_SECS.load(core::sync::atomic::Ordering::Relaxed)
+                    .saturating_mul(10_000_000)
+            } else {
+                0
+            };
+            (v_ticks as i64 - off).max(0) as u64
+        } else {
+            crate::arch::now_ticks().saturating_add(v_ticks)
+        };
+        t.deadline_ticks = deadline.max(1); // 0 is the "disarmed" sentinel
+        t.interval_ticks = (i_sec as u64)
+            .saturating_mul(10_000_000)
+            .saturating_add((i_nsec as u64) / 100);
+    }
     drop(g);
     if old_value != 0 {
+        // old_value reports the *previous* setting: its interval plus the
+        // relative time that was left on it (Linux returns relative remaining).
+        let (rem_sec, rem_nsec) = posix_timer_remaining(&prev, crate::arch::now_ticks());
         let mut out = [0u8; 32];
         out[0..8].copy_from_slice(&prev.interval.0.to_le_bytes());
         out[8..16].copy_from_slice(&prev.interval.1.to_le_bytes());
-        out[16..24].copy_from_slice(&prev.value.0.to_le_bytes());
-        out[24..32].copy_from_slice(&prev.value.1.to_le_bytes());
+        out[16..24].copy_from_slice(&rem_sec.to_le_bytes());
+        out[24..32].copy_from_slice(&rem_nsec.to_le_bytes());
         if task.copy_out_bytes(old_value, &out).is_none() {
             return EFAULT;
         }
     }
     0
+}
+
+/// Time remaining (sec, nsec) until a timer's next expiry, derived from its
+/// absolute raw-counter deadline. Linux returns *relative* remaining time from
+/// timer_gettime (commit e86fea764991), so a timer armed with TIMER_ABSTIME
+/// must still read back as "time left", not the absolute value it was armed
+/// with. A disarmed timer (deadline 0) or one already past reads back {0,0}.
+fn posix_timer_remaining(t: &PosixTimer, now: u64) -> (i64, i64) {
+    if t.deadline_ticks == 0 || now >= t.deadline_ticks {
+        return (0, 0);
+    }
+    let left = t.deadline_ticks - now;
+    ((left / 10_000_000) as i64, ((left % 10_000_000) * 100) as i64)
 }
 
 fn sys_timer_gettime(timerid: i32, curr: usize) -> isize {
@@ -5858,11 +6195,12 @@ fn sys_timer_gettime(timerid: i32, curr: usize) -> isize {
     if curr == 0 {
         return EFAULT; // NULL output (timer_gettime01)
     }
+    let (rem_sec, rem_nsec) = posix_timer_remaining(&t, crate::arch::now_ticks());
     let mut out = [0u8; 32];
     out[0..8].copy_from_slice(&t.interval.0.to_le_bytes());
     out[8..16].copy_from_slice(&t.interval.1.to_le_bytes());
-    out[16..24].copy_from_slice(&t.value.0.to_le_bytes());
-    out[24..32].copy_from_slice(&t.value.1.to_le_bytes());
+    out[16..24].copy_from_slice(&rem_sec.to_le_bytes());
+    out[24..32].copy_from_slice(&rem_nsec.to_le_bytes());
     if task.copy_out_bytes(curr, &out).is_none() {
         return EFAULT;
     }
@@ -8250,6 +8588,31 @@ fn sys_mmap(_addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: usize
     start.0 as isize
 }
 
+/// True if `target` is `root` itself or lies somewhere in `root`'s subtree.
+/// Used by rename to reject moving a directory inside itself (EINVAL). The VFS
+/// has no parent pointers, so we descend from `root` (bounded) and compare
+/// inode identities rather than walking up from the target.
+fn dir_contains_or_is(root: &Arc<dyn Inode>, target_id: u64, depth: usize) -> bool {
+    if fs::inode_identity(root) == target_id {
+        return true;
+    }
+    if depth == 0 || root.kind() != FileType::Directory {
+        return false;
+    }
+    let Ok(entries) = root.list() else { return false };
+    for (name, kind) in entries {
+        if kind != FileType::Directory || name == "." || name == ".." {
+            continue;
+        }
+        if let Ok(child) = root.lookup(&name) {
+            if dir_contains_or_is(&child, target_id, depth - 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn sys_renameat2(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _flags: u32) -> isize {
     let Some(old_str) = copy_path(old_path) else {
         return EFAULT;
@@ -8271,6 +8634,66 @@ fn sys_renameat2(old_dfd: i32, old_path: usize, new_dfd: i32, new_path: usize, _
         Ok(i) => i,
         Err(e) => return err_to_isize(e),
     };
+
+    // Renaming a path onto itself (same parent + same name) is a successful
+    // no-op; do this before the self-subdir check so old==new isn't rejected.
+    if fs::inode_identity(&old_parent) == fs::inode_identity(&new_parent)
+        && old_name == new_name
+    {
+        return 0;
+    }
+
+    // EACCES: removing the source entry needs write permission on its parent
+    // directory, and adding the destination entry needs write permission on the
+    // new parent (rename09 runs as an unprivileged user against a dir it doesn't
+    // own). Root is always granted by may_access, so root-run cases are
+    // unaffected.
+    if !may_access(&old_parent, 0o2) || !may_access(&new_parent, 0o2) {
+        return -13; // EACCES
+    }
+
+    // Validate against the destination, if it already exists.
+    let dst = new_parent.lookup(&new_name).ok();
+    if inode.kind() == FileType::Directory {
+        // EINVAL: a directory cannot be made a subdirectory of itself — the new
+        // parent must not be the directory itself or anywhere in its subtree
+        // (rename06: rename("dir1", "dir1/dir2") has new_parent == dir1). Descend
+        // from the SOURCE looking for the new parent; descending from the new
+        // parent instead would wrongly flag rename("olddir","newdir") because the
+        // shared cwd legitimately contains olddir.
+        let new_parent_id = fs::inode_identity(&new_parent);
+        if dir_contains_or_is(&inode, new_parent_id, 16) {
+            return EINVAL;
+        }
+    }
+    if let Some(ref d) = dst {
+        let src_is_dir = inode.kind() == FileType::Directory;
+        match d.kind() {
+            FileType::Directory => {
+                // EISDIR: a non-directory cannot replace an existing directory
+                // (rename05). When both are directories the target must be empty,
+                // else ENOTEMPTY (rename04); an empty dir may be overwritten.
+                if !src_is_dir {
+                    return -21; // EISDIR
+                }
+                let nonempty = d
+                    .list()
+                    .map(|e| e.iter().any(|(n, _)| n != "." && n != ".."))
+                    .unwrap_or(false);
+                if nonempty {
+                    return -39; // ENOTEMPTY
+                }
+            }
+            // ENOTDIR: a directory cannot replace an existing non-directory
+            // (rename07). Plain file-over-file replacement stays working.
+            _ => {
+                if src_is_dir {
+                    return -20; // ENOTDIR
+                }
+            }
+        }
+    }
+
     // Unlink from old location.
     if let Err(e) = old_parent.unlink(&old_name) {
         return err_to_isize(e);
