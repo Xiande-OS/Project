@@ -181,7 +181,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_MMAP => sys_mmap(a0, a1, a2 as i32, a3 as i32, a4 as i32, a5),
         nr::SYS_MUNMAP => sys_munmap(a0, a1),
         nr::SYS_MPROTECT => sys_mprotect(a0, a1, a2 as i32),
-        nr::SYS_MADVISE => 0,
+        nr::SYS_MADVISE => sys_madvise(a0, a1, a2 as i32),
         nr::SYS_PRLIMIT64 => sys_prlimit64(a0 as i32, a1 as u32, a2, a3),
         nr::SYS_GETRLIMIT => sys_getrlimit(a0 as u32, a1),
         nr::SYS_SETRLIMIT => sys_setrlimit(a0 as u32, a1),
@@ -3072,6 +3072,134 @@ fn sys_msync(addr: usize, length: usize, flags: i32) -> isize {
         }
     }
     0
+}
+
+/// madvise(addr, length, advice): give the kernel advice about a range of the
+/// caller's address space. We keep no page cache and demand-page nothing, so
+/// the data-movement advices (WILLNEED prefetch, DONTNEED/FREE reclaim, COLD,
+/// PAGEOUT, …) are honest no-ops on a valid range. What we DO implement is the
+/// validation Linux performs — which is what the LTP error-path tests check:
+///
+///  * EINVAL if `addr` is not page-aligned, the advice is not a known MADV_*
+///    value, or the length rounds/adds past the end of the address space.
+///  * EINVAL if MADV_FREE / MADV_WIPEONFORK is asked for on memory that is not
+///    private + anonymous (Linux restricts both to private anon pages).
+///  * ENOMEM if any page in `[addr, addr+len)` is not mapped (a hole, or an
+///    address outside the process — madvise02's file2 has its last page
+///    unmapped, and a PROT_NONE region still counts as mapped, per Linux).
+///
+/// MADV_WIPEONFORK is implemented for real: it flags the (private anonymous)
+/// range so a subsequent fork() hands the child zeroed pages; MADV_KEEPONFORK
+/// clears that flag again. See MemorySet::{set_wipe_on_fork, fork}.
+fn sys_madvise(addr: usize, length: usize, advice: i32) -> isize {
+    // MADV_* advice values (Linux asm-generic, shared by riscv & loongarch).
+    const MADV_NORMAL: i32 = 0;
+    const MADV_RANDOM: i32 = 1;
+    const MADV_SEQUENTIAL: i32 = 2;
+    const MADV_WILLNEED: i32 = 3;
+    const MADV_DONTNEED: i32 = 4;
+    const MADV_FREE: i32 = 8;
+    const MADV_REMOVE: i32 = 9;
+    const MADV_DONTFORK: i32 = 10;
+    const MADV_DOFORK: i32 = 11;
+    const MADV_MERGEABLE: i32 = 12;
+    const MADV_UNMERGEABLE: i32 = 13;
+    const MADV_HUGEPAGE: i32 = 14;
+    const MADV_NOHUGEPAGE: i32 = 15;
+    const MADV_DONTDUMP: i32 = 16;
+    const MADV_DODUMP: i32 = 17;
+    const MADV_WIPEONFORK: i32 = 18;
+    const MADV_KEEPONFORK: i32 = 19;
+    const MADV_COLD: i32 = 20;
+    const MADV_PAGEOUT: i32 = 21;
+    const MADV_HWPOISON: i32 = 100;
+
+    let page = crate::mm::address::PAGE_SIZE;
+
+    // start must be page-aligned (madvise02 case 1: file1+100 -> EINVAL).
+    if addr % page != 0 {
+        return EINVAL;
+    }
+
+    // The advice must be one we recognise (madvise02 case 2: 1212 -> EINVAL).
+    // Unknown advices are rejected before touching the address space, exactly
+    // like Linux's switch-default in madvise_behavior().
+    match advice {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED
+        | MADV_FREE | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE
+        | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP
+        | MADV_WIPEONFORK | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_HWPOISON => {}
+        _ => return EINVAL,
+    }
+
+    // Round len up to a page and compute the end, rejecting any wrap past the
+    // top of the address space (Linux: end < start -> EINVAL).
+    let len_aligned = match length.checked_add(page - 1) {
+        Some(v) => v & !(page - 1),
+        None => return EINVAL,
+    };
+    let end = match addr.checked_add(len_aligned) {
+        Some(e) => e,
+        None => return EINVAL,
+    };
+    // A zero-length request is a no-op once start/advice are validated (this is
+    // madvise10 case 2: MADV_WIPEONFORK with length 0 must succeed).
+    if length == 0 {
+        return 0;
+    }
+
+    let start_vpn = crate::mm::VirtAddr(addr).floor();
+    let end_vpn = crate::mm::VirtAddr(end).floor(); // `end` is already page-aligned
+
+    use crate::mm::memory_set::MadviseRange;
+    let task = current_task();
+    let mut ms = task.memory_set.lock();
+
+    match advice {
+        // MADV_FREE and MADV_WIPEONFORK apply only to private anonymous memory.
+        // The per-area walk reproduces Linux's precedence: a wrong-type area
+        // (file-backed or MAP_SHARED) gives EINVAL even when the range also has
+        // a trailing hole — madvise02 cases 10/11/12/13 (MADV_FREE/WIPEONFORK
+        // on file1, shared_anon and file3) all expect EINVAL; an all-anon range
+        // with a hole gives ENOMEM.
+        MADV_FREE => match ms.madvise_anon_check(start_vpn, end_vpn) {
+            MadviseRange::WrongType => EINVAL,
+            MadviseRange::Hole => -12, // ENOMEM
+            // No lazy-reclaim machinery here: the pages stay valid with their
+            // current contents, which is a permitted MADV_FREE outcome.
+            MadviseRange::Ok => 0,
+        },
+        MADV_WIPEONFORK => match ms.madvise_anon_check(start_vpn, end_vpn) {
+            MadviseRange::WrongType => EINVAL,
+            MadviseRange::Hole => -12, // ENOMEM
+            MadviseRange::Ok => {
+                ms.set_wipe_on_fork(crate::mm::VirtAddr(addr), length, true);
+                0
+            }
+        },
+        // MADV_KEEPONFORK undoes MADV_WIPEONFORK. Linux does not restrict it to
+        // anonymous memory, so it only needs the range mapped (else ENOMEM); we
+        // clear the flag wherever it could legitimately have been set.
+        MADV_KEEPONFORK => {
+            if !ms.range_fully_mapped(start_vpn, end_vpn) {
+                return -12; // ENOMEM
+            }
+            if ms.madvise_anon_check(start_vpn, end_vpn) == MadviseRange::Ok {
+                ms.set_wipe_on_fork(crate::mm::VirtAddr(addr), length, false);
+            }
+            0
+        }
+        // Every other recognised advice is purely advisory for our VM model (no
+        // page cache, eager mapping, no THP/KSM/dump state to toggle). It needs
+        // only a fully mapped range — ENOMEM otherwise (madvise02 cases 7/8:
+        // file2's last page was munmap'd) — and then succeeds as a no-op.
+        _ => {
+            if !ms.range_fully_mapped(start_vpn, end_vpn) {
+                return -12; // ENOMEM
+            }
+            0
+        }
+    }
 }
 
 /// Read a user iovec[] into a Vec<IoVec>.
