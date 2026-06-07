@@ -11,8 +11,8 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      diag:
-        description: "Diagnostic mode: after the whitelist, sweep every other LTP binary (find new scorers). Off = contest build (whitelist only)."
+      whitelist_only:
+        description: "Run ONLY the contest whitelist (what the judge runs), instead of the full sweep. Default (and every push) runs the full sweep — that's the score we drive to 10000."
         type: boolean
         default: false
 
@@ -90,13 +90,14 @@ jobs:
         run: |
           make prepare
           TGT=${{ matrix.arch == 'rv' && 'riscv64gc-unknown-none-elf' || 'loongarch64-unknown-none' }}
-          # Default (push/PR): build the contest kernel — runs the per-arch
-          # whitelist ONLY, exactly what the contest machine runs, so CI proves
-          # that config is stable and scores fully. Manually dispatch with
-          # diag=true to build the diagnostic kernel that also sweeps every
-          # other binary (to discover new scorers to fold into the whitelist).
-          FEATURES="${{ (github.event_name == 'workflow_dispatch' && inputs.diag) && '--features diag_full_ltp' || '' }}"
-          echo "building with: $FEATURES (diag=${{ inputs.diag }})"
+          # CI runs the FULL sweep by default (`diag_full_ltp`): the per-arch
+          # whitelist (pass 1) PLUS every other binary in testcases/bin (pass 2).
+          # That is the total achievable score — the number we drive to 10000 per
+          # cell. The contest JUDGE instead runs the whitelist only (bounded so a
+          # stress/OOM case can't wedge it); reproduce that here by dispatching
+          # with whitelist_only=true.
+          FEATURES="${{ (github.event_name == 'workflow_dispatch' && inputs.whitelist_only) && '' || '--features diag_full_ltp' }}"
+          echo "building with: ${FEATURES:-<whitelist-only>}"
           cargo build --release -p kernel --target "$TGT" --offline $FEATURES
           cp "target/$TGT/release/kernel" "kernel-${{ matrix.arch }}"
           ls -l "kernel-${{ matrix.arch }}"
