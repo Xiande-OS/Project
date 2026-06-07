@@ -386,6 +386,7 @@ const LTP_WHITELIST: &str = "\
 const LTP_WHITELIST: &str = "\
     epoll_ctl03 access01 rt_sigaction03 rt_sigaction02 rt_sigaction01 waitpid01 getpid01 pipe11 timer_settime02 clock_getres01 sysconf01 confstr01 \
     select03 ioctl06 writev03 pselect02 pselect02_64 \
+    fanotify10 fanotify16 fanotify13 fanotify14 fanotify15 fanotify20 chdir01 fsync01 mkdir09 copy_file_range01 execveat03 inotify05 prctl06 close_range01 \
     epoll-ltp posix_fadvise03_64 posix_fadvise03 fanotify09 chmod01 process_vm_readv03 signal05 signal03 getitimer01 signal04 name_to_handle_at01 open11 \
     process_vm01 setregid03 mq_timedsend01 madvise01 linkat01 personality01 mq_timedreceive01 llseek03 prctl02 pathconf01 select01 openat201 \
     getrlimit03 getrlimit01 access02 setreuid05 setreuid03 ptrace05 link04 memfd_create01 kill11 stat01_64 stat01 setregid02 \
