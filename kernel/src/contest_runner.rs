@@ -602,10 +602,21 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 // Give pass-1 (the curated high-yield list) more headroom on
                 // LA; pass-2's sweep stays at 3s so a wedged unknown can't eat
                 // the group budget and starve throughput.
-                #[cfg(target_arch = "loongarch64")]
+                #[cfg(all(target_arch = "loongarch64", not(feature = "single_ltp")))]
                 let wl_to = "15";
-                #[cfg(not(target_arch = "loongarch64"))]
+                #[cfg(all(not(target_arch = "loongarch64"), not(feature = "single_ltp")))]
                 let wl_to = "5";
+                // single_ltp harness: timeout from XIANDE_TO (default 25s) so a
+                // high-iteration target (fanotify10 = 249 forking sub-assertions)
+                // finishes on slow TCG — and so I can probe the real whitelist 15s.
+                #[cfg(feature = "single_ltp")]
+                let wl_to = option_env!("XIANDE_TO").unwrap_or("25");
+                // single_ltp harness: the "whitelist" becomes exactly the
+                // XIANDE_TESTS the dev wants to validate; otherwise the real list.
+                #[cfg(feature = "single_ltp")]
+                let wl_list: &str = option_env!("XIANDE_TESTS").unwrap_or("");
+                #[cfg(not(feature = "single_ltp"))]
+                let wl_list: &str = LTP_WHITELIST;
                 // Pass 2 — the full sweep of every other binary in
                 // testcases/bin — runs ONLY in the diagnostic build
                 // (`--features diag_full_ltp`, which CI uses to discover new
@@ -628,7 +639,7 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                      {pass2}fi'\n",
                     b = budget,
                     d = dir,
-                    wl = LTP_WHITELIST,
+                    wl = wl_list,
                     skip = LTP_SKIP,
                     wl_to = wl_to,
                     pass2 = pass2,

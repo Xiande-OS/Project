@@ -32,6 +32,11 @@ contest = []
 # only the known-good scoring whitelist (no stress/OOM case can wedge it); CI
 # turns it on to discover new scorers to fold back into the whitelist.
 diag_full_ltp = []
+# Single-test harness (local dev only): run ONLY the LTP cases named in the
+# XIANDE_TESTS build-time env, at a generous 25s timeout, no sweep — validate a
+# fix against one target test without a full run.
+# e.g. XIANDE_TESTS="fanotify10" cargo build --features single_ltp
+single_ltp = []
 bare_hello = []
 musl_hello = []
 rust_git = []
