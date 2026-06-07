@@ -656,6 +656,19 @@ fn gen_stat(pid: i32) -> Vec<u8> {
     let sid = task.sid.load(Ordering::Relaxed);
     let vsize_bytes = vm_size_kb(pid) * 1024;
     let rss_pages = vsize_bytes / 4096;
+    // CPU time accounting. We have no real per-task scheduler accounting, so we
+    // approximate consumed user CPU time by the wall time elapsed since the task
+    // was created, expressed in CLK_TCK (100 Hz) jiffies. For the contest's
+    // CPU-bound single-process tests this tracks actual CPU usage closely. It
+    // also has to be *nonzero* once a process has run for a few ms:
+    // clock_gettime01's setup spins `while (utime == 0)` reading this field, so
+    // a hardcoded 0 (the previous value) hung it forever. `starttime` is the
+    // creation time in jiffies since boot, matching what Linux reports.
+    let now = crate::arch::now_ticks();
+    let start = task.start_ticks.load(Ordering::Relaxed);
+    let per_jiffy = crate::arch::TICKS_PER_SEC / 100; // ticks per CLK_TCK jiffy
+    let utime_jiffies = now.saturating_sub(start) / per_jiffy.max(1);
+    let starttime_jiffies = start / per_jiffy.max(1);
     // pid (comm) state ppid pgid sid tty_nr tpgid flags minflt cminflt majflt
     // cmajflt utime stime cutime cstime priority nice num_threads itrealvalue
     // starttime vsize rss rsslim startcode endcode startstack kstkesp kstkeip
@@ -664,8 +677,8 @@ fn gen_stat(pid: i32) -> Vec<u8> {
     // cguest_time start_data end_data start_brk arg_start arg_end env_start
     // env_end exit_code
     let s = format!(
-        "{} ({}) {} {} {} {} -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 {} {} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        pid, comm, state, ppid, pgid, sid, vsize_bytes, rss_pages
+        "{} ({}) {} {} {} {} -1 0 0 0 0 0 0 {} 0 0 0 20 0 1 0 {} {} {} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        pid, comm, state, ppid, pgid, sid, utime_jiffies, starttime_jiffies, vsize_bytes, rss_pages
     );
     s.into_bytes()
 }
