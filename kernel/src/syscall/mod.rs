@@ -5697,11 +5697,14 @@ fn sys_posix_fadvise(fd: i32, advice: i32) -> isize {
     const POSIX_FADV_NORMAL: i32 = 0;
     const POSIX_FADV_NOREUSE: i32 = 5; // 0..=5 are the valid advices
     let task = current_task();
-    if task.fd_table.lock().get(fd).is_none() {
-        return EBADF;
-    }
+    let Some(file) = task.fd_table.lock().get(fd) else { return EBADF };
     if advice < POSIX_FADV_NORMAL || advice > POSIX_FADV_NOREUSE {
         return EINVAL;
+    }
+    // posix_fadvise on a pipe/FIFO is ESPIPE — posix_fadvise04 opens a pipe and
+    // calls fadvise with a valid advice expecting ESPIPE (mirrors sys_readahead).
+    if file.inode.as_any().is::<crate::fs::pipe::PipeEnd>() {
+        return -29; // ESPIPE
     }
     0
 }
