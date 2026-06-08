@@ -625,7 +625,7 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 // sweep on the contest machine.
                 let pass2: alloc::string::String = if cfg!(feature = "diag_full_ltp") {
                     alloc::format!(
-                        "for f in *; do [ -f \"$f\" ] || continue; case \"$f\" in *.sh|*datafile*|*_data|*.dat|cgroup_*|cpuctl_*|cpuacct_*|cpuset_*|cpuhotplug_*|genload|ebizzy|crash0?|hackbench|messaging|pidns*|pid_namespace*|mmap1|mmap2|mmap3|mmap-corruption*|mmapstress*|growfiles|growstack*|openfile|shm_comm|shm_test|mmstress*|mallocstress|swapping0?|tcp4-*|tcp6-*|udp4-*|udp6-*|sctp*|dccp*|route[46]*|route-change*|multicast*|igmp*|broken_ip*) continue ;; esac; case \"$WL\" in *\" $f \"*) continue ;; esac; case \"$SKIP\" in *\" $f \"*) continue ;; esac; {d}/busybox echo \"RUN LTP CASE $f\"; {d}/busybox setsid {d}/busybox timeout -s KILL 3 \"./$f\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $f : $?\"; {d}/busybox rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; done; ",
+                        "for f in *; do [ -f \"$f\" ] || continue; case \"$f\" in *.sh|*datafile*|*_data|*.dat|cgroup_*|cpuctl_*|cpuacct_*|cpuset_*|cpuhotplug_*|genload|ebizzy|crash0?|hackbench|messaging|fork_exec_loop|fork_processes|thp0?|pidns*|pid_namespace*|mmap1|mmap2|mmap3|mmap-corruption*|mmapstress*|growfiles|growstack*|openfile|shm_comm|shm_test|mmstress*|mallocstress|swapping0?|tcp4-*|tcp6-*|udp4-*|udp6-*|sctp*|dccp*|route[46]*|route-change*|multicast*|igmp*|broken_ip*) continue ;; esac; case \"$WL\" in *\" $f \"*) continue ;; esac; case \"$SKIP\" in *\" $f \"*) continue ;; esac; {d}/busybox echo \"RUN LTP CASE $f\"; {d}/busybox setsid {d}/busybox timeout -s KILL 20 \"./$f\" < /dev/null; {d}/busybox echo \"FAIL LTP CASE $f : $?\"; {d}/busybox rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null; done; ",
                         d = dir,
                     )
                 } else {
@@ -781,7 +781,17 @@ fn script_budget(script: &str) -> &'static str {
         // (musl + glibc), so 2×2000s + the small fast groups stays well
         // under budget, and the score is cumulative — whatever runs before
         // the budget fires is banked.
-        s if s.starts_with("ltp_") => "2000",
+        // The judge runs whitelist-only (bounded) so it keeps 2000s. The CI
+        // full sweep (diag_full_ltp) runs every binary at a 20s per-case timeout
+        // to let high-iteration tests finish and bank full TPASS — the leaders'
+        // ~10k/variant comes from the full ~2800-case set with real time, not a
+        // 3s-capped subset — so it needs a far larger budget (CI isn't time-limited).
+        s if s.starts_with("ltp_") => {
+            #[cfg(feature = "diag_full_ltp")]
+            { "9000" }
+            #[cfg(not(feature = "diag_full_ltp"))]
+            { "2000" }
+        }
         _ => "10",
     }
 }

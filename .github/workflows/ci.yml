@@ -38,7 +38,7 @@ jobs:
   ltp:
     name: ltp-${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +120,7 @@ jobs:
           chmod +x ci/*.sh
           # Generous wall cap so the slow TCG guest reaches its in-kernel ltp
           # budget (~2000 guest-s) and emits END before the host wall fires.
-          bash ci/run-qemu.sh "${{ matrix.arch }}" "ci/img/${{ matrix.name }}.img" "${{ matrix.name }}" 3600 \
+          bash ci/run-qemu.sh "${{ matrix.arch }}" "ci/img/${{ matrix.name }}.img" "${{ matrix.name }}" 10800 \
             | tee "ci/${{ matrix.name }}.log"
 
       - name: Parse results + gate
