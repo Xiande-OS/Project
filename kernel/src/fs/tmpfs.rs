@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use crate::sync::Mutex;
 
 use core::any::Any;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{
     devfs, xattr_store_get, xattr_store_list, xattr_store_remove, xattr_store_set, FileType,
@@ -321,6 +321,10 @@ pub struct TmpfsDir {
     entries: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
     pub meta: Mutex<Meta>,
     xattrs: XattrStore,
+    /// Set once this directory has been rmdir'd. An fd kept open across the
+    /// rmdir behaves like a dead dentry on Linux: getdents64 on it returns
+    /// ENOENT instead of a (now-detached) listing (getdents02).
+    removed: AtomicBool,
 }
 
 impl TmpfsDir {
@@ -329,6 +333,7 @@ impl TmpfsDir {
             entries: Mutex::new(BTreeMap::new()),
             meta: Mutex::new(Meta { mode: 0o755, ..Meta::default() }),
             xattrs: Mutex::new(BTreeMap::new()),
+            removed: AtomicBool::new(false),
         })
     }
 
@@ -417,6 +422,7 @@ impl Inode for TmpfsDir {
                 entries: Mutex::new(BTreeMap::new()),
                 meta: Mutex::new(Meta { mode: 0o755, ..Meta::default() }),
                 xattrs: Mutex::new(BTreeMap::new()),
+                removed: AtomicBool::new(false),
             }),
             _ => return Err(EINVAL),
         };
@@ -447,6 +453,12 @@ impl Inode for TmpfsDir {
             .iter()
             .map(|(k, v)| (k.clone(), v.kind()))
             .collect())
+    }
+    fn mark_removed(&self) {
+        self.removed.store(true, Ordering::Relaxed);
+    }
+    fn is_removed(&self) -> bool {
+        self.removed.load(Ordering::Relaxed)
     }
     fn xattr_get(&self, name: &str) -> Result<Vec<u8>> {
         xattr_store_get(&self.xattrs, name)

@@ -182,7 +182,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_MMAP => sys_mmap(a0, a1, a2 as i32, a3 as i32, a4 as i32, a5),
         nr::SYS_MUNMAP => sys_munmap(a0, a1),
         nr::SYS_MPROTECT => sys_mprotect(a0, a1, a2 as i32),
-        nr::SYS_MADVISE => 0,
+        nr::SYS_MADVISE => sys_madvise(a0, a1, a2 as i32),
         nr::SYS_PRLIMIT64 => sys_prlimit64(a0 as i32, a1 as u32, a2, a3),
         nr::SYS_GETRLIMIT => sys_getrlimit(a0 as u32, a1),
         nr::SYS_SETRLIMIT => sys_setrlimit(a0 as u32, a1),
@@ -3051,6 +3051,134 @@ fn sys_msync(addr: usize, length: usize, flags: i32) -> isize {
         }
     }
     0
+}
+
+/// madvise(addr, length, advice): give the kernel advice about a range of the
+/// caller's address space. We keep no page cache and demand-page nothing, so
+/// the data-movement advices (WILLNEED prefetch, DONTNEED/FREE reclaim, COLD,
+/// PAGEOUT, …) are honest no-ops on a valid range. What we DO implement is the
+/// validation Linux performs — which is what the LTP error-path tests check:
+///
+///  * EINVAL if `addr` is not page-aligned, the advice is not a known MADV_*
+///    value, or the length rounds/adds past the end of the address space.
+///  * EINVAL if MADV_FREE / MADV_WIPEONFORK is asked for on memory that is not
+///    private + anonymous (Linux restricts both to private anon pages).
+///  * ENOMEM if any page in `[addr, addr+len)` is not mapped (a hole, or an
+///    address outside the process — madvise02's file2 has its last page
+///    unmapped, and a PROT_NONE region still counts as mapped, per Linux).
+///
+/// MADV_WIPEONFORK is implemented for real: it flags the (private anonymous)
+/// range so a subsequent fork() hands the child zeroed pages; MADV_KEEPONFORK
+/// clears that flag again. See MemorySet::{set_wipe_on_fork, fork}.
+fn sys_madvise(addr: usize, length: usize, advice: i32) -> isize {
+    // MADV_* advice values (Linux asm-generic, shared by riscv & loongarch).
+    const MADV_NORMAL: i32 = 0;
+    const MADV_RANDOM: i32 = 1;
+    const MADV_SEQUENTIAL: i32 = 2;
+    const MADV_WILLNEED: i32 = 3;
+    const MADV_DONTNEED: i32 = 4;
+    const MADV_FREE: i32 = 8;
+    const MADV_REMOVE: i32 = 9;
+    const MADV_DONTFORK: i32 = 10;
+    const MADV_DOFORK: i32 = 11;
+    const MADV_MERGEABLE: i32 = 12;
+    const MADV_UNMERGEABLE: i32 = 13;
+    const MADV_HUGEPAGE: i32 = 14;
+    const MADV_NOHUGEPAGE: i32 = 15;
+    const MADV_DONTDUMP: i32 = 16;
+    const MADV_DODUMP: i32 = 17;
+    const MADV_WIPEONFORK: i32 = 18;
+    const MADV_KEEPONFORK: i32 = 19;
+    const MADV_COLD: i32 = 20;
+    const MADV_PAGEOUT: i32 = 21;
+    const MADV_HWPOISON: i32 = 100;
+
+    let page = crate::mm::address::PAGE_SIZE;
+
+    // start must be page-aligned (madvise02 case 1: file1+100 -> EINVAL).
+    if addr % page != 0 {
+        return EINVAL;
+    }
+
+    // The advice must be one we recognise (madvise02 case 2: 1212 -> EINVAL).
+    // Unknown advices are rejected before touching the address space, exactly
+    // like Linux's switch-default in madvise_behavior().
+    match advice {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED
+        | MADV_FREE | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE
+        | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP
+        | MADV_WIPEONFORK | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_HWPOISON => {}
+        _ => return EINVAL,
+    }
+
+    // Round len up to a page and compute the end, rejecting any wrap past the
+    // top of the address space (Linux: end < start -> EINVAL).
+    let len_aligned = match length.checked_add(page - 1) {
+        Some(v) => v & !(page - 1),
+        None => return EINVAL,
+    };
+    let end = match addr.checked_add(len_aligned) {
+        Some(e) => e,
+        None => return EINVAL,
+    };
+    // A zero-length request is a no-op once start/advice are validated (this is
+    // madvise10 case 2: MADV_WIPEONFORK with length 0 must succeed).
+    if length == 0 {
+        return 0;
+    }
+
+    let start_vpn = crate::mm::VirtAddr(addr).floor();
+    let end_vpn = crate::mm::VirtAddr(end).floor(); // `end` is already page-aligned
+
+    use crate::mm::memory_set::MadviseRange;
+    let task = current_task();
+    let mut ms = task.memory_set.lock();
+
+    match advice {
+        // MADV_FREE and MADV_WIPEONFORK apply only to private anonymous memory.
+        // The per-area walk reproduces Linux's precedence: a wrong-type area
+        // (file-backed or MAP_SHARED) gives EINVAL even when the range also has
+        // a trailing hole — madvise02 cases 10/11/12/13 (MADV_FREE/WIPEONFORK
+        // on file1, shared_anon and file3) all expect EINVAL; an all-anon range
+        // with a hole gives ENOMEM.
+        MADV_FREE => match ms.madvise_anon_check(start_vpn, end_vpn) {
+            MadviseRange::WrongType => EINVAL,
+            MadviseRange::Hole => -12, // ENOMEM
+            // No lazy-reclaim machinery here: the pages stay valid with their
+            // current contents, which is a permitted MADV_FREE outcome.
+            MadviseRange::Ok => 0,
+        },
+        MADV_WIPEONFORK => match ms.madvise_anon_check(start_vpn, end_vpn) {
+            MadviseRange::WrongType => EINVAL,
+            MadviseRange::Hole => -12, // ENOMEM
+            MadviseRange::Ok => {
+                ms.set_wipe_on_fork(crate::mm::VirtAddr(addr), length, true);
+                0
+            }
+        },
+        // MADV_KEEPONFORK undoes MADV_WIPEONFORK. Linux does not restrict it to
+        // anonymous memory, so it only needs the range mapped (else ENOMEM); we
+        // clear the flag wherever it could legitimately have been set.
+        MADV_KEEPONFORK => {
+            if !ms.range_fully_mapped(start_vpn, end_vpn) {
+                return -12; // ENOMEM
+            }
+            if ms.madvise_anon_check(start_vpn, end_vpn) == MadviseRange::Ok {
+                ms.set_wipe_on_fork(crate::mm::VirtAddr(addr), length, false);
+            }
+            0
+        }
+        // Every other recognised advice is purely advisory for our VM model (no
+        // page cache, eager mapping, no THP/KSM/dump state to toggle). It needs
+        // only a fully mapped range — ENOMEM otherwise (madvise02 cases 7/8:
+        // file2's last page was munmap'd) — and then succeeds as a no-op.
+        _ => {
+            if !ms.range_fully_mapped(start_vpn, end_vpn) {
+                return -12; // ENOMEM
+            }
+            0
+        }
+    }
 }
 
 /// Read a user iovec[] into a Vec<IoVec>.
@@ -6789,6 +6917,10 @@ fn sys_unlinkat(dfd: i32, path: usize, flag: i32) -> isize {
             if let Some(v) = &victim {
                 if !is_dir {
                     v.adjust_nlink(-1);
+                } else {
+                    // A directory removed out from under an open fd becomes a
+                    // dead dentry: getdents64 on that fd must report ENOENT.
+                    v.mark_removed();
                 }
             }
             // inotify: IN_DELETE on the parent (with name) + IN_DELETE_SELF on
@@ -6820,45 +6952,86 @@ struct Linux64Dirent {
     // followed by name[]
 }
 
+/// Map a FileType to the linux_dirent64 d_type value (DT_*).
+fn dirent_d_type(kind: FileType) -> u8 {
+    match kind {
+        FileType::Regular => 8u8,    // DT_REG
+        FileType::Directory => 4u8,  // DT_DIR
+        FileType::CharDevice => 2u8, // DT_CHR
+        FileType::BlockDevice => 6u8, // DT_BLK
+        FileType::Pipe => 1u8,       // DT_FIFO
+        FileType::Symlink => 10u8,   // DT_LNK
+    }
+}
+
 fn sys_getdents64(fd: i32, buf: usize, len: usize) -> isize {
     let task = current_task();
     let Some(file) = task.fd_table.lock().get(fd) else {
         return EBADF;
     };
+    // getdents64 only applies to directories. A non-directory fd is ENOTDIR
+    // (getdents02 checks this), and a directory that has been removed while the
+    // fd stays open reports ENOENT like a dead dentry on Linux.
+    if file.inode.kind() != FileType::Directory {
+        return -20; // ENOTDIR
+    }
+    if file.inode.is_removed() {
+        return ENOENT; // getdents02: directory unlinked while still open
+    }
     let entries = match file.inode.list() {
         Ok(e) => e,
         Err(e) => return err_to_isize(e),
     };
 
-    // Track read progress with `offset`.
+    // Build the full entry set, including the synthetic "." and ".." that every
+    // real directory has but our VFS doesn't store. Without these, getdents01
+    // fails ("Entry '.'/'..' not found"). Each tuple carries the on-disk inode
+    // number (d_ino) and the file type (d_type).
+    let self_ino = fs::inode_identity(&file.inode);
+    let mut full: alloc::vec::Vec<(alloc::string::String, FileType, u64)> =
+        alloc::vec::Vec::with_capacity(entries.len() + 2);
+    // "." points at this directory. ".." points at the parent; our single-level
+    // VFS doesn't track parents, so we reuse this directory's identity, which is
+    // a valid non-zero d_ino (the dirent tests only check name/type presence).
+    full.push((alloc::string::String::from("."), FileType::Directory, self_ino));
+    full.push((alloc::string::String::from(".."), FileType::Directory, self_ino));
+    for (name, kind) in entries.into_iter() {
+        // Resolve the child to report its real inode number. lookup() can fail
+        // for a racily-removed entry; fall back to a synthetic non-zero d_ino.
+        let ino = file
+            .inode
+            .lookup(&name)
+            .map(|c| fs::inode_identity(&c))
+            .unwrap_or(self_ino);
+        full.push((name, kind, ino));
+    }
+
+    // Track read progress with `offset` (an index into `full`).
     let mut offset = file.offset.lock();
     let start_idx = *offset as usize;
-    if start_idx >= entries.len() {
+    if start_idx >= full.len() {
         return 0;
     }
 
     let mut out = alloc::vec::Vec::new();
     let mut idx = start_idx;
-    while idx < entries.len() {
-        let (name, kind) = &entries[idx];
+    while idx < full.len() {
+        let (name, kind, ino) = &full[idx];
         let name_bytes = name.as_bytes();
         let reclen = ((19 + name_bytes.len() + 1) + 7) & !7;
         if out.len() + reclen > len {
             break;
         }
-        let d_type = match kind {
-            FileType::Regular => 8u8,
-            FileType::Directory => 4u8,
-            FileType::CharDevice => 2u8,
-            FileType::BlockDevice => 6u8,
-            FileType::Pipe => 1u8,
-            FileType::Symlink => 10u8,
-        };
         let mut dent = alloc::vec![0u8; reclen];
-        dent[0..8].copy_from_slice(&(idx as u64 + 1).to_le_bytes());
+        // d_ino: real inode number.
+        dent[0..8].copy_from_slice(&ino.to_le_bytes());
+        // d_off: opaque cookie for the *next* entry; our reader resumes by index
+        // so the 1-based position of the following record is a valid cookie.
         dent[8..16].copy_from_slice(&((idx + 1) as i64).to_le_bytes());
+        // d_reclen.
         dent[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
-        dent[18] = d_type;
+        // d_type.
+        dent[18] = dirent_d_type(*kind);
         let name_end = 19 + name_bytes.len();
         dent[19..name_end].copy_from_slice(name_bytes);
         dent[name_end] = 0;
@@ -6867,6 +7040,8 @@ fn sys_getdents64(fd: i32, buf: usize, len: usize) -> isize {
     }
 
     if out.is_empty() {
+        // We didn't advance and there were entries to return, so the caller's
+        // buffer was too small for even one record: EINVAL (getdents02).
         return EINVAL;
     }
     if task.copy_out_bytes(buf, &out).is_none() {
@@ -7168,13 +7343,17 @@ fn sys_chdir(path: usize) -> isize {
     if inode.kind() != FileType::Directory {
         return -20; // ENOTDIR
     }
-    let new_cwd = if path_str.starts_with('/') {
+    // Build the absolute target, then canonicalize it so symlink components are
+    // resolved. POSIX chdir() resolves the path, so a later getcwd() must report
+    // the real directory, not the symlink we walked through (getcwd03).
+    let abs = if path_str.starts_with('/') {
         normalize_path(&path_str)
     } else {
         let task = current_task();
         let cur = task.cwd.lock().clone();
         normalize_path(&alloc::format!("{}/{}", cur, path_str))
     };
+    let new_cwd = canonicalize_path(&abs);
     *current_task().cwd.lock() = new_cwd;
     0
 }
@@ -7340,6 +7519,57 @@ fn normalize_path(p: &str) -> String {
             out.push('/');
         }
         out.push_str(part);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// Produce the canonical absolute path for `abs_path` by resolving every
+/// symlink component (the way the kernel resolves a path internally). This is
+/// what makes getcwd() return the real directory after `chdir()` through a
+/// symlink: chdir resolves the link, so the recorded cwd must too. `abs_path`
+/// must already be absolute; on any resolution failure we fall back to the
+/// plain textual normalization so chdir's own lookup remains the source of
+/// truth for whether the target exists.
+fn canonicalize_path(abs_path: &str) -> String {
+    let mut out = String::from("/");
+    let mut depth = 0usize;
+    for part in abs_path.split('/').filter(|s| !s.is_empty() && *s != ".") {
+        if part == ".." {
+            if let Some(idx) = out[..out.len().saturating_sub(1)].rfind('/') {
+                out.truncate(idx + 1);
+            }
+            continue;
+        }
+        let candidate = if out.ends_with('/') {
+            alloc::format!("{}{}", out, part)
+        } else {
+            alloc::format!("{}/{}", out, part)
+        };
+        // Resolve this component without following a final symlink so we can see
+        // whether it *is* a link and splice in its (canonical) target.
+        match fs::lookup_path_nofollow(fs::root(), &candidate) {
+            Ok(node) if node.kind() == FileType::Symlink && depth < 16 => {
+                depth += 1;
+                let target = match node.readlink() {
+                    Ok(t) => t,
+                    Err(_) => return normalize_path(abs_path),
+                };
+                let resolved = if target.starts_with('/') {
+                    canonicalize_path(&normalize_path(&target))
+                } else {
+                    // Relative to the directory holding the link (`out`).
+                    canonicalize_path(&normalize_path(&alloc::format!("{}/{}", out, target)))
+                };
+                out = resolved;
+            }
+            Ok(_) => {
+                out = candidate;
+            }
+            Err(_) => return normalize_path(abs_path),
+        }
     }
     if out.is_empty() {
         out.push('/');

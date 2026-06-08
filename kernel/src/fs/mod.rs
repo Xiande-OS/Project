@@ -244,6 +244,16 @@ pub trait Inode: Send + Sync + core::any::Any {
     fn list(&self) -> Result<Vec<(String, FileType)>> {
         Err(ENOTDIR)
     }
+    /// Mark this inode as removed from its parent (an unlink/rmdir whose target
+    /// is still held open by a file descriptor). Default: a no-op for fs types
+    /// that don't model dead dentries.
+    fn mark_removed(&self) {}
+    /// Whether this inode has been removed from the namespace while still open.
+    /// Used by getdents64 to report ENOENT on a dir fd whose directory was
+    /// rmdir'd, matching Linux's dead-dentry behavior.
+    fn is_removed(&self) -> bool {
+        false
+    }
     /// If this Inode is a symlink, return its target path.
     fn readlink(&self) -> Result<String> {
         Err(EINVAL)

@@ -82,6 +82,16 @@ pub struct VmArea {
     /// visible. LTP's tst_test framework passes results parent<->child
     /// through exactly such a region.
     pub shared: bool,
+    /// True for private anonymous memory (MAP_ANONYMOUS without a file backing,
+    /// plus the brk heap). False for file-backed mappings and kernel-provided
+    /// pages. madvise(2) uses this to honor Linux's rule that MADV_FREE and
+    /// MADV_WIPEONFORK apply only to private anonymous pages (EINVAL otherwise).
+    pub anon: bool,
+    /// MADV_WIPEONFORK was requested on this area: on fork() the child receives
+    /// freshly zeroed pages for this range instead of a copy of the parent's
+    /// contents. MADV_KEEPONFORK clears it again. Only ever set on private
+    /// anonymous areas (see `anon`).
+    pub wipe_on_fork: bool,
 }
 
 impl VmArea {
@@ -92,12 +102,26 @@ impl VmArea {
             perm,
             frames: BTreeMap::new(),
             shared: false,
+            anon: false,
+            wipe_on_fork: false,
         }
     }
 
     pub fn contains(&self, vpn: VirtPageNum) -> bool {
         vpn >= self.vpn_start && vpn < self.vpn_end
     }
+}
+
+/// Outcome of `MemorySet::madvise_anon_check` for an advice (MADV_FREE /
+/// MADV_WIPEONFORK) that Linux restricts to private anonymous memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MadviseRange {
+    /// Every covered page is private anonymous and the range is fully mapped.
+    Ok,
+    /// A mapped page in the range is not private anonymous → EINVAL.
+    WrongType,
+    /// The range is private-anon where mapped but has an unmapped hole → ENOMEM.
+    Hole,
 }
 
 /// Base address from which anonymous mmap (and file mmap) hands out
@@ -266,6 +290,141 @@ impl MemorySet {
             .map(|a| a.perm)
     }
 
+    /// Is every page in `[start_vpn, end_vpn)` covered by some VmArea? Used by
+    /// madvise(2)/msync(2) to return ENOMEM when a hole (or an address outside
+    /// the address space) falls inside the requested range. A PROT_NONE guard
+    /// page still counts as mapped — it lives in a VmArea — which matches Linux
+    /// (madvise on a PROT_NONE region is not ENOMEM).
+    pub fn range_fully_mapped(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        let mut vpn = start_vpn.0;
+        while vpn < end_vpn.0 {
+            let cur = VirtPageNum(vpn);
+            match self.areas.iter().find(|a| a.contains(cur)) {
+                // Skip to the end of the covering area so this is O(areas), not
+                // O(pages) — a multi-hundred-MiB range would otherwise be slow.
+                Some(a) => vpn = a.vpn_end.0,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Check `[start_vpn, end_vpn)` for MADV_FREE / MADV_WIPEONFORK, which Linux
+    /// allows only on private anonymous memory. This reproduces the precedence
+    /// of Linux's `madvise_walk_vmas`: it scans VMAs left-to-right and returns
+    /// EINVAL the moment it visits a non-(private-anon) area, *before* it would
+    /// report a later hole as ENOMEM. So a range that starts in a too-short
+    /// MAP_SHARED anonymous mapping (madvise02's shared_anon, where the madvise
+    /// length runs past the one mapped page) yields EINVAL, not ENOMEM — the
+    /// wrong-type area at the start wins over the trailing gap.
+    pub fn madvise_anon_check(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> MadviseRange {
+        let mut vpn = start_vpn.0;
+        let mut saw_hole = false;
+        while vpn < end_vpn.0 {
+            let cur = VirtPageNum(vpn);
+            match self.areas.iter().find(|a| a.contains(cur)) {
+                Some(a) => {
+                    // A mapped area that is not private anonymous → EINVAL now,
+                    // exactly as the per-VMA behaviour check would fire.
+                    if !(a.anon && !a.shared) {
+                        return MadviseRange::WrongType;
+                    }
+                    vpn = a.vpn_end.0;
+                }
+                // Unmapped page: remember it as a candidate ENOMEM but keep
+                // scanning — a wrong-type area later still takes precedence.
+                // Jump straight to the next area that starts beyond here (or to
+                // the end of the range) so a large hole stays O(areas).
+                None => {
+                    saw_hole = true;
+                    let next = self
+                        .areas
+                        .iter()
+                        .map(|a| a.vpn_start.0)
+                        .filter(|&s| s > vpn)
+                        .min()
+                        .unwrap_or(end_vpn.0);
+                    vpn = next;
+                }
+            }
+        }
+        if saw_hole {
+            MadviseRange::Hole
+        } else {
+            MadviseRange::Ok
+        }
+    }
+
+    /// Set (or clear) the MADV_WIPEONFORK flag on every page in `[va, va+len)`,
+    /// splitting VmAreas at the range boundaries so the flag applies exactly to
+    /// the requested span. Mirrors `protect_range`'s split logic but only flips
+    /// the per-area `wipe_on_fork` bit (no PTE rewrite). The caller has already
+    /// validated that the whole range is private anonymous.
+    pub fn set_wipe_on_fork(&mut self, va: VirtAddr, len: usize, wipe: bool) {
+        let start = va.0 & !(PAGE_SIZE - 1);
+        let end = (va.0 + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let start_vpn = VirtPageNum(start / PAGE_SIZE);
+        let end_vpn = VirtPageNum(end / PAGE_SIZE);
+
+        let mut new_areas: Vec<VmArea> = Vec::new();
+        for area in core::mem::take(&mut self.areas) {
+            // No overlap → keep verbatim.
+            if area.vpn_end <= start_vpn || area.vpn_start >= end_vpn {
+                new_areas.push(area);
+                continue;
+            }
+
+            let a_start = area.vpn_start;
+            let a_end = area.vpn_end;
+            let perm = area.perm;
+            let a_shared = area.shared;
+            let a_anon = area.anon;
+            let a_wipe = area.wipe_on_fork;
+            let mut frames = area.frames;
+
+            let cut_start = core::cmp::max(a_start, start_vpn);
+            let cut_end = core::cmp::min(a_end, end_vpn);
+
+            // Head outside the range — keep its old flag.
+            if a_start < cut_start {
+                let head_frames = split_off_le(&mut frames, cut_start);
+                new_areas.push(VmArea {
+                    vpn_start: a_start,
+                    vpn_end: cut_start,
+                    perm,
+                    shared: a_shared,
+                    anon: a_anon,
+                    wipe_on_fork: a_wipe,
+                    frames: head_frames,
+                });
+            }
+            // Middle inside the range — set the new flag.
+            let mid_frames = split_off_le(&mut frames, cut_end);
+            new_areas.push(VmArea {
+                vpn_start: cut_start,
+                vpn_end: cut_end,
+                perm,
+                shared: a_shared,
+                anon: a_anon,
+                wipe_on_fork: wipe,
+                frames: mid_frames,
+            });
+            // Tail outside the range — keep its old flag.
+            if cut_end < a_end {
+                new_areas.push(VmArea {
+                    vpn_start: cut_end,
+                    vpn_end: a_end,
+                    perm,
+                    shared: a_shared,
+                    anon: a_anon,
+                    wipe_on_fork: a_wipe,
+                    frames,
+                });
+            }
+        }
+        self.areas = new_areas;
+    }
+
     /// Real munmap: unmap every page in `[va, va+len)`. If a VmArea is
     /// fully covered, drop it (and all its frames). If partially covered,
     /// shrink or split it. PTEs in the range are cleared and the local TLB
@@ -288,6 +447,8 @@ impl MemorySet {
             let a_end = area.vpn_end;
             let perm = area.perm;
             let a_shared = area.shared;
+            let a_anon = area.anon;
+            let a_wipe = area.wipe_on_fork;
             let mut frames = area.frames;
 
             // Compute overlap.
@@ -311,6 +472,8 @@ impl MemorySet {
                     vpn_end: cut_start,
                     perm,
                     shared: a_shared,
+                    anon: a_anon,
+                    wipe_on_fork: a_wipe,
                     frames: head_frames,
                 });
             }
@@ -321,6 +484,8 @@ impl MemorySet {
                     vpn_end: a_end,
                     perm,
                     shared: a_shared,
+                    anon: a_anon,
+                    wipe_on_fork: a_wipe,
                     frames,
                 });
             }
@@ -351,6 +516,8 @@ impl MemorySet {
             let a_end = area.vpn_end;
             let a_perm = area.perm;
             let a_shared = area.shared;
+            let a_anon = area.anon;
+            let a_wipe = area.wipe_on_fork;
             let mut frames = area.frames;
 
             let cut_start = core::cmp::max(a_start, start_vpn);
@@ -364,6 +531,8 @@ impl MemorySet {
                     vpn_end: cut_start,
                     perm: a_perm,
                     shared: a_shared,
+                    anon: a_anon,
+                    wipe_on_fork: a_wipe,
                     frames: head_frames,
                 });
             }
@@ -399,6 +568,8 @@ impl MemorySet {
                 vpn_end: cut_end,
                 perm,
                 shared: a_shared,
+                anon: a_anon,
+                wipe_on_fork: a_wipe,
                 frames: mid_frames,
             });
             // Tail with old perm.
@@ -408,6 +579,8 @@ impl MemorySet {
                     vpn_end: a_end,
                     perm: a_perm,
                     shared: a_shared,
+                    anon: a_anon,
+                    wipe_on_fork: a_wipe,
                     frames,
                 });
             }
@@ -439,9 +612,20 @@ impl MemorySet {
             // segment (~260 pages) is no longer copied on every fork. The
             // common shell pattern fork()+execve() then drops the shared
             // refs at exec teardown, so nothing is pinned.
-            let share = area.shared || !area.perm.contains(VmPerm::W);
+            // MADV_WIPEONFORK: the child must see this private-anonymous range
+            // as freshly zeroed rather than a copy of the parent (Linux zaps
+            // the child's pages at fork). The setting itself is inherited, so a
+            // grand-child forked from this child is wiped too.
+            let wipe = area.wipe_on_fork;
+            let share = !wipe && (area.shared || !area.perm.contains(VmPerm::W));
             for (&vpn, frame) in &area.frames {
-                if share {
+                if wipe {
+                    // Hand the child a zeroed frame instead of the parent's
+                    // contents. alloc_frame() returns a zero-filled page.
+                    let new_frame = alloc_frame()?; // None -> ENOMEM
+                    new_ms.page_table.map(vpn, new_frame.ppn, pte_flags);
+                    new_frames.insert(vpn, Arc::new(new_frame));
+                } else if share {
                     // MAP_SHARED anon (mutually-visible writes) OR a
                     // read-only page: map the same frame in the child.
                     new_ms.page_table.map(vpn, frame.ppn, pte_flags);
@@ -464,6 +648,8 @@ impl MemorySet {
                 vpn_end: area.vpn_end,
                 perm: area.perm,
                 shared: area.shared,
+                anon: area.anon,
+                wipe_on_fork: area.wipe_on_fork,
                 frames: new_frames,
             });
         }
@@ -666,7 +852,8 @@ impl MemorySet {
             area.vpn_end = new_top_vpn;
         } else {
             // Create a new heap area.
-            let area = VmArea::new(self.brk_base, new_brk, heap_perm);
+            let mut area = VmArea::new(self.brk_base, new_brk, heap_perm);
+            area.anon = true; // the program break heap is private anonymous memory
             if self.push_user_area(area, None).is_err() {
                 // OOM — leave brk where it was.
                 return self.brk_cur;
@@ -699,6 +886,11 @@ impl MemorySet {
         let end = start + aligned;
         let mut area = VmArea::new(VirtAddr(start), VirtAddr(end), perm);
         area.shared = shared;
+        // A mapping with no file-backed initialiser is anonymous memory (a
+        // plain MAP_ANONYMOUS mmap, or the brk heap which calls in with
+        // init=None). File mmaps pass the file contents as `init`. madvise(2)
+        // restricts MADV_FREE/MADV_WIPEONFORK to private anonymous pages.
+        area.anon = init.is_none();
         if self.push_user_area(area, init).is_err() {
             // OOM — return the conventional MAP_FAILED sentinel. The
             // mmap syscall translates this to -ENOMEM. Don't advance
