@@ -803,6 +803,34 @@ pub fn reclaim_dead_tasks() -> usize {
                         reap(pid);
                         freed += 1;
                     }
+                    // Ready/Running leftover of a *finished* session. The contest
+                    // launches each case as `setsid timeout -s KILL N ./case`, so
+                    // every per-case session leader is the `timeout` wrapper. When
+                    // it exits, kill_session SIGKILLs the members it can see — but
+                    // a member that was mid-fork in that window (the child is born
+                    // just after kill_session snapshots the session) never receives
+                    // the kill, gets reparented to init, and keeps *running*
+                    // (fork/exec-loop cases spin a fresh child forever). Nothing
+                    // re-targets it: kill_session is one-shot at leader exit, and
+                    // the zombie/parked reclaim arms above skip Ready/Running. So
+                    // it executes for the rest of the run, pinning its whole
+                    // address space AND blocking reclaim of its own zombie children
+                    // (a zombie whose parent is this still-"live" task is never
+                    // reapable). This was the dominant cumulative leak that
+                    // OOM-powers-off the full sweep mid-run (~case 1100+). A
+                    // session whose leader is gone (sid not live, sid > 1) is
+                    // finished by definition — nothing there is legitimate work —
+                    // so force it down exactly like the Waiting arm. The sid > 1
+                    // guard keeps the init session (init + the never-setsid'd
+                    // driver shells, where the runner legitimately runs) untouched;
+                    // a live case's own session leader is still in the table, so
+                    // session_dead is false and its real fork-storm is never hit.
+                    TaskState::Ready | TaskState::Running if session_dead => {
+                        crate::signal::kill_now(&task);
+                        drop(task);
+                        reap(pid);
+                        freed += 1;
+                    }
                     _ => {}
                 }
             }

@@ -7817,6 +7817,20 @@ fn exit_one_thread(task: &alloc::sync::Arc<crate::task::Task>, status: i32, grou
         let my_sid = task.sid.load(core::sync::atomic::Ordering::Relaxed);
         if my_sid == task.pid {
             crate::task::kill_session(my_sid, task.pid);
+            // A per-case session just finished. Sweep up any leftovers from
+            // EARLIER finished sessions now — kill_session is one-shot, so a
+            // member that was mid-fork when its own leader exited (and was thus
+            // never killed, then reparented to init and left running/zombied)
+            // would otherwise survive for the rest of the run. Those leftovers
+            // are the cumulative leak that OOM-powers-off the full LTP sweep
+            // mid-run. reclaim_dead_tasks only touches finished sessions (leader
+            // gone, sid > 1) and init-orphaned zombies, so it never disturbs the
+            // live case or the init-session driver shells. Running it on each
+            // case boundary keeps the dead-task backlog from ever building,
+            // instead of waiting for memory to get tight (by which point the
+            // steady-state working set never reaches the old size-gated sweep's
+            // 128-task threshold, so it never fired and the leak ran unbounded).
+            crate::task::reclaim_dead_tasks();
         }
         let ppid = task.ppid.load(core::sync::atomic::Ordering::Relaxed);
         if let Some(parent) = crate::task::task_by_pid(ppid) {
