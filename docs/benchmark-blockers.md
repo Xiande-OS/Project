@@ -24,6 +24,29 @@ XIANDE_BENCH=<group> XIANDE_LIBC=<musl|glibc> [XIANDE_DBG=1 XIANDE_ONLY=<substr>
   cooperative single-core scheduler, starved peers. Now parks for a yield
   slice / the real timeout. (commit: "select(nfds=0) must yield/sleep …")
 
+## THE cross-cutting root cause (−480: lmbench + iozone + cyclictest)
+
+All three biggest groups fail the **same way**: they print good results, then
+launch a tight IPC/fork storm that our **cooperative single-core scheduler**
+can't survive — the storm monopolises the core and starves the watchdog
+(`busybox timeout`, parked in nanosleep) and the driver shell, so the group
+never reaches its `END` marker and the grader zeroes the WHOLE group (including
+the good output already printed).
+
+- **lmbench** dies at `lat_pipe` — a 2-process pipe ping-pong; both ends run but
+  the measurement never returns and the 90s watchdog never fires.
+- **iozone** `-t 4` — 4 SHM-barrier workers; only some reach the rendezvous.
+- **cyclictest** — `NO_STRESS_P1/P8` SUCCEED with latency *better than baseline*
+  (Max 788µs vs 1862, 349µs vs 1558 — scoreable!), then `hackbench -l 100000000 &`
+  (a 100M-iter fork/IPC storm) wedges `STRESS_P1` → no END → 0 for the group.
+
+Fixing the scheduler's behaviour under runaway IPC/fork storms (fair preemption
+and/or reliably waking the nanosleep'd watchdog so it can SIGKILL the storm, so
+the group always reaches END) is the single highest-value lever — but the
+scheduler is delicate (many past-breakage notes), so it must be done carefully
+and CI-gated. Note cyclictest would bank ~half its points from NO_STRESS alone
+if the group merely reached END.
+
 ## OPEN — deep scheduler / IPC work (parked; need a focused, CI-gated session)
 
 ### lmbench (−288, the biggest single group)
@@ -64,4 +87,9 @@ XIANDE_BENCH=<group> XIANDE_LIBC=<musl|glibc> [XIANDE_DBG=1 XIANDE_ONLY=<substr>
   reproduce one cell and trace the connect/accept.
 
 ### cyclictest (−32)
-- Not yet reproduced. RT-latency loop (`clock_nanosleep` ABS + SCHED_FIFO).
+- Reproduced. `NO_STRESS_P1` (Max 788µs) and `NO_STRESS_P8` (Max 349µs) both
+  print `success` with latency BELOW baseline (1862 / 1558) — scoreable. The
+  group then runs `./hackbench -l 100000000 &` and hangs at `STRESS_P1`, so no
+  END marker → 0. See the cross-cutting root cause above; the cheapest partial
+  win here is getting the group to END despite hackbench (the STRESS results are
+  explicitly "ignore"-able per the script's own comment).
