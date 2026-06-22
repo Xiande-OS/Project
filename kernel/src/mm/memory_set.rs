@@ -697,6 +697,22 @@ impl MemorySet {
         }
     }
 
+    /// A new thread is being created with `stack_top` as its stack. Cancel any
+    /// deferred reclaim previously queued for that same address: glibc's NPTL
+    /// caches an exited thread's stack and REUSES the identical address for the
+    /// next pthread_create (musl does too). Without this, the stale queue entry
+    /// from the prior thread's exit would let `drain_stack_reclaim` unmap a
+    /// stack that is now live again — the new thread then faults (SIGSEGV) the
+    /// instant it touches its stack. This is exactly what zeroed the glibc
+    /// libcbench pthread_create / pthread_createjoin sub-benchmarks. Reclaim
+    /// still frees genuinely-abandoned stacks (distinct, never-reused addresses
+    /// that are never cancelled here).
+    pub fn cancel_stack_reclaim(&mut self, stack_top: usize) {
+        if stack_top != 0 {
+            self.pending_stack_reclaim.retain(|&s| s != stack_top);
+        }
+    }
+
     /// Number of most-recently-queued exited-thread stacks we never reclaim.
     /// Must exceed the largest number of threads that can be exited-but-not-
     /// yet-joined at once for any well-behaved workload, so we never unmap a

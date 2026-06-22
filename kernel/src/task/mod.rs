@@ -1637,6 +1637,18 @@ pub fn clone_current(
     // sret's to the TrapFrame just written (the child returns 0 from fork).
     task.init_kctx_for_first_run();
 
+    // If this new pthread reuses a stack address that a prior exited thread
+    // left queued for deferred reclaim (glibc/musl cache and reuse thread
+    // stacks), cancel that stale reclaim so drain_stack_reclaim can never unmap
+    // this now-live stack out from under it. Same guard as thread_stack_top.
+    if flags & CLONE_VM != 0
+        && flags & CLONE_THREAD != 0
+        && flags & CLONE_VFORK == 0
+        && child_sp != 0
+    {
+        task.memory_set.lock().cancel_stack_reclaim(child_sp);
+    }
+
     // A fork starts a new thread group and so needs its own copy of the
     // parent's credentials; thread members share the parent's tgid (and thus
     // its creds) already.
