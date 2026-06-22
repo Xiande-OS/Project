@@ -461,6 +461,50 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
         s.push_str("echo '#### OS COMP TEST GROUP END basic ####'\n");
         return s;
     }
+    // single_bench harness (local dev only): run exactly ONE benchmark group for
+    // ONE libc variant so a benchmark fix can be validated without a full run.
+    // All three knobs are compile-time (option_env!), like the single_ltp harness.
+    #[cfg(feature = "single_bench")]
+    {
+        let want = option_env!("XIANDE_BENCH").unwrap_or("iozone");
+        let libc = option_env!("XIANDE_LIBC").unwrap_or("musl");
+        let to = option_env!("XIANDE_TO").unwrap_or("180");
+        let sel = variants
+            .iter()
+            .find(|(d, _)| d.rsplit('/').next() == Some(libc))
+            .or_else(|| variants.first());
+        if let Some((dir, _)) = sel {
+            let v = dir.rsplit('/').next().unwrap_or("musl");
+            s.push_str(&alloc::format!("cd {}\n", dir));
+            s.push_str(&alloc::format!(
+                "export LD_LIBRARY_PATH={d}/lib:/lib:/lib64\n",
+                d = dir
+            ));
+            s.push_str(&alloc::format!(
+                "./busybox echo '#### OS COMP TEST GROUP START {want}-{v} ####'\n"
+            ));
+            // Debug mode: rewrite the on-disk testcode so each command is
+            // preceded by a `>>> N` marker and wrapped in a short per-command
+            // timeout — pinpoints exactly which line hangs (the group still
+            // reaches END). Triggered by XIANDE_DBG=1.
+            if option_env!("XIANDE_DBG").is_some() {
+                s.push_str(&alloc::format!(
+                    "n=0; ./busybox grep -vE '^#|^$' ./{want}_testcode.sh | while IFS= read -r line; do \
+                       n=$((n+1)); ./busybox echo \">>> CMD $n: $line\"; \
+                       ./busybox timeout -s KILL 8 ./busybox sh -c \"$line\"; \
+                       ./busybox echo \"<<< CMD $n rc=$?\"; done\n"
+                ));
+            } else {
+                s.push_str(&alloc::format!(
+                    "./busybox timeout -s KILL {to} ./busybox sh ./{want}_testcode.sh\n"
+                ));
+            }
+            s.push_str(&alloc::format!(
+                "./busybox echo '#### OS COMP TEST GROUP END {want}-{v} ####'\n"
+            ));
+        }
+        return s;
+    }
     // Two phases over the variants. Phase 0 emits every NON-benchmark group
     // (basic/lua/busybox/ltp/libctest/iperf/netperf/libcbench/iozone) for
     // BOTH libc variants; phase 1 then emits the fork-storm benchmarks

@@ -37,6 +37,12 @@ diag_full_ltp = []
 # fix against one target test without a full run.
 # e.g. XIANDE_TESTS="fanotify10" cargo build --features single_ltp
 single_ltp = []
+# Single-benchmark harness (local dev only): run exactly ONE non-LTP group for
+# ONE libc, so a benchmark fix (iozone/lmbench/cyclictest/iperf/netperf/
+# libcbench) can be validated without a full run. XIANDE_BENCH names the group,
+# XIANDE_LIBC the variant (musl/glibc), XIANDE_TO the wall budget.
+# e.g. XIANDE_BENCH="iozone" XIANDE_LIBC="musl" cargo build --features single_bench
+single_bench = []
 bare_hello = []
 musl_hello = []
 rust_git = []
