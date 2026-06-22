@@ -488,10 +488,13 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
             // timeout — pinpoints exactly which line hangs (the group still
             // reaches END). Triggered by XIANDE_DBG=1.
             if option_env!("XIANDE_DBG").is_some() {
+                // XIANDE_ONLY: substring filter to run just the matching lines
+                // (e.g. "lat_select") — pairs with SYSTRACE=1 to trace one cmd.
+                let only = option_env!("XIANDE_ONLY").unwrap_or(".");
                 s.push_str(&alloc::format!(
-                    "n=0; ./busybox grep -vE '^#|^$' ./{want}_testcode.sh | while IFS= read -r line; do \
+                    "n=0; ./busybox grep -vE '^#|^$' ./{want}_testcode.sh | ./busybox grep -E '{only}' | while IFS= read -r line; do \
                        n=$((n+1)); ./busybox echo \">>> CMD $n: $line\"; \
-                       ./busybox timeout -s KILL 8 ./busybox sh -c \"$line\"; \
+                       ./busybox timeout -s KILL 12 ./busybox sh -c \"$line\"; \
                        ./busybox echo \"<<< CMD $n rc=$?\"; done\n"
                 ));
             } else {
