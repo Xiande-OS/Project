@@ -591,6 +591,16 @@ pub fn kill_session(sid: i32, except_pid: i32) {
             .cloned()
             .collect()
     };
+    // Daemon vs fork-storm. A daemon (iperf3 -s -D, netserver -D) double-forks,
+    // so its transient session leader exits as NORMAL daemon() behaviour, leaving
+    // the real server alone in the session. SIGKILLing the whole session on that
+    // exit then kills the server before it can bind/listen — every network
+    // benchmark (iperf/netperf) scored 0. A fork/memory bomb instead leaves MANY
+    // leftover members. Only tear down a crowd; spare a lone (≤2) session so
+    // daemons survive. A small genuine leak is bounded by the OOM killer.
+    if members.len() <= 2 {
+        return;
+    }
     for m in members {
         // Posting SIGKILL (raise_signal) wakes the member but doesn't guarantee
         // it dies: a member re-entering a futex/fd wait re-blocks before acting
@@ -768,6 +778,12 @@ pub fn reclaim_dead_tasks() -> usize {
                 .collect();
             (rows, live)
         };
+        // Members per session, for the daemon-vs-fork-storm heuristic below.
+        let mut sid_counts: alloc::collections::BTreeMap<i32, usize> =
+            alloc::collections::BTreeMap::new();
+        for (_, _, sid) in &rows {
+            *sid_counts.entry(*sid).or_insert(0) += 1;
+        }
         let mut freed = 0usize;
         for (pid, ppid, sid) in rows {
             if pid == INIT_PID || pid == cur {
@@ -782,6 +798,13 @@ pub fn reclaim_dead_tasks() -> usize {
             // OOM-poweroffs the run mid-catch-all. Treat such a dead session as
             // grounds to reclaim the member regardless of parent.
             let session_dead = sid > 1 && !live.contains(&sid);
+            // Only force down LIVE members of a *crowded* dead session (a
+            // fork-storm). A lone member is a daemon (iperf3 -s -D / netserver -D)
+            // whose double-fork left it alone after its transient leader exited —
+            // killing it breaks every network benchmark. Zombies are still reaped
+            // regardless (session_dead, below). Small leaks are bounded by OOM.
+            let session_is_storm =
+                session_dead && sid_counts.get(&sid).copied().unwrap_or(0) > 2;
             if let Some(task) = task_by_pid(pid) {
                 let st = *task.state.lock();
                 match st {
@@ -797,7 +820,7 @@ pub fn reclaim_dead_tasks() -> usize {
                     // runner loop waits in wait4 there, and killing it aborts
                     // the whole ltp sweep (the "loop Killed at case N" that caps
                     // the LA cells). Mirrors kill_session/reap_orphan_zombies.
-                    TaskState::Waiting if (parent_dead || session_dead) && sid > 1 => {
+                    TaskState::Waiting if (parent_dead || session_is_storm) && sid > 1 => {
                         crate::signal::kill_now(&task);
                         drop(task);
                         reap(pid);
@@ -825,7 +848,7 @@ pub fn reclaim_dead_tasks() -> usize {
                     // driver shells, where the runner legitimately runs) untouched;
                     // a live case's own session leader is still in the table, so
                     // session_dead is false and its real fork-storm is never hit.
-                    TaskState::Ready | TaskState::Running if session_dead => {
+                    TaskState::Ready | TaskState::Running if session_is_storm => {
                         crate::signal::kill_now(&task);
                         drop(task);
                         reap(pid);
