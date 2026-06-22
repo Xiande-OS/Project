@@ -28,3 +28,8 @@ ksyms-*.bin
 kernel-la-single
 /kernel-rv-bench
 /kernel-la-bench
+# any suffixed kernel build output (single_bench/debug/contest local copies,
+# e.g. kernel-rv-cyc, kernel-la-new, kernel-la-pc) — never committed; built
+# fresh from cargo + `cp target/.../kernel kernel-<arch>...`.
+/kernel-rv-*
+/kernel-la-*
