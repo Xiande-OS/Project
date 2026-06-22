@@ -847,6 +847,100 @@ pub fn reclaim_dead_tasks() -> usize {
 /// powers off after a sustained, unrecoverable allocation-failure storm. Called
 /// from the allocation-failure path (heap/frame). The proactive throttle calls
 /// `reclaim_dead_tasks` directly instead, so reaping while still above the hard
+/// OOM killer. When allocations keep failing, free memory by terminating the
+/// single largest-RSS *live* user process — Linux's strategy — instead of
+/// powering off the whole machine. One memory hog (e.g. libc-bench's 64 MB
+/// `b_malloc_big`, or a leaked fork-storm worker) dies and scores what it
+/// banked, and the run continues to the next case/group rather than a poweroff
+/// zeroing everything after it.
+///
+/// Guards mirror `reclaim_dead_tasks`: never pid 1, never the init session
+/// (`sid <= 1` — init plus the never-`setsid`'d runner shells whose wait4 loop
+/// drives the sweep; killing them aborts the whole run). The current task is the
+/// likely allocator, so it's a candidate too — but only via a *pending* SIGKILL
+/// (delivered on syscall return), never an immediate free, so we don't pull the
+/// active address space out from under ourselves. Returns true if it picked a
+/// victim (caller treats that as recovery and restarts the OOM window).
+pub fn oom_kill_largest(cur: i32) -> bool {
+    const INIT_PID: i32 = 1;
+    let rows: alloc::vec::Vec<(i32, i32)> = {
+        let t = TABLE.lock();
+        t.tasks
+            .values()
+            .map(|task| (task.pid, task.sid.load(Ordering::Relaxed)))
+            .collect()
+    };
+    // Largest-RSS killable victim (Linux-style badness ~ resident size),
+    // including the current task — it is usually the requester that can't get
+    // memory, so it must be a candidate.
+    let mut best: Option<(i32, usize)> = None;
+    for (pid, sid) in &rows {
+        let (pid, sid) = (*pid, *sid);
+        if pid == INIT_PID || sid <= 1 {
+            continue;
+        }
+        if let Some(task) = task_by_pid(pid) {
+            if matches!(*task.state.lock(), TaskState::Zombie) {
+                continue;
+            }
+            // try_lock: never block the failing-allocation path on a memory_set
+            // some other context holds (e.g. the current task's, if we were
+            // called from its page-fault handler). Such a skipped current task
+            // still gets sacrificed by the fallback below.
+            if let Some(ms) = task.memory_set.try_lock() {
+                let rss: usize = ms.areas.iter().map(|a| a.frames.len()).sum();
+                drop(ms);
+                if best.map_or(true, |(_, r)| rss > r) {
+                    best = Some((pid, rss));
+                }
+            }
+        }
+    }
+    if let Some((pid, rss)) = best {
+        if pid == cur {
+            // The current task is the largest hog. We can't free its active
+            // address space from under ourselves, so queue a pending SIGKILL:
+            // its failing alloc returns ENOMEM, then it dies on syscall return,
+            // freeing its memory then.
+            if let Some(task) = task_by_pid(cur) {
+                crate::println!(
+                    "[oom] SIGKILL current pid={} (~{} MB, largest) — dies on return, run continues",
+                    cur,
+                    rss / 256
+                );
+                crate::signal::raise_signal(&task, crate::signal::SIGKILL);
+                return true;
+            }
+        } else if let Some(task) = task_by_pid(pid) {
+            crate::println!(
+                "[oom] killing pid={} (~{} MB resident) to free memory — run continues",
+                pid,
+                rss / 256
+            );
+            crate::signal::kill_now(&task);
+            drop(task);
+            reap(pid);
+            return true;
+        }
+    }
+    // Fallback: the only hog was the current task but its memory_set was locked
+    // (we were called from its own fault/mmap path), so it never entered the
+    // scan. Sacrifice it via a pending SIGKILL if it's a real per-case process.
+    if cur > INIT_PID {
+        if let Some(task) = task_by_pid(cur) {
+            if task.sid.load(Ordering::Relaxed) > 1 {
+                crate::println!(
+                    "[oom] no spare victim — SIGKILL current pid={} (the allocator) so the run continues",
+                    cur
+                );
+                crate::signal::raise_signal(&task, crate::signal::SIGKILL);
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// floor can never trip this detector.
 pub fn emergency_reclaim() -> usize {
     let total = reclaim_dead_tasks();
@@ -874,12 +968,25 @@ pub fn emergency_reclaim() -> usize {
         let start = OOM_STREAK_START.load(Ordering::Relaxed);
         if start == 0 {
             OOM_STREAK_START.store(now, Ordering::Relaxed);
-        } else if now.wrapping_sub(start) > 45 * crate::arch::TICKS_PER_SEC {
-            crate::println!(
-                "[oom] allocations have failed continuously for >45s — powering \
-                 off cleanly so the run still scores what it banked"
-            );
-            crate::arch::shutdown();
+        } else if now.wrapping_sub(start) > 8 * crate::arch::TICKS_PER_SEC {
+            // Sustained failure with no recovery gap: do NOT power off. Sacrifice
+            // the largest memory hog (Linux-style OOM kill) so the offending
+            // program dies and the run continues to the next case/group, instead
+            // of a poweroff zeroing every group after this point.
+            if oom_kill_largest(current_pid()) {
+                // Freed memory — restart the pressure window (at most one kill
+                // per ~8s of sustained failure).
+                OOM_STREAK_START.store(now, Ordering::Relaxed);
+            } else if now.wrapping_sub(start) > 45 * crate::arch::TICKS_PER_SEC {
+                // Nothing left to kill (only init + the runner shells) and
+                // allocations still failing: a genuine terminal wedge. Power off
+                // cleanly so the run still scores everything banked so far.
+                crate::println!(
+                    "[oom] no killable victim and allocations failing >45s — \
+                     powering off cleanly so the run still scores what it banked"
+                );
+                crate::arch::shutdown();
+            }
         }
     }
     total
