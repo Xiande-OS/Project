@@ -491,10 +491,11 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 // XIANDE_ONLY: substring filter to run just the matching lines
                 // (e.g. "lat_select") — pairs with SYSTRACE=1 to trace one cmd.
                 let only = option_env!("XIANDE_ONLY").unwrap_or(".");
+                let cmdto = option_env!("XIANDE_CMDTO").unwrap_or("12");
                 s.push_str(&alloc::format!(
                     "n=0; ./busybox grep -vE '^#|^$' ./{want}_testcode.sh | ./busybox grep -E '{only}' | while IFS= read -r line; do \
                        n=$((n+1)); ./busybox echo \">>> CMD $n: $line\"; \
-                       ./busybox timeout -s KILL 12 ./busybox sh -c \"$line\"; \
+                       ./busybox timeout -s KILL {cmdto} ./busybox sh -c \"$line\"; \
                        ./busybox echo \"<<< CMD $n rc=$?\"; done\n"
                 ));
             } else {
