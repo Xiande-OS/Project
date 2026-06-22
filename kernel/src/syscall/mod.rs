@@ -281,17 +281,16 @@ pub fn dispatch(tf: &mut TrapFrame) {
         nr::SYS_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(a0, a1, a2),
         nr::SYS_RT_SIGSUSPEND => sys_rt_sigsuspend(a0, a1),
         nr::SYS_SYSINFO => sys_sysinfo(a0),
-        // SysV shared memory: the real implementation (sysv_ipc::sys_shm*)
-        // passes the LTP shm* family, but iozone's throughput mode
-        // (`iozone -t N`, N>=2) uses shmget/shmat to share buffers across
-        // forked workers, and our segments crash when a *second* forked child
-        // accesses the inherited attach — which killed the whole iozone suite
-        // (×4 variants) and, on LoongArch, took down the run before it reached
-        // the glibc groups. Until that multi-child path is fixed, fall back to
-        // the old stub: returning -1 makes iozone (and netperf/libcbench) use
-        // their non-SysV-shmem code path, which works. Net: we trade ~15
-        // low-value shm* LTP sub-cases for the iozone suite + the LA glibc
-        // column. MSG/SEM (sysv_ipc too) are unaffected and stay enabled.
+        // SysV shared memory: kept stubbed to -1. fork() now correctly SHARES
+        // shmat'd frames into children (MemorySet::fork maps the same frames via
+        // Arc::clone for `shared` areas), and the pselect6 busy-spin that
+        // starved iozone's workers is fixed below — but iozone's `-t N`
+        // throughput barrier STILL doesn't complete with SHM enabled (not all 4
+        // forked workers reach the rendezvous; deeper multi-worker sync issue),
+        // so it hangs instead of cleanly falling back. A hang is worse than the
+        // stub (which makes iozone use its non-SysV path and reach END at 0), so
+        // SHM stays off until the barrier rendezvous is fully fixed. The real
+        // sys_shm* impl stays in the tree (sysv_ipc, pub) for that future fix.
         nr::SYS_SHMGET => -1,
         nr::SYS_SHMCTL => -1,
         nr::SYS_SHMAT => -1,
@@ -5049,9 +5048,15 @@ fn sys_pselect6(
     if (nfds as isize) < 0 {
         return EINVAL;
     }
-    if nfds == 0 {
-        return 0;
-    }
+    // NOTE: nfds==0 is NOT short-circuited to 0 here anymore. select(0, NULL,
+    // NULL, NULL, &timeout) is the portable sub-second sleep idiom, and iozone's
+    // `-t N` throughput barrier spins on exactly that to pace its poll of the
+    // shared arrival counter. Returning 0 immediately turned that pace-sleep
+    // into a 100%-CPU busy-loop which, on a single core, starved the very peer
+    // workers it was waiting for — the barrier never completed and the whole
+    // iozone throughput suite hung (zeroing it). Falling through lets the
+    // finite-timeout block path below actually consume the timeout (yielding the
+    // CPU so peers run), which is also what LTP's pselect timeout cases expect.
     // Clamp nfds the way Linux clamps to the fd-table size: a bogus huge nfds
     // (fuzzers pass 2^30) would otherwise make the fd_set byte length —
     // (nfds+7)/8 — hundreds of MB and panic the kernel allocator. Clamping
@@ -5087,6 +5092,36 @@ fn sys_pselect6(
     } else {
         (false, None)
     };
+    // Empty fd set: select(0, NULL, NULL, NULL, timeout) is the portable
+    // sleep/yield idiom — iozone's `-t N` throughput barrier spins on exactly
+    // this to pace its poll of the shared arrival counter. Our scheduler is
+    // cooperative (a Running task that returns from a syscall keeps running),
+    // so returning 0 immediately let the early-arriving workers monopolize the
+    // single core and STARVE the very peers they were waiting on — the barrier
+    // never completed and the whole iozone throughput suite hung (scored 0).
+    // Park briefly instead so peers run, then return 0: a finite timeout sleeps
+    // its real duration; a zero/NULL timeout yields a short slice. The per-task
+    // sleeper deadline doubles as the "already yielded" flag, so the rewound
+    // re-run returns 0 once it matures.
+    if nfds == 0 {
+        let now = crate::arch::now_ticks();
+        if let Some(d) = crate::task::sleeper_deadline(task.pid) {
+            if now >= d {
+                crate::task::forget_sleeper(task.pid);
+                return 0;
+            }
+        } else {
+            const YIELD_SLICE_TICKS: u64 = 2000; // ~200us at the 10 MHz mtime
+            let slice = timeout_ticks.unwrap_or(YIELD_SLICE_TICKS).max(1);
+            crate::task::sleep_until(task.pid, now.saturating_add(slice));
+        }
+        *task.state.lock() = crate::task::TaskState::Waiting;
+        unsafe {
+            let tf = task.tf_ptr();
+            (*tf).rewind_syscall();
+        }
+        return -11; // EAGAIN: re-run after the yield slice; returns 0 when due.
+    }
     let bytes = (nfds + 7) / 8;
     // select03: a non-NULL fd_set pointer that can't be read is EFAULT (the
     // test passes a deliberately bad address for each of read/write/except).
