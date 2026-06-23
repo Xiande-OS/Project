@@ -500,7 +500,7 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 ));
             } else {
                 s.push_str(&alloc::format!(
-                    "./busybox timeout -s KILL {to} ./busybox sh ./{want}_testcode.sh\n"
+                    "./busybox setsid ./busybox timeout -s KILL {to} ./busybox sh ./{want}_testcode.sh\n"
                 ));
             }
             s.push_str(&alloc::format!(
@@ -713,8 +713,19 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                     g = group,
                     v = variant,
                 ));
+                // `setsid` puts the group in its OWN session so the OOM-killer
+                // can reclaim it. oom_kill_largest skips the init/driver session
+                // (sid<=1) to avoid killing the harness; without setsid a group's
+                // big allocator (e.g. libc-bench's b_malloc_big, ~38 MB) lives in
+                // that protected session, so under accumulated late-run pressure
+                // the killer finds "no killable victim" and the 45 s sustained-OOM
+                // guard powers the machine off mid-glibc — taking iozone-glibc and
+                // every phase-1 benchmark to 0. In its own session the group is a
+                // valid victim, the killer frees it, the streak resets, and the
+                // run continues. (LTP already setsid's each case for the same
+                // reason.)
                 s.push_str(&alloc::format!(
-                    "./busybox timeout -s KILL {b} ./busybox sh ./{s}\n",
+                    "./busybox setsid ./busybox timeout -s KILL {b} ./busybox sh ./{s}\n",
                     b = budget,
                     s = script
                 ));
