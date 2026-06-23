@@ -30,6 +30,23 @@ pub fn init(pa_start: PhysAddr, pa_end: PhysAddr) {
     TOTAL_PAGES.store(end - start, Ordering::Relaxed);
 }
 
+/// Pool an ADDITIONAL physical `[start, end)` bank after `init`. The buddy
+/// allocator already supports disjoint banks (`add_frame` may be called more
+/// than once), so this just folds a second region into the free pool and grows
+/// the page total. Used on boards whose RAM is split across banks — notably the
+/// loongarch64 QEMU `virt` machine, whose low bank at PA 0 is separate from the
+/// high bank the kernel loads into and was otherwise left unused (the ~256 MiB
+/// that decides whether the LA contest run completes or OOM-wedges mid-glibc).
+pub fn add_region(pa_start: PhysAddr, pa_end: PhysAddr) {
+    let start = pa_start.0.div_ceil(PAGE_SIZE);
+    let end = pa_end.0 / PAGE_SIZE;
+    if end <= start {
+        return;
+    }
+    FRAME_ALLOC.lock().add_frame(start, end);
+    TOTAL_PAGES.fetch_add(end - start, Ordering::Relaxed);
+}
+
 /// Force-release the frame pool's internal spinlock — the physical-memory twin
 /// of [`crate::mm::heap::force_unlock`]. A wedged/faulted stack abandoned inside
 /// `try_alloc_zeroed`/`dealloc` would otherwise strand this lock and hang every

@@ -173,4 +173,58 @@ pub fn init(dtb_pa: usize) {
     // end of the kernel image. On riscv64 the offset is 0 (identity map).
     let kend = PhysAddr(__kernel_end as usize - address::KERNEL_PHYS_OFFSET);
     frame::init(kend, PhysAddr(mem_end));
+    // loongarch64 `virt` splits RAM into a low bank at PA 0 and a high bank at
+    // 0x8000_0000. `detect_memory_end` only pools the high bank (the one holding
+    // the kernel), so the entire low bank — 256 MiB with `-m 1G` on QEMU >= 9 —
+    // was wasted, leaving LA with ~280 MiB less than RV. That gap is exactly why
+    // the LA contest run OOM-wedged mid-glibc (libcbench) on the judge's QEMU
+    // while RV completed. Fold the low bank in so LA has RV-comparable headroom.
+    #[cfg(target_arch = "loongarch64")]
+    add_low_ram_banks();
+}
+
+/// loongarch64: pool the low RAM bank(s) the kernel doesn't load into.
+///
+/// QEMU direct-boot leaves the flattened device tree in the low bank, and we
+/// read the memory map from it (the same FDT scan `detect_memory_end` uses).
+/// For every `device_type = "memory"` region that lies entirely below the high
+/// RAM base (RAM_START) we add it to the frame pool, skipping a generous 16 MiB
+/// prefix that holds the FDT (it sits in [0, 16 MiB) — that scan is what found
+/// it) and any early-boot scratch. Regions are validated against RAM_START so
+/// QEMU 8.2's buggy DTB (which mislabels RAM at ~0x2_9000_0000) contributes
+/// nothing — there it simply no-ops, which is correct (8.2 already maps the high
+/// bank to 0xC000_0000).
+#[cfg(target_arch = "loongarch64")]
+fn add_low_ram_banks() {
+    const DMW: usize = address::KERNEL_PHYS_OFFSET;
+    const LOW_RESERVE: usize = 0x100_0000; // 16 MiB FDT/boot prefix to skip
+    let mut pa = 0usize;
+    let fdt = loop {
+        if pa >= 0x0100_0000 {
+            return; // no FDT found in the low window — leave the pool as-is
+        }
+        let magic = unsafe { core::ptr::read_volatile((pa | DMW) as *const u32) };
+        if magic == 0xedfe0dd0 {
+            if let Ok(f) = unsafe { fdt::Fdt::from_ptr((pa | DMW) as *const u8) } {
+                break f;
+            }
+        }
+        pa += 0x1000;
+    };
+    for node in memory_nodes(&fdt) {
+        let Some(regions) = node.reg() else { continue };
+        for region in regions {
+            let Some(size) = region.size else { continue };
+            let start = region.starting_address as usize;
+            let end = start.saturating_add(size);
+            // A low bank: ends at or below the high RAM base, and is big enough
+            // to be worth pooling past the reserved prefix.
+            if end <= RAM_START && size >= LOW_RESERVE * 2 {
+                let lo = start.saturating_add(LOW_RESERVE);
+                if lo < end {
+                    frame::add_region(PhysAddr(lo), PhysAddr(end));
+                }
+            }
+        }
+    }
 }
