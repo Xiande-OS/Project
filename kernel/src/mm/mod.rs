@@ -56,7 +56,10 @@ fn detect_memory_end(dtb_pa: usize) -> usize {
                     .and_then(|n| n.property("timebase-frequency"))
                     .and_then(|p| p.as_usize())
                 {
+                    crate::println!("[timer] dtb timebase-frequency = {} Hz", hz);
                     crate::arch::set_timer_raw_hz(hz as u64);
+                } else {
+                    crate::println!("[timer] no timebase-frequency in dtb — assuming 10 MHz");
                 }
                 let end = fdt_ram_end(&fdt);
                 if end > RAM_START {
