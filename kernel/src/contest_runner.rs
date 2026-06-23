@@ -454,6 +454,21 @@ const LTP_WHITELIST: &str = "\
     fsync02 timer_create03 \
     ";
 
+/// Prefix that wraps each non-LTP group launch in its own session.
+///
+/// On riscv64 this is `"./busybox setsid "`, which makes the group a valid
+/// OOM-killer victim (see the call site) and stops the late-glibc OOM-poweroff.
+/// On loongarch64 it MUST be empty: per-group `setsid` (which wraps `sh
+/// testcode`, whose children outlive the session leader) wedges LA's
+/// inter-group transition — the LA run hung right after lua-musl and zeroed
+/// every later LA group (musl-la dropped to basic+lua, glibc-la to 0). LA still
+/// completes the full suite without it, and the LTP per-case `setsid` (a single
+/// binary, not a forking shell) is unaffected and stays on both arches.
+#[cfg(target_arch = "riscv64")]
+const SETSID_PREFIX: &str = "./busybox setsid ";
+#[cfg(not(target_arch = "riscv64"))]
+const SETSID_PREFIX: &str = "";
+
 fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
     let mut s = String::from("#!/bin/sh\n");
     if variants.is_empty() {
@@ -500,7 +515,8 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                 ));
             } else {
                 s.push_str(&alloc::format!(
-                    "./busybox setsid ./busybox timeout -s KILL {to} ./busybox sh ./{want}_testcode.sh\n"
+                    "{ss}./busybox timeout -s KILL {to} ./busybox sh ./{want}_testcode.sh\n",
+                    ss = SETSID_PREFIX
                 ));
             }
             s.push_str(&alloc::format!(
@@ -713,19 +729,21 @@ fn build_driver_script(variants: &[(String, Vec<String>)]) -> String {
                     g = group,
                     v = variant,
                 ));
-                // `setsid` puts the group in its OWN session so the OOM-killer
-                // can reclaim it. oom_kill_largest skips the init/driver session
-                // (sid<=1) to avoid killing the harness; without setsid a group's
-                // big allocator (e.g. libc-bench's b_malloc_big, ~38 MB) lives in
-                // that protected session, so under accumulated late-run pressure
-                // the killer finds "no killable victim" and the 45 s sustained-OOM
-                // guard powers the machine off mid-glibc — taking iozone-glibc and
-                // every phase-1 benchmark to 0. In its own session the group is a
-                // valid victim, the killer frees it, the streak resets, and the
-                // run continues. (LTP already setsid's each case for the same
-                // reason.)
+                // `SETSID_PREFIX` puts the group in its OWN session so the
+                // OOM-killer can reclaim it. oom_kill_largest skips the
+                // init/driver session (sid<=1) to avoid killing the harness;
+                // without setsid a group's big allocator (e.g. libc-bench's
+                // b_malloc_big, ~38 MB) lives in that protected session, so under
+                // accumulated late-run pressure the killer finds "no killable
+                // victim" and the 45 s sustained-OOM guard powers the machine off
+                // mid-glibc. In its own session the group is a valid victim, the
+                // killer frees it, the streak resets, and the run continues.
+                // riscv64-only: see SETSID_PREFIX — per-group setsid wedges the
+                // loongarch64 inter-group transition (it hung the whole LA run
+                // right after lua-musl, zeroing every later LA group).
                 s.push_str(&alloc::format!(
-                    "./busybox setsid ./busybox timeout -s KILL {b} ./busybox sh ./{s}\n",
+                    "{ss}./busybox timeout -s KILL {b} ./busybox sh ./{s}\n",
+                    ss = SETSID_PREFIX,
                     b = budget,
                     s = script
                 ));
